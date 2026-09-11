@@ -11,6 +11,7 @@ from .enemies import (
     ShieldGuard,
     SpearThrower,
 )
+from .player import Hitbox, Player
 
 __all__ = [
     "ENEMY_CLASSES",
@@ -18,6 +19,8 @@ __all__ = [
     "Chaser",
     "Enemy",
     "EnemyIntent",
+    "Hitbox",
+    "Player",
     "ResonanceMage",
     "RiftWorm",
     "ShieldGuard",

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import pygame
 
-from game.entities import Chaser, Enemy, SpearThrower
+from game.entities import Chaser, Enemy, Hitbox, Player, SpearThrower
 from settings import COLORS, FPS, IMAGE_DIR, LOGICAL_SIZE, SAVE_FILE, WINDOW_TITLE
 
 
@@ -17,6 +17,14 @@ class MenuItem:
     enabled: bool = True
 
 
+@dataclass(frozen=True)
+class TutorialStep:
+    title: str
+    objective: str
+    hint: str
+    action: str
+
+
 class AssetStore:
     def __init__(self) -> None:
         self.background = self._load("title_background.png", alpha=False)
@@ -25,6 +33,37 @@ class AssetStore:
         self.panel = self._load("menu_panel.png")
         self.cursor = self._load("menu_cursor.png")
         self.spark = self._load("parry_spark.png")
+        self.player_sprites = {
+            name: self._load_optional(filename)
+            for name, filename in {
+                "idle": "player_idle_v2.png",
+                "run_0": "player_run_0.png",
+                "run_1": "player_run_1.png",
+                "jump": "player_jump.png",
+                "fall": "player_fall.png",
+                "attack_side": "player_attack_side.png",
+                "attack_up": "player_attack_up.png",
+                "attack_down": "player_attack_down.png",
+            }.items()
+        }
+        self.enemy_sprites = {
+            name: self._load_optional(filename)
+            for name, filename in {
+                "chaser": "enemy_chaser.png",
+                "spear_thrower": "enemy_spear_thrower.png",
+                "shield_guard": "enemy_shield_guard.png",
+                "rift_worm": "enemy_rift_worm.png",
+                "resonance_mage": "enemy_resonance_mage.png",
+            }.items()
+        }
+        self.slash_sprites = {
+            name: self._load_optional(filename)
+            for name, filename in {
+                "side": "slash_side.png",
+                "up": "slash_up.png",
+                "down": "slash_down.png",
+            }.items()
+        }
 
     @staticmethod
     def _load(filename: str, alpha: bool = True) -> pygame.Surface:
@@ -33,6 +72,13 @@ class AssetStore:
             raise FileNotFoundError(f"找不到界面素材: {path}")
         image = pygame.image.load(path)
         return image.convert_alpha() if alpha else image.convert()
+
+    @staticmethod
+    def _load_optional(filename: str) -> pygame.Surface | None:
+        path = IMAGE_DIR / filename
+        if not path.exists():
+            return None
+        return pygame.image.load(path).convert_alpha()
 
 
 class StartScreen:
@@ -59,6 +105,11 @@ class StartScreen:
         self.confirm_exit = False
         self.pressed_item: int | None = None
         self.pressed_button: str | None = None
+        self.pressed_keys: set[int] = set()
+        self.tutorial_steps = self._build_tutorial_steps()
+        self.tutorial_index = 0
+        self.tutorial_start_x = 0.0
+        self.tutorial_move_distance = 0.0
 
         self.profile = self._load_profile()
         saved_settings = self.profile.get("settings", {})
@@ -83,7 +134,9 @@ class StartScreen:
         self.run_score = 0
         self.run_combo = 0
         self.run_parries = 0
-        self.player_x = 230
+        self.player = Player(230, 566)
+        self._attack_hits: set[tuple[int, int]] = set()
+        self._defeated_enemies: set[int] = set()
         self.room_enemies: list[Enemy] = []
         self.result_score = 0
         self.result_new_record = False
@@ -182,7 +235,12 @@ class StartScreen:
             if event.type == pygame.QUIT:
                 self.running = False
             elif event.type == pygame.KEYDOWN:
+                self.pressed_keys.add(event.key)
                 self._handle_key(event.key)
+            elif event.type == pygame.KEYUP:
+                self.pressed_keys.discard(event.key)
+            elif event.type == pygame.WINDOWFOCUSLOST:
+                self.pressed_keys.clear()
             elif event.type == pygame.MOUSEMOTION:
                 self._handle_mouse_motion(event.pos)
             elif event.type == pygame.VIDEORESIZE:
@@ -195,6 +253,12 @@ class StartScreen:
                     self._handle_overlay_click(event.pos)
                 elif self.page == "menu":
                     self.pressed_item = self._item_at(event.pos)
+                elif self.page == "game":
+                    button = self._page_button_at(event.pos)
+                    if button is None and event.button == 1:
+                        self._start_player_attack(self._attack_direction_from_input())
+                    else:
+                        self.pressed_button = button
                 else:
                     self.pressed_button = self._page_button_at(event.pos)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -279,24 +343,20 @@ class StartScreen:
             return
 
         if self.page == "game":
-            if key in (pygame.K_LEFT, self.keybinds["left"]):
-                self.player_x = max(110, self.player_x - 18)
-            elif key in (pygame.K_RIGHT, self.keybinds["right"]):
-                self.player_x = min(690, self.player_x + 18)
-            elif key == self.keybinds["attack"]:
-                self.run_score += 120
-                self.run_combo += 1
-                self._notify("折光长刃：连击 +1")
+            if key == self.keybinds["attack"]:
+                self._start_player_attack(self._attack_direction_from_input())
             elif key == self.keybinds["parry"]:
                 self.run_score += 260
                 self.run_combo += 2
                 self.run_parries += 1
                 self._notify("PERFECT  弹刀成功")
+                self._complete_tutorial_action("parry")
             elif key in (pygame.K_LSHIFT, self.keybinds["dash"]):
-                self.player_x = min(690, self.player_x + 70)
-                self._notify("冲刺")
+                if self.player.dash():
+                    self._notify("冲刺")
             elif key == self.keybinds["jump"]:
-                self._notify("跳跃")
+                if self.player.request_jump():
+                    self._notify("跳跃")
             elif key == pygame.K_ESCAPE:
                 self.confirm_exit = True
             return
@@ -448,6 +508,108 @@ class StartScreen:
     def _update(self, dt: float) -> None:
         if self.notification_timer > 0:
             self.notification_timer = max(0.0, self.notification_timer - dt)
+
+        if self.page != "game" or self.overlay is not None or self.confirm_exit:
+            return
+
+        fixed_dt = min(max(0.0, dt), 1.0 / 30.0)
+        previous_x = self.player.x
+        self.player.update(fixed_dt, self._move_axis())
+        self.tutorial_move_distance += abs(self.player.x - previous_x)
+        if abs(self.player.x - self.tutorial_start_x) >= 80 or (
+            self._current_tutorial_step.action == "move"
+            and self.tutorial_move_distance >= 48
+        ):
+            self._complete_tutorial_action("move")
+        if not self.player.grounded:
+            self._complete_tutorial_action("jump")
+        self._resolve_player_attack()
+
+    def _move_axis(self) -> float:
+        left = self._is_key_down(pygame.K_LEFT) or self._is_key_down(
+            self.keybinds["left"]
+        )
+        right = self._is_key_down(pygame.K_RIGHT) or self._is_key_down(
+            self.keybinds["right"]
+        )
+        return float(right) - float(left)
+
+    def _is_key_down(self, key: int) -> bool:
+        if key in self.pressed_keys:
+            return True
+        try:
+            return bool(pygame.key.get_pressed()[key])
+        except (IndexError, KeyError):
+            return False
+
+    def _attack_direction_from_input(self) -> str:
+        up = self._is_key_down(pygame.K_UP) or self._is_key_down(pygame.K_w)
+        down = self._is_key_down(pygame.K_DOWN) or self._is_key_down(pygame.K_s)
+        if up and not down:
+            return "up"
+        if down and not up:
+            return "down"
+        return "side"
+
+    def _start_player_attack(self, direction: str = "side") -> None:
+        if self.player.start_attack(direction):
+            direction_name = {
+                "side": f"第 {self.player.attack_stage} 段",
+                "up": "上劈",
+                "down": "下劈",
+            }[direction]
+            self._notify(f"折光长刃：{direction_name}")
+            if direction == "side":
+                self._complete_tutorial_action("attack")
+            elif direction == "up":
+                self._complete_tutorial_action("up_attack")
+
+    def _resolve_player_attack(self) -> None:
+        attack_hitbox = self.player.attack_hitbox
+        if attack_hitbox is None:
+            return
+
+        for index, enemy in enumerate(self.room_enemies):
+            if enemy.defeated or (self.player.attack_id, index) in self._attack_hits:
+                continue
+            enemy_hitbox = Hitbox(enemy.x - 18, enemy.y - 44, 36, 44)
+            if not attack_hitbox.overlaps(enemy_hitbox):
+                continue
+
+            self._attack_hits.add((self.player.attack_id, index))
+            damage = enemy.take_damage(
+                self.player.attack_damage,
+                source_x=self.player.x,
+                posture_damage=self.player.posture_damage,
+            )
+            if damage <= 0:
+                continue
+            if self.player.attack_direction == "down":
+                self.player.bounce_from_down_attack()
+                self._complete_tutorial_action("down_attack")
+            self.run_score += 120
+            self.run_combo += 1
+            if enemy.defeated and index not in self._defeated_enemies:
+                self._defeated_enemies.add(index)
+                self.run_score += enemy.bounty_score
+                self._notify(f"击败 {enemy.display_name}")
+            else:
+                self._notify(f"命中 {enemy.display_name}  -{damage}")
+
+    @property
+    def _current_tutorial_step(self) -> TutorialStep:
+        return self.tutorial_steps[self.tutorial_index]
+
+    def _complete_tutorial_action(self, action: str) -> None:
+        if self.page != "game" or self.tutorial_index >= len(self.tutorial_steps) - 1:
+            return
+        if self._current_tutorial_step.action != action:
+            return
+        self.tutorial_index += 1
+        if self._current_tutorial_step.action == "finish":
+            self._notify("教学完成，房门已开启")
+        else:
+            self._notify(f"下一步：{self._current_tutorial_step.title}")
 
     def _draw(self) -> None:
         self.canvas.blit(self.assets.background, (0, 0))
@@ -730,14 +892,18 @@ class StartScreen:
         rect: pygame.Rect,
         label: str,
         selected: bool = False,
+        enabled: bool = True,
     ) -> None:
         panel = pygame.transform.scale(self.assets.panel, rect.size)
-        panel.set_alpha(255 if selected else 195)
+        panel.set_alpha(255 if selected else 195 if enabled else 120)
         self.canvas.blit(panel, rect)
-        color = COLORS["ice"] if selected else COLORS["muted"]
+        if not enabled:
+            color = (86, 108, 116)
+        else:
+            color = COLORS["ice"] if selected else COLORS["muted"]
         text = self.menu_font.render(label, True, color)
         self.canvas.blit(text, text.get_rect(center=rect.center))
-        if selected:
+        if selected and enabled:
             cursor = pygame.transform.scale(self.assets.cursor, (30, 30))
             cursor.set_alpha(215 + int(40 * math.sin(self.elapsed * 4.0)))
             self.canvas.blit(
@@ -775,13 +941,61 @@ class StartScreen:
         self.screen = pygame.display.set_mode(LOGICAL_SIZE, flags)
 
     @staticmethod
+    def _build_tutorial_steps() -> list[TutorialStep]:
+        return [
+            TutorialStep(
+                "移动训练",
+                "按 A/D 或方向键左右移动一段距离",
+                "先感受加速和停下，门会在完成教学后打开。",
+                "move",
+            ),
+            TutorialStep(
+                "跳跃训练",
+                "按 Space 跳起",
+                "跳跃会受到重力影响，可以在空中微调左右方向。",
+                "jump",
+            ),
+            TutorialStep(
+                "基础攻击",
+                "靠近训练目标，按 J 或鼠标左键挥砍",
+                "横向攻击会跟随角色朝向，命中后增加分数与连击。",
+                "attack",
+            ),
+            TutorialStep(
+                "上劈训练",
+                "按住 W/↑ 再按 J 使用上劈",
+                "上劈用于攻击头顶目标，之后会接入空中敌人。",
+                "up_attack",
+            ),
+            TutorialStep(
+                "下劈训练",
+                "跳到目标上方，按住 S/↓ 再按 J 下劈命中",
+                "下劈命中会把你向上弹起，连续命中可以保持滞空。",
+                "down_attack",
+            ),
+            TutorialStep(
+                "弹刀训练",
+                "按 K 进行一次完美弹刀演示",
+                "正式战斗里需要看准白色预警，失败会中断连击。",
+                "parry",
+            ),
+            TutorialStep(
+                "教学完成",
+                "点击右侧按钮或按提示完成当前房间",
+                "你已经完成基础操作，可以进入结算。",
+                "finish",
+            ),
+        ]
+
+    @staticmethod
     def _build_training_room_enemies() -> list[Enemy]:
         return [
-            Chaser(560, 522),
-            SpearThrower(660, 522),
+            Chaser(320, 522),
+            SpearThrower(650, 522),
         ]
 
     def _start_run(self, floor: int) -> None:
+        self.pressed_keys.clear()
         self.page = "game"
         self.overlay = None
         self.confirm_exit = False
@@ -789,8 +1003,13 @@ class StartScreen:
         self.run_score = 0
         self.run_combo = 0
         self.run_parries = 0
-        self.player_x = 230
+        self.player = Player(230, 566)
+        self._attack_hits.clear()
+        self._defeated_enemies.clear()
         self.room_enemies = self._build_training_room_enemies()
+        self.tutorial_index = 0
+        self.tutorial_start_x = self.player.x
+        self.tutorial_move_distance = 0.0
         self._notify("试炼房间已开启")
 
     def _page_buttons(self) -> dict[str, pygame.Rect]:
@@ -815,6 +1034,9 @@ class StartScreen:
 
     def _activate_page_button(self, button: str | None) -> None:
         if button == "finish" and self.page == "game":
+            if self._current_tutorial_step.action != "finish":
+                self._notify(f"先完成教学：{self._current_tutorial_step.title}")
+                return
             self._finish_run()
         elif button == "restart" and self.page == "result":
             self._start_run(1)
@@ -907,13 +1129,13 @@ class StartScreen:
         gate = pygame.transform.scale(self.assets.logo, (96, 96))
         gate.set_alpha(100)
         self.canvas.blit(gate, (520, 340))
-        player = pygame.transform.scale(self.assets.player, (96, 120))
-        self.canvas.blit(player, (self.player_x, 446))
+        self._draw_player()
         self._draw_enemies()
+        self._draw_tutorial_panel()
 
         room_title = self.overlay_body_font.render("试炼房间已开启", True, COLORS["ice"])
         room_hint = self.small_font.render(
-            "用移动观察空间，尝试攻击与弹刀。完成房间后进入结算。",
+            self._current_tutorial_step.objective,
             True,
             COLORS["muted"],
         )
@@ -934,8 +1156,12 @@ class StartScreen:
         self.canvas.blit(parries, (100, 642))
 
         for name, rect in self._page_buttons().items():
-            label = "完成当前房间" if name == "finish" else "返回主菜单"
-            self._draw_ui_button(rect, label)
+            if name == "finish":
+                unlocked = self._current_tutorial_step.action == "finish"
+                label = "完成当前房间" if unlocked else "完成教学后开启"
+                self._draw_ui_button(rect, label, enabled=unlocked)
+            else:
+                self._draw_ui_button(rect, "返回主菜单")
         controls = self.small_font.render(
             (
                 f"{self._key_name(self.keybinds['left'])}/{self._key_name(self.keybinds['right'])} 移动    "
@@ -950,6 +1176,156 @@ class StartScreen:
         self.canvas.blit(controls, controls.get_rect(center=(640, 690)))
         self._draw_notification()
 
+    def _draw_tutorial_panel(self) -> None:
+        step = self._current_tutorial_step
+        rect = pygame.Rect(820, 125, 380, 225)
+        shade = pygame.Surface(rect.size, pygame.SRCALPHA)
+        shade.fill((6, 16, 28, 226))
+        self.canvas.blit(shade, rect)
+        pygame.draw.rect(self.canvas, COLORS["cyan"], rect, 2)
+        pygame.draw.line(
+            self.canvas,
+            COLORS["ice"],
+            (rect.x + 22, rect.y + 58),
+            (rect.right - 22, rect.y + 58),
+            1,
+        )
+
+        progress = self.small_font.render(
+            f"教学 {self.tutorial_index + 1}/{len(self.tutorial_steps)}",
+            True,
+            COLORS["gold"],
+        )
+        title = self.overlay_body_font.render(step.title, True, COLORS["ice"])
+        self.canvas.blit(progress, (rect.x + 24, rect.y + 18))
+        self.canvas.blit(title, (rect.x + 24, rect.y + 34))
+
+        for index, line_text in enumerate(
+            self._wrap_text(step.objective, self.overlay_body_font, rect.width - 48)
+        ):
+            line_surface = self.overlay_body_font.render(line_text, True, COLORS["ice"])
+            self.canvas.blit(line_surface, (rect.x + 24, rect.y + 82 + index * 28))
+
+        hint_lines = self._wrap_text(step.hint, self.small_font, rect.width - 48)
+        hint_y = rect.bottom - 34 - (len(hint_lines) - 1) * 21
+        for index, line_text in enumerate(hint_lines):
+            line_surface = self.small_font.render(line_text, True, COLORS["muted"])
+            self.canvas.blit(line_surface, (rect.x + 24, hint_y + index * 21))
+
+        dot_y = rect.bottom - 18
+        for index in range(len(self.tutorial_steps)):
+            color = COLORS["cyan"] if index <= self.tutorial_index else (45, 88, 96)
+            pygame.draw.rect(
+                self.canvas,
+                color,
+                (rect.x + 24 + index * 18, dot_y, 10, 5),
+            )
+
+    def _wrap_text(
+        self,
+        text: str,
+        font: pygame.font.Font,
+        max_width: int,
+    ) -> list[str]:
+        lines: list[str] = []
+        current = ""
+        for char in text:
+            candidate = current + char
+            if current and font.size(candidate)[0] > max_width:
+                lines.append(current)
+                current = char
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines or [""]
+
+    def _draw_player(self) -> None:
+        sprite_name = "idle"
+        if self.player.attack_in_progress:
+            sprite_name = f"attack_{self.player.attack_direction}"
+        elif not self.player.grounded:
+            sprite_name = "jump" if self.player.velocity_y < 0 else "fall"
+        elif abs(self.player.velocity_x) > 20:
+            sprite_name = f"run_{int(self.elapsed * 10) % 2}"
+        image = self.assets.player_sprites.get(sprite_name) or self.assets.player
+        if self.player.facing < 0:
+            image = pygame.transform.flip(image, True, False)
+
+        bob = 0
+        if self.player.grounded and abs(self.player.velocity_x) > 20:
+            bob = round(math.sin(self.elapsed * 18.0) * 3)
+
+        player_image = pygame.transform.scale(image, (96, 120))
+        draw_x = round(self.player.x - player_image.get_width() / 2)
+        draw_y = round(self.player.y - player_image.get_height() + bob)
+        self.canvas.blit(player_image, (draw_x, draw_y))
+        self._draw_attack_effect()
+
+    def _draw_attack_effect(self) -> None:
+        hitbox = self.player.attack_hitbox
+        if hitbox is None:
+            return
+
+        sprite = self.assets.slash_sprites.get(self.player.attack_direction)
+        if sprite is not None:
+            effect = sprite
+            if self.player.attack_direction == "side" and self.player.facing < 0:
+                effect = pygame.transform.flip(effect, True, False)
+            effect.set_alpha(180)
+            if self.player.attack_direction == "side":
+                center = (round(hitbox.left + hitbox.width / 2), round(self.player.y - 66))
+            elif self.player.attack_direction == "up":
+                center = (round(self.player.x), round(hitbox.top + hitbox.height / 2))
+            else:
+                center = (round(self.player.x), round(hitbox.top + hitbox.height / 2))
+            self.canvas.blit(effect, effect.get_rect(center=center))
+            return
+
+        effect = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+        if self.player.attack_direction == "up":
+            start_y = self.player.y - self.player.BODY_HEIGHT + 8
+            end_y = hitbox.top
+            for offset, alpha, width in ((-16, 95, 3), (0, 190, 5), (16, 115, 3)):
+                color = (*COLORS["ice"], alpha)
+                pygame.draw.line(
+                    effect,
+                    color,
+                    (round(self.player.x + offset), round(start_y)),
+                    (round(self.player.x + offset * 0.25), round(end_y)),
+                    width,
+                )
+        elif self.player.attack_direction == "down":
+            start_y = self.player.y - 58
+            end_y = hitbox.bottom
+            for offset, alpha, width in ((-16, 95, 3), (0, 190, 5), (16, 115, 3)):
+                color = (*COLORS["ice"], alpha)
+                pygame.draw.line(
+                    effect,
+                    color,
+                    (round(self.player.x + offset), round(start_y)),
+                    (round(self.player.x + offset * 0.25), round(end_y)),
+                    width,
+                )
+        else:
+            start_x = self.player.x + self.player.facing * 18
+            end_x = (
+                hitbox.right + 12
+                if self.player.facing > 0
+                else hitbox.left - 12
+            )
+            center_y = self.player.y - 64
+            for offset, alpha, width in ((-26, 95, 3), (0, 190, 5), (24, 115, 3)):
+                color = (*COLORS["ice"], alpha)
+                pygame.draw.line(
+                    effect,
+                    color,
+                    (round(start_x), round(center_y + offset)),
+                    (round(end_x), round(center_y + offset * 0.25)),
+                    width,
+                )
+        self.canvas.blit(effect, (0, 0))
+
     def _draw_enemies(self) -> None:
         colors = {
             "chaser": COLORS["red"],
@@ -960,6 +1336,27 @@ class StartScreen:
         }
         for enemy in self.room_enemies:
             x, y = int(enemy.x), int(enemy.y)
+            sprite = self.assets.enemy_sprites.get(enemy.kind)
+            if sprite is not None:
+                draw_rect = sprite.get_rect(midbottom=(x, y))
+                self.canvas.blit(sprite, draw_rect)
+                hp_ratio = enemy.hp / enemy.max_hp if enemy.max_hp else 0
+                hp_back = pygame.Rect(x - 26, y - 104, 52, 5)
+                pygame.draw.rect(self.canvas, (24, 57, 65), hp_back)
+                pygame.draw.rect(
+                    self.canvas,
+                    COLORS["red"],
+                    (
+                        hp_back.x,
+                        hp_back.y,
+                        int(hp_back.width * hp_ratio),
+                        hp_back.height,
+                    ),
+                )
+                label = self.small_font.render(enemy.display_name, True, COLORS["ice"])
+                self.canvas.blit(label, label.get_rect(center=(x, y - 120)))
+                continue
+
             body = pygame.Rect(x - 18, y - 44, 36, 44)
             color = colors.get(enemy.kind, COLORS["muted"])
             pygame.draw.rect(self.canvas, (9, 25, 35), body)

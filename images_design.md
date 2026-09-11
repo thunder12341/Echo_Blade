@@ -27,6 +27,8 @@
 
 ## 3. 资源清单
 
+### 3.1 开始界面资源
+
 | 文件名 | 尺寸 | 透明背景 | 主要用途 |
 | --- | ---: | :---: | --- |
 | `title_background.png` | 1280×720 | 否 | 开始界面全屏背景 |
@@ -35,6 +37,31 @@
 | `menu_panel.png` | 640×128 | 是 | 菜单按钮的背景面板 |
 | `menu_cursor.png` | 48×48 | 是 | 当前菜单选项的指示光标 |
 | `parry_spark.png` | 128×128 | 是 | 弹刀主题的闪光动画素材 |
+
+### 3.2 战斗原型资源
+
+| 文件名 | 尺寸 | 透明背景 | 主要用途 |
+| --- | ---: | :---: | --- |
+| `player_idle_v2.png` | 96×120 | 是 | 玩家待机帧，供战斗场景替换现有占位 |
+| `player_run_0.png` / `player_run_1.png` | 96×120 | 是 | 玩家跑动循环 |
+| `player_jump.png` / `player_fall.png` | 96×120 | 是 | 玩家跳跃与下落状态 |
+| `player_attack_side.png` | 96×120 | 是 | 横向攻击姿势 |
+| `player_attack_up.png` | 96×120 | 是 | 上劈攻击姿势 |
+| `player_attack_down.png` | 96×120 | 是 | 下劈攻击姿势 |
+| `enemy_chaser.png` | 96×96 | 是 | 追击者 |
+| `enemy_spear_thrower.png` | 96×96 | 是 | 投矛手 |
+| `enemy_shield_guard.png` | 96×96 | 是 | 盾卫 |
+| `enemy_rift_worm.png` | 96×96 | 是 | 裂隙虫 |
+| `enemy_resonance_mage.png` | 96×96 | 是 | 共鸣法师 |
+| `boss_rust_crown_knight.png` | 96×96 | 是 | 锈冠骑士首领 |
+| `boss_broadcast_ghost.png` | 96×96 | 是 | 广播幽灵首领 |
+| `boss_city_heart.png` | 96×96 | 是 | 城市心脏首领 |
+| `slash_side.png` / `slash_up.png` / `slash_down.png` | 96×96 | 是 | 横劈、上劈、下劈攻击特效 |
+| `projectile_spear.png` / `projectile_orb.png` | 64×32 | 是 | 长矛与能量球投射物 |
+| `icon_heart.png` / `icon_echo.png` / `icon_combo.png` / `icon_parry.png` | 72×72 | 是 | 生命、回响能量、连击、弹刀 HUD 图标 |
+| `icon_dash.png` / `icon_warning.png` / `icon_coin.png` / `icon_skull.png` | 72×72 | 是 | 冲刺、危险、金币、死亡结算图标 |
+| `tile_floor.png` / `room_gate.png` / `echo_shard.png` | 96×96 | 是 | 地面块、房门、回响碎片 |
+| `reward_common.png` / `reward_rare.png` / `reward_epic.png` | 96×96 | 是 | 普通、稀有、史诗奖励图标 |
 
 ## 4. 单项图片说明
 

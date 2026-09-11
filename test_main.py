@@ -9,6 +9,7 @@ from game.entities import (
     ENEMY_CLASSES,
     Chaser,
     Enemy,
+    Player,
     ResonanceMage,
     RiftWorm,
     ShieldGuard,
@@ -112,3 +113,244 @@ def test_perfect_parry_opens_vulnerability_and_reflects_damage():
     assert reflected_damage == round(enemy.damage * 1.5)
     assert enemy.vulnerable is True
     assert enemy.update(0.1, (120, 0)).action == "vulnerable"
+
+
+def test_player_moves_accelerates_faces_and_stops_at_bounds():
+    player = Player(300, 566)
+
+    player.update(0.1, 1)
+    assert player.x > 300
+    assert player.velocity_x > 0
+    assert player.facing == 1
+
+    for _ in range(180):
+        player.update(1.0 / 60.0, 1)
+    assert player.x == player.bounds_right
+
+    player.update(0.1, -1)
+    assert player.facing == -1
+
+
+def test_player_jump_uses_gravity_and_lands():
+    player = Player(300, 566)
+
+    assert player.request_jump() is True
+    player.update(0.016, 0)
+    assert player.grounded is False
+    assert player.y < player.ground_y
+
+    for _ in range(120):
+        player.update(0.016, 0)
+        if player.grounded:
+            break
+
+    assert player.grounded is True
+    assert player.y == player.ground_y
+    assert player.velocity_y == 0
+
+
+def test_player_three_hit_attack_has_active_hitbox():
+    player = Player(300, 566)
+
+    assert player.start_attack() is True
+    player.update(0.1, 0)
+    assert player.attack_stage == 1
+    assert player.attack_active is True
+    assert player.attack_hitbox is not None
+
+    player.update(0.4, 0)
+    assert player.attack_in_progress is False
+    assert player.start_attack() is True
+    assert player.attack_stage == 2
+
+    player.update(0.4, 0)
+    assert player.start_attack() is True
+    assert player.attack_stage == 3
+
+
+def test_player_up_and_down_attack_hitboxes_follow_direction():
+    player = Player(300, 566)
+
+    player.facing = -1
+    player.start_attack("side")
+    player.update(0.1, 0)
+    side_hitbox = player.attack_hitbox
+    assert side_hitbox is not None
+    assert side_hitbox.right <= player.x
+
+    player.update(0.4, 0)
+    player.start_attack("up")
+    player.update(0.1, 0)
+    up_hitbox = player.attack_hitbox
+    assert up_hitbox is not None
+    assert up_hitbox.bottom <= player.y - player.BODY_HEIGHT
+    assert up_hitbox.top < up_hitbox.bottom
+
+    player.update(0.4, 0)
+    player.start_attack("down")
+    player.update(0.1, 0)
+    down_hitbox = player.attack_hitbox
+    assert down_hitbox is not None
+    assert down_hitbox.top == player.y
+    assert down_hitbox.bottom > player.y
+
+
+def test_game_attack_damages_enemy(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1)
+    enemy = app.room_enemies[0]
+    starting_hp = enemy.hp
+
+    app._start_player_attack()
+    app.player.update(0.1, 0)
+    app._resolve_player_attack()
+
+    assert enemy.hp < starting_hp
+    assert app.run_score > 0
+    pygame.quit()
+
+
+def test_initial_room_move_and_jump_use_game_loop_input(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1)
+    starting_x = app.player.x
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d))
+    app._handle_events()
+
+    for _ in range(60):
+        app._update(1.0 / 60.0)
+
+    assert app.page == "game"
+    assert app.player.x > starting_x + 100
+
+    pygame.event.post(pygame.event.Event(pygame.KEYUP, key=pygame.K_d))
+    pygame.event.post(
+        pygame.event.Event(pygame.KEYDOWN, key=app.keybinds["jump"])
+    )
+    app._handle_events()
+    for _ in range(6):
+        app._update(1.0 / 60.0)
+
+    assert app.player.grounded is False
+    assert app.player.y < app.player.ground_y
+    pygame.quit()
+
+
+def test_down_attack_hit_bounces_player_up(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1)
+    app.player.x = app.room_enemies[0].x
+    app.player.y = 500
+    app.player.grounded = False
+    app.player.velocity_x = -120
+    enemy = app.room_enemies[0]
+    app.pressed_keys.add(pygame.K_s)
+
+    for _ in range(3):
+        hp_before = enemy.hp
+        pygame.event.post(
+            pygame.event.Event(pygame.KEYDOWN, key=app.keybinds["attack"])
+        )
+        app._handle_events()
+        assert app.player.attack_direction == "down"
+
+        for _ in range(20):
+            app._update(1.0 / 60.0)
+            if enemy.hp < hp_before and app.player.velocity_y < 0:
+                break
+
+        assert enemy.hp < hp_before
+        assert app.player.velocity_y < 0
+        assert app.player.grounded is False
+        while app.player.attack_in_progress:
+            app._update(1.0 / 60.0)
+            assert app.player.y < app.player.ground_y
+    pygame.quit()
+
+
+def test_mouse_attack_uses_directional_input(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1)
+
+    app.pressed_keys.add(pygame.K_s)
+    pygame.event.post(
+        pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN,
+            button=1,
+            pos=(400, 400),
+        )
+    )
+    app._handle_events()
+
+    assert app.player.attack_direction == "down"
+    pygame.quit()
+
+
+def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1)
+
+    assert app._current_tutorial_step.action == "move"
+    app._activate_page_button("finish")
+    assert app.page == "game"
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d))
+    app._handle_events()
+    for _ in range(30):
+        app._update(1.0 / 60.0)
+    assert app._current_tutorial_step.action == "jump"
+
+    pygame.event.post(pygame.event.Event(pygame.KEYUP, key=pygame.K_d))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=app.keybinds["jump"]))
+    app._handle_events()
+    app._update(1.0 / 60.0)
+    assert app._current_tutorial_step.action == "attack"
+
+    app._handle_key(app.keybinds["attack"])
+    assert app._current_tutorial_step.action == "up_attack"
+
+    app.player.update(0.4, 0)
+    app.pressed_keys.add(pygame.K_w)
+    app._handle_key(app.keybinds["attack"])
+    assert app._current_tutorial_step.action == "down_attack"
+
+    app.player.update(0.4, 0)
+    app.pressed_keys.discard(pygame.K_w)
+    app.pressed_keys.add(pygame.K_s)
+    app.player.x = app.room_enemies[0].x
+    app.player.y = 500
+    app.player.grounded = False
+    app._handle_key(app.keybinds["attack"])
+    for _ in range(20):
+        app._update(1.0 / 60.0)
+        if app._current_tutorial_step.action == "parry":
+            break
+    assert app._current_tutorial_step.action == "parry"
+
+    app._handle_key(app.keybinds["parry"])
+    assert app._current_tutorial_step.action == "finish"
+
+    app._activate_page_button("finish")
+    assert app.page == "result"
+    pygame.quit()
