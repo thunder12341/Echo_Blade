@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import pygame
 
+from game.entities import Chaser, Enemy, SpearThrower
 from settings import COLORS, FPS, IMAGE_DIR, LOGICAL_SIZE, SAVE_FILE, WINDOW_TITLE
 
 
@@ -83,6 +84,7 @@ class StartScreen:
         self.run_combo = 0
         self.run_parries = 0
         self.player_x = 230
+        self.room_enemies: list[Enemy] = []
         self.result_score = 0
         self.result_new_record = False
 
@@ -772,6 +774,13 @@ class StartScreen:
         flags = pygame.FULLSCREEN if self.settings["fullscreen"] else pygame.RESIZABLE
         self.screen = pygame.display.set_mode(LOGICAL_SIZE, flags)
 
+    @staticmethod
+    def _build_training_room_enemies() -> list[Enemy]:
+        return [
+            Chaser(560, 522),
+            SpearThrower(660, 522),
+        ]
+
     def _start_run(self, floor: int) -> None:
         self.page = "game"
         self.overlay = None
@@ -781,6 +790,7 @@ class StartScreen:
         self.run_combo = 0
         self.run_parries = 0
         self.player_x = 230
+        self.room_enemies = self._build_training_room_enemies()
         self._notify("试炼房间已开启")
 
     def _page_buttons(self) -> dict[str, pygame.Rect]:
@@ -899,6 +909,7 @@ class StartScreen:
         self.canvas.blit(gate, (520, 340))
         player = pygame.transform.scale(self.assets.player, (96, 120))
         self.canvas.blit(player, (self.player_x, 446))
+        self._draw_enemies()
 
         room_title = self.overlay_body_font.render("试炼房间已开启", True, COLORS["ice"])
         room_hint = self.small_font.render(
@@ -938,6 +949,34 @@ class StartScreen:
         )
         self.canvas.blit(controls, controls.get_rect(center=(640, 690)))
         self._draw_notification()
+
+    def _draw_enemies(self) -> None:
+        colors = {
+            "chaser": COLORS["red"],
+            "spear_thrower": COLORS["gold"],
+            "shield_guard": COLORS["ice"],
+            "rift_worm": (166, 99, 244),
+            "resonance_mage": COLORS["cyan"],
+        }
+        for enemy in self.room_enemies:
+            x, y = int(enemy.x), int(enemy.y)
+            body = pygame.Rect(x - 18, y - 44, 36, 44)
+            color = colors.get(enemy.kind, COLORS["muted"])
+            pygame.draw.rect(self.canvas, (9, 25, 35), body)
+            pygame.draw.rect(self.canvas, color, body, 2)
+            eye_x = x + (7 if enemy.facing > 0 else -12)
+            pygame.draw.rect(self.canvas, color, (eye_x, y - 32, 8, 5))
+
+            hp_ratio = enemy.hp / enemy.max_hp if enemy.max_hp else 0
+            hp_back = pygame.Rect(x - 26, y - 56, 52, 5)
+            pygame.draw.rect(self.canvas, (24, 57, 65), hp_back)
+            pygame.draw.rect(
+                self.canvas,
+                COLORS["red"],
+                (hp_back.x, hp_back.y, int(hp_back.width * hp_ratio), hp_back.height),
+            )
+            label = self.small_font.render(enemy.display_name, True, COLORS["ice"])
+            self.canvas.blit(label, label.get_rect(center=(x, y - 72)))
 
     def _draw_stat_bar(
         self,
