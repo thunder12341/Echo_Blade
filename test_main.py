@@ -354,3 +354,40 @@ def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
     app._activate_page_button("finish")
     assert app.page == "result"
     pygame.quit()
+
+
+def test_tutorial_hints_follow_custom_keybinds(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1)
+
+    jump_step = next(step for step in app.tutorial_steps if step.action == "jump")
+    parry_step = next(step for step in app.tutorial_steps if step.action == "parry")
+    assert jump_step.objective == "按 SPACE 跳起"
+    assert parry_step.objective == "按 K 进行一次完美弹刀演示"
+
+    # 先把弹刀从 K 挪到 P，腾出 K 再绑定给跳跃，模拟玩家在设置里换键。
+    app.overlay = "keybinds"
+    app.rebinding_action = "parry"
+    app._handle_key(pygame.K_p)
+    app.rebinding_action = "jump"
+    app._handle_key(pygame.K_k)
+
+    assert app.keybinds["parry"] == pygame.K_p
+    assert app.keybinds["jump"] == pygame.K_k
+
+    jump_step = next(step for step in app.tutorial_steps if step.action == "jump")
+    parry_step = next(step for step in app.tutorial_steps if step.action == "parry")
+    attack_step = next(step for step in app.tutorial_steps if step.action == "up_attack")
+    assert jump_step.objective == "按 K 跳起"
+    assert parry_step.objective == "按 P 进行一次完美弹刀演示"
+    assert attack_step.objective == "按住 W/↑ 再按 J 使用上劈"
+
+    # 重新开一局也要保留玩家自定义的键位提示。
+    app._start_run(1)
+    jump_step = next(step for step in app.tutorial_steps if step.action == "jump")
+    assert jump_step.objective == "按 K 跳起"
+    pygame.quit()

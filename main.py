@@ -106,7 +106,7 @@ class StartScreen:
         self.pressed_item: int | None = None
         self.pressed_button: str | None = None
         self.pressed_keys: set[int] = set()
-        self.tutorial_steps = self._build_tutorial_steps()
+        self.tutorial_steps: list[TutorialStep] = []
         self.tutorial_index = 0
         self.tutorial_start_x = 0.0
         self.tutorial_move_distance = 0.0
@@ -121,6 +121,7 @@ class StartScreen:
             "volume": max(0, min(100, int(saved_settings.get("volume", 80)))),
         }
         self.keybinds = self._load_keybinds(saved_settings.get("keybinds", {}))
+        self._refresh_tutorial_hints()
         if self.settings["fullscreen"]:
             self._apply_display_mode()
         self.has_save = self._load_save()
@@ -297,6 +298,7 @@ class StartScreen:
                     self.keybinds[self.rebinding_action] = key
                     action_name = dict(self._keybind_actions())[self.rebinding_action]
                     self.rebinding_action = None
+                    self._refresh_tutorial_hints()
                     self._save_profile()
                     self._notify(f"{action_name} 已绑定为 {self._key_name(key)}")
                 return
@@ -940,42 +942,46 @@ class StartScreen:
         flags = pygame.FULLSCREEN if self.settings["fullscreen"] else pygame.RESIZABLE
         self.screen = pygame.display.set_mode(LOGICAL_SIZE, flags)
 
-    @staticmethod
-    def _build_tutorial_steps() -> list[TutorialStep]:
+    def _build_tutorial_steps(self) -> list[TutorialStep]:
+        """按当前键位设置生成教学步骤，让提示与实际按键保持一致。"""
+        keys = {
+            action: self._key_name(bound)
+            for action, bound in self.keybinds.items()
+        }
         return [
             TutorialStep(
                 "移动训练",
-                "按 A/D 或方向键左右移动一段距离",
+                f"按 {keys['left']}/{keys['right']} 或方向键左右移动一段距离",
                 "先感受加速和停下，门会在完成教学后打开。",
                 "move",
             ),
             TutorialStep(
                 "跳跃训练",
-                "按 Space 跳起",
+                f"按 {keys['jump']} 跳起",
                 "跳跃会受到重力影响，可以在空中微调左右方向。",
                 "jump",
             ),
             TutorialStep(
                 "基础攻击",
-                "靠近训练目标，按 J 或鼠标左键挥砍",
+                f"靠近训练目标，按 {keys['attack']} 或鼠标左键挥砍",
                 "横向攻击会跟随角色朝向，命中后增加分数与连击。",
                 "attack",
             ),
             TutorialStep(
                 "上劈训练",
-                "按住 W/↑ 再按 J 使用上劈",
+                f"按住 W/↑ 再按 {keys['attack']} 使用上劈",
                 "上劈用于攻击头顶目标，之后会接入空中敌人。",
                 "up_attack",
             ),
             TutorialStep(
                 "下劈训练",
-                "跳到目标上方，按住 S/↓ 再按 J 下劈命中",
+                f"跳到目标上方，按住 S/↓ 再按 {keys['attack']} 下劈命中",
                 "下劈命中会把你向上弹起，连续命中可以保持滞空。",
                 "down_attack",
             ),
             TutorialStep(
                 "弹刀训练",
-                "按 K 进行一次完美弹刀演示",
+                f"按 {keys['parry']} 进行一次完美弹刀演示",
                 "正式战斗里需要看准白色预警，失败会中断连击。",
                 "parry",
             ),
@@ -986,6 +992,10 @@ class StartScreen:
                 "finish",
             ),
         ]
+
+    def _refresh_tutorial_hints(self) -> None:
+        """键位设置变化后，重新生成教学关卡里的按键提示。"""
+        self.tutorial_steps = self._build_tutorial_steps()
 
     @staticmethod
     def _build_training_room_enemies() -> list[Enemy]:
@@ -1007,6 +1017,7 @@ class StartScreen:
         self._attack_hits.clear()
         self._defeated_enemies.clear()
         self.room_enemies = self._build_training_room_enemies()
+        self._refresh_tutorial_hints()
         self.tutorial_index = 0
         self.tutorial_start_x = self.player.x
         self.tutorial_move_distance = 0.0
