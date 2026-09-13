@@ -324,6 +324,50 @@ def test_game_attack_damages_enemy(monkeypatch, tmp_path):
 
     assert enemy.hp < starting_hp
     assert app.run_score > 0
+    assert app.run_currency >= 2
+    pygame.quit()
+
+
+def test_enemy_attack_telegraph_draws_visible_timing_effect(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1, tutorial=False)
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+    app.pending_enemy_attacks = [
+        PendingEnemyAttack(
+            enemy,
+            enemy.scaled_attack(),
+            app.player.PERFECT_PARRY_WINDOW * 0.5,
+        )
+    ]
+    app.canvas.fill((0, 0, 0))
+
+    app._draw_enemy_attack_effects()
+
+    assert pygame.mask.from_threshold(
+        app.canvas,
+        (0, 0, 0),
+        threshold=(1, 1, 1, 255),
+    ).count() < app.canvas.get_width() * app.canvas.get_height()
+    pygame.quit()
+
+
+def test_unlocked_reserve_carry_grants_starting_run_currency(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.profile["progression"] = {
+        "unlocked_nodes": ["reserve_carry"],
+        "equipped_start_module": None,
+    }
+
+    app._start_run(1, tutorial=False)
+
+    assert app.run_currency == 20
     pygame.quit()
 
 
@@ -347,6 +391,57 @@ def test_defeated_enemy_is_removed_from_active_room(monkeypatch, tmp_path):
 
     app._resolve_player_attack()
     assert app.run_score == score_after_defeat
+    pygame.quit()
+
+
+def test_lethal_enemy_attack_opens_failure_settlement_and_returns_lobby(
+    monkeypatch, tmp_path
+):
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(2, tutorial=False)
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+    app.player.hp = enemy.damage
+    app.run_score = 420
+    app.run_currency = 17
+    app.pending_enemy_attacks = [
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.001)
+    ]
+
+    app._update(1.0 / 60.0)
+
+    assert app.player.hp == 0
+    assert app.page == "failure"
+    assert app.result_score == 420
+    assert app.result_relics == 25
+    assert app.pending_enemy_attacks == []
+    assert app._stat("failures") == 1
+    assert json.loads(save_file.read_text(encoding="utf-8"))["echo_relics"] == 25
+
+    app._handle_key(pygame.K_RETURN)
+    assert app.page == "lobby"
+    assert app.run_currency == 0
+    pygame.quit()
+
+
+def test_tutorial_failure_does_not_grant_relics(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1, tutorial=True)
+
+    app.player.hp = 0
+    app._fail_run()
+
+    assert app.page == "failure"
+    assert app.result_relics == 0
+    assert app.echo_relics == 0
+    assert app.tutorial_completed is False
     pygame.quit()
 
 

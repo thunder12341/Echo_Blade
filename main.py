@@ -34,6 +34,15 @@ class PendingEnemyAttack:
     remaining: float
 
 
+@dataclass
+class AttackImpact:
+    x: float
+    y: float
+    parried: bool
+    parryable: bool
+    remaining: float = 0.24
+
+
 @dataclass(frozen=True)
 class ProgressionNode:
     node_id: str
@@ -251,12 +260,15 @@ class StartScreen:
         self.run_floor = max(1, int(self.profile.get("best_floor", 1) or 1))
         self.run_score = 0
         self.run_combo = 0
+        self.run_max_combo = 0
         self.run_parries = 0
+        self.run_currency = 0
         self.player = Player(230, 566)
         self._attack_hits: set[tuple[int, int]] = set()
         self._defeated_enemies: set[int] = set()
         self.room_enemies: list[Enemy] = []
         self.pending_enemy_attacks: list[PendingEnemyAttack] = []
+        self.attack_impacts: list[AttackImpact] = []
         self.result_score = 0
         self.result_new_record = False
         self.result_relics = 0
@@ -590,6 +602,16 @@ class StartScreen:
                 self.page = "menu"
             return
 
+        if self.page == "failure":
+            if key in (
+                pygame.K_RETURN,
+                pygame.K_SPACE,
+                pygame.K_j,
+                pygame.K_ESCAPE,
+            ):
+                self._activate_page_button("lobby")
+            return
+
         if self.page == "lobby":
             if key in (pygame.K_LEFT, pygame.K_a, pygame.K_UP, pygame.K_w):
                 self.lobby_selected = (self.lobby_selected - 1) % len(
@@ -713,6 +735,7 @@ class StartScreen:
         self.overlay = None
         self.confirm_exit = False
         self.lobby_selected = 0
+        self.run_currency = 0
         self._notify("灰塔大厅已就绪")
 
     def _activate_lobby_action(self, index: int) -> None:
@@ -875,6 +898,7 @@ class StartScreen:
         fixed_dt = min(max(0.0, dt), 1.0 / 30.0)
         previous_x = self.player.x
         self.player.update(fixed_dt, self._move_axis())
+        self._update_attack_impacts(fixed_dt)
         self.tutorial_move_distance += abs(self.player.x - previous_x)
         if abs(self.player.x - self.tutorial_start_x) >= 80 or (
             self._current_tutorial_step.action == "move"
@@ -956,6 +980,8 @@ class StartScreen:
                 self._complete_tutorial_action("down_attack")
             self.run_score += 120
             self.run_combo += 1
+            self.run_max_combo = max(self.run_max_combo, self.run_combo)
+            self.run_currency += 2
             if enemy.defeated:
                 self._award_enemy_defeat(enemy)
             else:
@@ -986,8 +1012,19 @@ class StartScreen:
                 unresolved.append(pending)
                 continue
             self._resolve_enemy_attack(pending)
+            if self.player.hp <= 0:
+                self.pending_enemy_attacks.clear()
+                self._fail_run()
+                return
         self.pending_enemy_attacks = unresolved
         self._remove_defeated_enemies()
+
+    def _update_attack_impacts(self, dt: float) -> None:
+        for impact in self.attack_impacts:
+            impact.remaining -= dt
+        self.attack_impacts = [
+            impact for impact in self.attack_impacts if impact.remaining > 0.0
+        ]
 
     def _resolve_enemy_attack(self, pending: PendingEnemyAttack) -> None:
         enemy = pending.enemy
@@ -997,7 +1034,12 @@ class StartScreen:
             enemy.take_damage(reflected_damage, source_x=self.player.x)
             self.run_score += 260
             self.run_combo += 2
+            self.run_max_combo = max(self.run_max_combo, self.run_combo)
             self.run_parries += 1
+            self.run_currency += 5
+            self.attack_impacts.append(
+                AttackImpact(self.player.x, self.player.y - 58, True, True)
+            )
             self._notify(
                 f"PERFECT  弹刀成功  反震 {reflected_damage}"
             )
@@ -1008,6 +1050,14 @@ class StartScreen:
 
         damage = self.player.take_damage(profile.damage)
         self.run_combo = 0
+        self.attack_impacts.append(
+            AttackImpact(
+                self.player.x,
+                self.player.y - 54,
+                False,
+                profile.parryable,
+            )
+        )
         if profile.parryable and self.player.parry_active:
             self._notify(f"弹刀过早  受到 {damage} 伤害")
         elif not profile.parryable and self.player.parry_active:
@@ -1021,6 +1071,7 @@ class StartScreen:
             return
         self._defeated_enemies.add(enemy_id)
         self.run_score += enemy.bounty_score
+        self.run_currency += max(4, enemy.bounty_score // 20)
         self._notify(f"击败 {enemy.display_name}")
 
     def _remove_defeated_enemies(self) -> None:
@@ -1076,6 +1127,8 @@ class StartScreen:
             self._draw_game()
         elif self.page == "result":
             self._draw_result()
+        elif self.page == "failure":
+            self._draw_failure()
         if self.overlay is not None:
             self._draw_overlay()
         if self.confirm_exit:
@@ -1656,12 +1709,15 @@ class StartScreen:
         self.run_floor = max(1, floor)
         self.run_score = 0
         self.run_combo = 0
+        self.run_max_combo = 0
         self.run_parries = 0
+        self.run_currency = 20 if "reserve_carry" in self._unlocked_nodes() else 0
         self.player = Player(230, 566)
         self._attack_hits.clear()
         self._defeated_enemies.clear()
         self.room_enemies = [] if tutorial else self._build_training_room_enemies()
         self.pending_enemy_attacks.clear()
+        self.attack_impacts.clear()
         self._refresh_tutorial_hints()
         self.tutorial_index = 0 if tutorial else len(self.tutorial_steps) - 1
         self.tutorial_start_x = self.player.x
@@ -1679,6 +1735,8 @@ class StartScreen:
                 "restart": pygame.Rect(430, 500, 200, 58),
                 "menu": pygame.Rect(650, 500, 200, 58),
             }
+        if self.page == "failure":
+            return {"lobby": pygame.Rect(490, 512, 300, 58)}
         return {}
 
     def _page_button_at(self, position: tuple[int, int]) -> str | None:
@@ -1696,6 +1754,10 @@ class StartScreen:
             self._finish_run()
         elif button == "restart" and self.page == "result":
             self._start_run(1)
+        elif button == "lobby" and self.page == "failure":
+            relics = self.result_relics
+            self._enter_lobby()
+            self._notify(f"失败勘定完成，凝结回响遗晶 +{relics}")
         elif button == "menu":
             self.page = "menu"
             self.confirm_exit = False
@@ -1769,6 +1831,61 @@ class StartScreen:
         self._enter_lobby()
         self._notify(f"远征已结算，凝结回响遗晶 +{self.result_relics}")
 
+    def _fail_run(self) -> None:
+        if self.page != "game":
+            return
+
+        self.result_score = self.run_score
+        previous_best = int(self.profile.get("best_score", 0) or 0)
+        self.result_new_record = self.result_score > previous_best
+        self.profile["best_score"] = max(previous_best, self.result_score)
+        self.profile["best_floor"] = max(
+            int(self.profile.get("best_floor", 0) or 0),
+            self.run_floor,
+        )
+        scores = self.profile.get("scores", [])
+        if not isinstance(scores, list):
+            scores = []
+        scores.append(
+            {
+                "score": self.result_score,
+                "floor": self.run_floor,
+                "parries": self.run_parries,
+                "outcome": "failure",
+            }
+        )
+        self.profile["scores"] = sorted(
+            [score for score in scores if isinstance(score, dict)],
+            key=lambda score: int(score.get("score", 0) or 0),
+            reverse=True,
+        )[:20]
+        self.result_relics = (
+            0
+            if self.is_tutorial_run
+            else 15 + self.run_floor * 5 + min(self.run_parries * 2, 15)
+        )
+        self.profile["echo_relics"] = self.echo_relics + self.result_relics
+
+        lifetime_stats = self.profile.get("lifetime_stats", {})
+        if not isinstance(lifetime_stats, dict):
+            lifetime_stats = {}
+        lifetime_stats = lifetime_stats.copy()
+        lifetime_stats["settlements"] = self._stat("settlements") + 1
+        lifetime_stats["failures"] = self._stat("failures") + 1
+        lifetime_stats["parries"] = self._stat("parries") + self.run_parries
+        self.profile["lifetime_stats"] = lifetime_stats
+        self._save_profile()
+        self.has_save = True
+        self.items = self._build_items()
+
+        self.page = "failure"
+        self.overlay = None
+        self.confirm_exit = False
+        self.pressed_keys.clear()
+        self.pending_enemy_attacks.clear()
+        self.attack_impacts.clear()
+        self._notify("记忆载体崩解，远征已终止")
+
     def _draw_game(self) -> None:
         shade = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
         shade.fill((3, 8, 18, 80))
@@ -1801,6 +1918,7 @@ class StartScreen:
         )
         self.canvas.blit(score, (930, 42))
         self.canvas.blit(floor, (930, 76))
+        self._draw_run_currency_ui()
 
         pygame.draw.line(self.canvas, (37, 103, 103), (120, 566), (760, 566), 2)
         pygame.draw.rect(self.canvas, (12, 37, 48), (165, 428, 500, 138), 2)
@@ -1869,6 +1987,34 @@ class StartScreen:
         )
         self.canvas.blit(controls, controls.get_rect(center=(640, 690)))
         self._draw_notification()
+
+    def _draw_run_currency_ui(self) -> None:
+        panel = pygame.Rect(1050, 98, 180, 42)
+        shade = pygame.Surface(panel.size, pygame.SRCALPHA)
+        shade.fill((6, 16, 28, 220))
+        self.canvas.blit(shade, panel)
+        pygame.draw.rect(self.canvas, (100, 82, 48), panel, 1)
+
+        coin_center = (panel.x + 24, panel.centery)
+        pygame.draw.circle(self.canvas, (91, 68, 37), coin_center, 12)
+        pygame.draw.circle(self.canvas, COLORS["gold"], coin_center, 10, 2)
+        pygame.draw.polygon(
+            self.canvas,
+            COLORS["gold"],
+            (
+                (coin_center[0], coin_center[1] - 5),
+                (coin_center[0] + 5, coin_center[1]),
+                (coin_center[0], coin_center[1] + 5),
+                (coin_center[0] - 5, coin_center[1]),
+            ),
+            1,
+        )
+        label = self.small_font.render("战时铸币", True, COLORS["muted"])
+        value = self.overlay_body_font.render(
+            f"{self.run_currency:03d}", True, COLORS["gold"]
+        )
+        self.canvas.blit(label, (panel.x + 44, panel.y + 3))
+        self.canvas.blit(value, (panel.right - value.get_width() - 12, panel.y + 17))
 
     def _draw_tutorial_panel(self) -> None:
         step = self._current_tutorial_step
@@ -2078,26 +2224,171 @@ class StartScreen:
             label = self.small_font.render(enemy.display_name, True, COLORS["ice"])
             self.canvas.blit(label, label.get_rect(center=(x, y - 72)))
 
+        self._draw_enemy_attack_effects()
+
+    def _draw_enemy_attack_effects(self) -> None:
+        effect = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+        player_center = (round(self.player.x), round(self.player.y - 54))
+
         for pending in self.pending_enemy_attacks:
             if pending.enemy.defeated:
                 continue
-            ratio = max(
-                0.0,
-                min(1.0, pending.remaining / pending.profile.telegraph_time),
-            )
-            warning_color = (
+            duration = max(0.001, pending.profile.telegraph_time)
+            remaining_ratio = max(0.0, min(1.0, pending.remaining / duration))
+            progress = 1.0 - remaining_ratio
+            imminent = pending.remaining <= self.player.PERFECT_PARRY_WINDOW
+            color = (
                 (166, 99, 244)
                 if not pending.profile.parryable
                 else COLORS["ice"]
             )
-            center = (round(pending.enemy.x), round(pending.enemy.y - 142))
-            pygame.draw.circle(self.canvas, (15, 31, 40), center, 11)
-            pygame.draw.circle(self.canvas, warning_color, center, 11, 2)
-            pygame.draw.rect(
-                self.canvas,
-                warning_color,
-                (center[0] - 2, center[1] - 6, 4, max(2, round(9 * ratio))),
+            if imminent and pending.profile.parryable:
+                color = COLORS["white"]
+
+            enemy_center = (
+                round(pending.enemy.x),
+                round(pending.enemy.y - 52),
             )
+            pulse = (math.sin(self.elapsed * 24.0) + 1.0) * 0.5
+            charge_radius = round(12 + 17 * progress + 3 * pulse)
+            pygame.draw.circle(
+                effect,
+                (*color, round(48 + 100 * progress)),
+                enemy_center,
+                charge_radius,
+                3,
+            )
+            pygame.draw.circle(effect, (*color, 210), enemy_center, 5)
+
+            line_alpha = round(55 + 105 * progress)
+            if pending.profile.projectile_speed is not None:
+                pygame.draw.line(
+                    effect,
+                    (*color, line_alpha),
+                    enemy_center,
+                    player_center,
+                    2,
+                )
+                projectile_progress = min(0.9, 0.18 + progress * 0.72)
+                projectile = (
+                    round(
+                        enemy_center[0]
+                        + (player_center[0] - enemy_center[0]) * projectile_progress
+                    ),
+                    round(
+                        enemy_center[1]
+                        + (player_center[1] - enemy_center[1]) * projectile_progress
+                    ),
+                )
+                pygame.draw.circle(effect, (*color, 70), projectile, 13)
+                pygame.draw.circle(effect, (*color, 235), projectile, 6)
+            else:
+                dx = player_center[0] - enemy_center[0]
+                dy = player_center[1] - enemy_center[1]
+                distance = max(1.0, math.hypot(dx, dy))
+                reach = min(float(pending.profile.reach), 190.0)
+                end = (
+                    round(enemy_center[0] + dx / distance * reach),
+                    round(enemy_center[1] + dy / distance * reach),
+                )
+                side_x = -dy / distance * (10 + 18 * progress)
+                side_y = dx / distance * (10 + 18 * progress)
+                pygame.draw.polygon(
+                    effect,
+                    (*color, round(28 + 62 * progress)),
+                    (
+                        enemy_center,
+                        (round(end[0] + side_x), round(end[1] + side_y)),
+                        (round(end[0] - side_x), round(end[1] - side_y)),
+                    ),
+                )
+                pygame.draw.line(
+                    effect,
+                    (*color, line_alpha + 40),
+                    enemy_center,
+                    end,
+                    max(2, round(2 + progress * 4)),
+                )
+
+            target_radius = round(38 - 20 * progress)
+            pygame.draw.circle(
+                effect,
+                (*color, 220 if imminent else 125),
+                player_center,
+                target_radius,
+                3 if imminent else 2,
+            )
+            for angle in (0, math.pi / 2, math.pi, math.pi * 1.5):
+                inner = target_radius + 3
+                outer = target_radius + 9
+                pygame.draw.line(
+                    effect,
+                    (*color, 225),
+                    (
+                        round(player_center[0] + math.cos(angle) * inner),
+                        round(player_center[1] + math.sin(angle) * inner),
+                    ),
+                    (
+                        round(player_center[0] + math.cos(angle) * outer),
+                        round(player_center[1] + math.sin(angle) * outer),
+                    ),
+                    2,
+                )
+
+            marker = (enemy_center[0], enemy_center[1] - charge_radius - 15)
+            if pending.profile.parryable:
+                pygame.draw.polygon(
+                    effect,
+                    (*color, 245),
+                    (
+                        (marker[0], marker[1] - 7),
+                        (marker[0] + 7, marker[1]),
+                        (marker[0], marker[1] + 7),
+                        (marker[0] - 7, marker[1]),
+                    ),
+                    2,
+                )
+            else:
+                pygame.draw.line(
+                    effect,
+                    (*color, 245),
+                    (marker[0] - 6, marker[1] - 6),
+                    (marker[0] + 6, marker[1] + 6),
+                    3,
+                )
+                pygame.draw.line(
+                    effect,
+                    (*color, 245),
+                    (marker[0] + 6, marker[1] - 6),
+                    (marker[0] - 6, marker[1] + 6),
+                    3,
+                )
+
+        for impact in self.attack_impacts:
+            progress = 1.0 - max(0.0, impact.remaining / 0.24)
+            color = (
+                COLORS["cyan"]
+                if impact.parried
+                else ((166, 99, 244) if not impact.parryable else COLORS["red"])
+            )
+            radius = round(16 + progress * 68)
+            alpha = round(220 * (1.0 - progress))
+            center = (round(impact.x), round(impact.y))
+            pygame.draw.circle(effect, (*color, alpha), center, radius, 4)
+            pygame.draw.circle(effect, (*COLORS["white"], alpha), center, 8, 2)
+            for angle in range(0, 360, 45):
+                radians = math.radians(angle)
+                start = (
+                    round(center[0] + math.cos(radians) * (radius * 0.35)),
+                    round(center[1] + math.sin(radians) * (radius * 0.35)),
+                )
+                end = (
+                    round(center[0] + math.cos(radians) * radius),
+                    round(center[1] + math.sin(radians) * radius),
+                )
+                pygame.draw.line(effect, (*color, alpha), start, end, 2)
+
+        self.canvas.blit(effect, (0, 0))
 
     def _draw_stat_bar(
         self,
@@ -2163,6 +2454,69 @@ class StartScreen:
             COLORS["muted"],
         )
         self.canvas.blit(hint, hint.get_rect(center=(640, 610)))
+        self._draw_notification()
+
+    def _draw_failure(self) -> None:
+        shade = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+        shade.fill((18, 4, 12, 188))
+        self.canvas.blit(shade, (0, 0))
+
+        for radius, alpha in ((46, 32), (34, 52), (22, 82)):
+            pygame.draw.circle(
+                self.canvas,
+                (239, 102, 105, alpha),
+                (640, 104),
+                radius,
+                2,
+            )
+        pygame.draw.line(self.canvas, COLORS["red"], (622, 86), (658, 122), 4)
+        pygame.draw.line(self.canvas, COLORS["red"], (658, 86), (622, 122), 4)
+
+        title = self.title_font.render("远征失格", True, COLORS["ice"])
+        self.canvas.blit(title, title.get_rect(center=(640, 198)))
+        subtitle = self.subtitle_font.render(
+            "记忆载体已崩解  /  回收可勘定残响",
+            True,
+            COLORS["red"],
+        )
+        self.canvas.blit(subtitle, subtitle.get_rect(center=(640, 241)))
+
+        panel = pygame.Rect(390, 278, 500, 202)
+        pygame.draw.rect(self.canvas, (10, 13, 24), panel)
+        pygame.draw.rect(self.canvas, (133, 55, 66), panel, 2)
+        rows = [
+            ("本局分数", f"{self.result_score:05d}"),
+            ("抵达层数", str(self.run_floor)),
+            ("最高连击", f"x{self.run_max_combo}"),
+            ("完美弹刀", str(self.run_parries)),
+            ("战时铸币", f"{self.run_currency}  已消散"),
+        ]
+        for index, (label, value) in enumerate(rows):
+            y = panel.y + 20 + index * 34
+            self.canvas.blit(
+                self.small_font.render(label, True, COLORS["muted"]),
+                (panel.x + 38, y),
+            )
+            value_color = COLORS["red"] if index == 4 else COLORS["ice"]
+            value_text = self.overlay_body_font.render(value, True, value_color)
+            self.canvas.blit(
+                value_text,
+                (panel.right - value_text.get_width() - 38, y - 5),
+            )
+
+        relic_text = self.small_font.render(
+            f"回响遗晶凝结  +{self.result_relics}",
+            True,
+            COLORS["gold"],
+        )
+        self.canvas.blit(relic_text, relic_text.get_rect(center=(640, 493)))
+        self._draw_ui_button(self._page_buttons()["lobby"], "返回灰塔大厅")
+        hint = self.small_font.render(
+            "Enter / Space 返回大厅",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(hint, hint.get_rect(center=(640, 600)))
         self._draw_notification()
 
     def _draw_notification(self) -> None:
