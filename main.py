@@ -25,6 +25,111 @@ class TutorialStep:
     action: str
 
 
+@dataclass(frozen=True)
+class ProgressionNode:
+    node_id: str
+    branch: str
+    title: str
+    prerequisite: str | None
+    requirement: str
+    cost: int
+    effect: str
+
+
+PROGRESSION_NODES = (
+    ProgressionNode(
+        "aftershock_calibration",
+        "锻刃谱系",
+        "余震校准",
+        None,
+        "完成新手教程",
+        40,
+        "将「镜面余震」纳入临时强化池。",
+    ),
+    ProgressionNode(
+        "refracted_afterglow",
+        "锻刃谱系",
+        "折光余温",
+        "aftershock_calibration",
+        "累计完成 3 次完美弹刀",
+        70,
+        "每局开场选择：普通攻击 +5% 或冲刺距离 +8%。",
+    ),
+    ProgressionNode(
+        "twin_blade_license",
+        "锻刃谱系",
+        "双刃许可",
+        "refracted_afterglow",
+        "击破锈冠骑士 1 次",
+        120,
+        "解锁双短刃武器，形成高速连击分支。",
+    ),
+    ProgressionNode(
+        "white_window_record",
+        "共鸣谱系",
+        "白窗记录",
+        None,
+        "完成新手教程",
+        40,
+        "训练房显示攻击前摇、完美窗口与反应时间。",
+    ),
+    ProgressionNode(
+        "perfect_circuit",
+        "共鸣谱系",
+        "完美回路",
+        "white_window_record",
+        "累计完成 20 次完美弹刀",
+        80,
+        "每局首次完美弹刀额外获得 1 点回响能量。",
+    ),
+    ProgressionNode(
+        "resonance_protocol",
+        "共鸣谱系",
+        "反响协议",
+        "perfect_circuit",
+        "单局反射 10 枚可反射投射物",
+        130,
+        "解锁回响枪与投射物构筑。",
+    ),
+    ProgressionNode(
+        "route_cartography",
+        "远征谱系",
+        "路线测绘",
+        None,
+        "首次抵达第二区域",
+        40,
+        "预示下一层节点类型、危险标签与遗晶倍率。",
+    ),
+    ProgressionNode(
+        "reserve_carry",
+        "远征谱系",
+        "余量携行",
+        "route_cartography",
+        "累计完成 3 次商店购买",
+        70,
+        "每局开场获得 20 点战时铸币。",
+    ),
+    ProgressionNode(
+        "risk_covenant",
+        "远征谱系",
+        "风险契约",
+        "reserve_carry",
+        "热度 1 无伤完成精英房",
+        110,
+        "可主动提高威胁值，成功清房获得额外遗晶。",
+    ),
+    ProgressionNode(
+        "city_seal",
+        "终局节点",
+        "城心钥印",
+        None,
+        "两条谱系各激活 2 个节点，并完成 10 次结算",
+        180,
+        "开放第五区域、城市心脏与终局热度层。",
+    ),
+)
+
+
 class AssetStore:
     def __init__(self) -> None:
         self.background = self._load("title_background.png", alpha=False)
@@ -110,6 +215,9 @@ class StartScreen:
         self.tutorial_index = 0
         self.tutorial_start_x = 0.0
         self.tutorial_move_distance = 0.0
+        self.lobby_selected = 0
+        self.progression_selected = 0
+        self.is_tutorial_run = False
 
         self.profile = self._load_profile()
         saved_settings = self.profile.get("settings", {})
@@ -141,6 +249,7 @@ class StartScreen:
         self.room_enemies: list[Enemy] = []
         self.result_score = 0
         self.result_new_record = False
+        self.result_relics = 0
 
         self.title_font = self._font(56, bold=True)
         self.subtitle_font = self._font(18, bold=True)
@@ -148,6 +257,8 @@ class StartScreen:
         self.small_font = self._font(16)
         self.overlay_title_font = self._font(30, bold=True)
         self.overlay_body_font = self._font(19)
+        self.lobby_title_font = self._font(34, bold=True)
+        self.lobby_node_font = self._font(17, bold=True)
 
     @staticmethod
     def _font(size: int, bold: bool = False) -> pygame.font.Font:
@@ -162,14 +273,53 @@ class StartScreen:
             data = json.loads(SAVE_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        if "echo_relics" not in data:
+            data["echo_relics"] = max(
+                0,
+                int(data.get("echo_tokens", data.get("permanent_memory", 0)) or 0),
+            )
+        if not isinstance(data.get("progression"), dict):
+            data["progression"] = {
+                "unlocked_nodes": [],
+                "equipped_start_module": None,
+            }
+        if not isinstance(data.get("lifetime_stats"), dict):
+            data["lifetime_stats"] = {}
+        return data
 
     def _load_save(self) -> bool:
         return bool(
             self.profile.get("best_score")
             or self.profile.get("best_floor")
             or self.profile.get("scores")
+            or self.profile.get("tutorial_completed")
         )
+
+    @property
+    def tutorial_completed(self) -> bool:
+        return bool(self.profile.get("tutorial_completed", False))
+
+    @property
+    def echo_relics(self) -> int:
+        return max(0, int(self.profile.get("echo_relics", 0) or 0))
+
+    def _progression(self) -> dict:
+        progression = self.profile.get("progression", {})
+        return progression if isinstance(progression, dict) else {}
+
+    def _unlocked_nodes(self) -> set[str]:
+        unlocked = self._progression().get("unlocked_nodes", [])
+        if not isinstance(unlocked, list):
+            return set()
+        return {node_id for node_id in unlocked if isinstance(node_id, str)}
+
+    def _stat(self, name: str) -> int:
+        stats = self.profile.get("lifetime_stats", {})
+        if not isinstance(stats, dict):
+            return 0
+        return max(0, int(stats.get(name, 0) or 0))
 
     @staticmethod
     def _default_keybinds() -> dict[str, int]:
@@ -197,10 +347,16 @@ class StartScreen:
 
     def _save_profile(self) -> None:
         data = {
-            "version": 1,
+            "version": 2,
             "best_score": int(self.profile.get("best_score", 0) or 0),
             "best_floor": int(self.profile.get("best_floor", 0) or 0),
             "scores": self.profile.get("scores", []),
+            "tutorial_completed": bool(
+                self.profile.get("tutorial_completed", False)
+            ),
+            "echo_relics": self.echo_relics,
+            "progression": self._progression(),
+            "lifetime_stats": self.profile.get("lifetime_stats", {}),
             "settings": self.settings.copy(),
         }
         data["settings"]["keybinds"] = self.keybinds.copy()
@@ -260,6 +416,12 @@ class StartScreen:
                         self._start_player_attack(self._attack_direction_from_input())
                     else:
                         self.pressed_button = button
+                elif self.page == "lobby":
+                    logical = self._to_logical(event.pos)
+                    for index, (_, _, rect) in enumerate(self._lobby_actions()):
+                        if rect.collidepoint(logical):
+                            self.pressed_button = str(index)
+                            break
                 else:
                     self.pressed_button = self._page_button_at(event.pos)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -273,6 +435,19 @@ class StartScreen:
                     if self.pressed_item is not None and index == self.pressed_item:
                         self._activate(index)
                     self.pressed_item = None
+                elif self.overlay is None and self.page == "lobby":
+                    logical = self._to_logical(event.pos)
+                    index = next(
+                        (
+                            index
+                            for index, (_, _, rect) in enumerate(self._lobby_actions())
+                            if rect.collidepoint(logical)
+                        ),
+                        None,
+                    )
+                    if self.pressed_button is not None and str(index) == self.pressed_button:
+                        self._activate_lobby_action(index)
+                    self.pressed_button = None
                 elif self.overlay is None:
                     button = self._page_button_at(event.pos)
                     if self.pressed_button is not None and button == self.pressed_button:
@@ -344,6 +519,21 @@ class StartScreen:
                 self._close_overlay()
             return
 
+        if self.overlay == "progression":
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self._close_overlay()
+            elif key in (pygame.K_UP, pygame.K_w):
+                self.progression_selected = (
+                    self.progression_selected - 1
+                ) % len(PROGRESSION_NODES)
+            elif key in (pygame.K_DOWN, pygame.K_s):
+                self.progression_selected = (
+                    self.progression_selected + 1
+                ) % len(PROGRESSION_NODES)
+            elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
+                self._activate_progression_node(self.progression_selected)
+            return
+
         if self.page == "game":
             if key == self.keybinds["attack"]:
                 self._start_player_attack(self._attack_direction_from_input())
@@ -366,6 +556,21 @@ class StartScreen:
         if self.page == "result":
             if key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
                 self._activate_page_button("restart")
+            elif key == pygame.K_ESCAPE:
+                self.page = "menu"
+            return
+
+        if self.page == "lobby":
+            if key in (pygame.K_LEFT, pygame.K_a, pygame.K_UP, pygame.K_w):
+                self.lobby_selected = (self.lobby_selected - 1) % len(
+                    self._lobby_actions()
+                )
+            elif key in (pygame.K_RIGHT, pygame.K_d, pygame.K_DOWN, pygame.K_s):
+                self.lobby_selected = (self.lobby_selected + 1) % len(
+                    self._lobby_actions()
+                )
+            elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
+                self._activate_lobby_action(self.lobby_selected)
             elif key == pygame.K_ESCAPE:
                 self.page = "menu"
             return
@@ -394,8 +599,20 @@ class StartScreen:
                 if rect.collidepoint(logical):
                     self.overlay_selected = index
                     return
+        if self.overlay == "progression":
+            logical = self._to_logical(position)
+            for index, rect in enumerate(self._progression_node_rects()):
+                if rect.collidepoint(logical):
+                    self.progression_selected = index
+                    return
         elif self.overlay is None and self.page == "menu":
             self._select_from_mouse(position)
+        elif self.overlay is None and self.page == "lobby":
+            logical = self._to_logical(position)
+            for index, (_, _, rect) in enumerate(self._lobby_actions()):
+                if rect.collidepoint(logical):
+                    self.lobby_selected = index
+                    return
 
     def _move_selection(self, direction: int) -> None:
         enabled = [i for i, item in enumerate(self.items) if item.enabled]
@@ -441,13 +658,117 @@ class StartScreen:
         if action == "quit":
             self.confirm_exit = True
         elif action == "start":
-            self._start_run(1)
+            if self.tutorial_completed:
+                self._enter_lobby()
+            else:
+                self._start_run(1, tutorial=True)
         elif action == "continue":
-            self._start_run(int(self.profile.get("best_floor", 1) or 1))
+            self._enter_lobby()
         elif action == "leaderboard":
             self._open_overlay("leaderboard")
         elif action == "settings":
             self._open_overlay("settings")
+
+    @staticmethod
+    def _lobby_actions() -> list[tuple[str, str, pygame.Rect]]:
+        return [
+            ("gate", "开启远征", pygame.Rect(490, 414, 300, 72)),
+            ("nexus", "进入回响中枢", pygame.Rect(485, 196, 310, 100)),
+            ("smith", "铸刃师", pygame.Rect(78, 420, 260, 86)),
+            ("records", "查看远征记录", pygame.Rect(920, 420, 280, 86)),
+        ]
+
+    def _enter_lobby(self) -> None:
+        self.page = "lobby"
+        self.overlay = None
+        self.confirm_exit = False
+        self.lobby_selected = 0
+        self._notify("灰塔大厅已就绪")
+
+    def _activate_lobby_action(self, index: int) -> None:
+        actions = self._lobby_actions()
+        if index < 0 or index >= len(actions):
+            return
+        action = actions[index][0]
+        if action == "gate":
+            self._start_run(
+                max(1, int(self.profile.get("best_floor", 1) or 1)),
+                tutorial=False,
+            )
+        elif action == "nexus":
+            self._open_overlay("progression", return_page="lobby")
+        elif action == "smith":
+            self._notify("铸刃师：武装谱系将在后续版本接入")
+        elif action == "records":
+            self._open_overlay("leaderboard", return_page="lobby")
+
+    def _node_requirement_met(self, node: ProgressionNode) -> bool:
+        if node.node_id in {"aftershock_calibration", "white_window_record"}:
+            return self.tutorial_completed
+        if node.node_id == "refracted_afterglow":
+            return self._stat("parries") >= 3
+        if node.node_id == "twin_blade_license":
+            return self._stat("boss_kills") >= 1
+        if node.node_id == "perfect_circuit":
+            return self._stat("parries") >= 20
+        if node.node_id == "resonance_protocol":
+            return self._stat("reflections") >= 10
+        if node.node_id == "route_cartography":
+            return int(self.profile.get("best_floor", 0) or 0) >= 2
+        if node.node_id == "reserve_carry":
+            return self._stat("shop_purchases") >= 3
+        if node.node_id == "risk_covenant":
+            return self._stat("elite_flawless") >= 1
+        if node.node_id == "city_seal":
+            unlocked = self._unlocked_nodes()
+            branches = {
+                branch: sum(
+                    1
+                    for item in PROGRESSION_NODES
+                    if item.branch == branch and item.node_id in unlocked
+                )
+                for branch in ("锻刃谱系", "共鸣谱系", "远征谱系")
+            }
+            return (
+                sum(value >= 2 for value in branches.values()) >= 2
+                and self._stat("settlements") >= 10
+                and self._stat("boss_kills") >= 2
+            )
+        return False
+
+    def _node_available(self, node: ProgressionNode) -> bool:
+        unlocked = self._unlocked_nodes()
+        return (
+            node.node_id not in unlocked
+            and (node.prerequisite is None or node.prerequisite in unlocked)
+            and self._node_requirement_met(node)
+        )
+
+    def _activate_progression_node(self, index: int) -> None:
+        if index < 0 or index >= len(PROGRESSION_NODES):
+            return
+        node = PROGRESSION_NODES[index]
+        unlocked = self._unlocked_nodes()
+        if node.node_id in unlocked:
+            self._notify("该节点已经铭刻在回响中枢")
+            return
+        if node.prerequisite and node.prerequisite not in unlocked:
+            self._notify("前置节点尚未激活")
+            return
+        if not self._node_requirement_met(node):
+            self._notify(f"尚未满足解锁门槛：{node.requirement}")
+            return
+        if self.echo_relics < node.cost:
+            self._notify(f"回响遗晶不足，还需 {node.cost - self.echo_relics}")
+            return
+        unlocked.add(node.node_id)
+        progression = self._progression().copy()
+        progression["unlocked_nodes"] = sorted(unlocked)
+        progression.setdefault("equipped_start_module", None)
+        self.profile["progression"] = progression
+        self.profile["echo_relics"] = self.echo_relics - node.cost
+        self._save_profile()
+        self._notify(f"已激活：{node.title}")
 
     def _open_overlay(self, overlay: str, return_page: str | None = None) -> None:
         self.overlay = overlay
@@ -505,6 +826,13 @@ class StartScreen:
                 self._overlay_back_rect().collidepoint(logical)
                 or not self._overlay_rect().collidepoint(logical)
             ):
+                self._close_overlay()
+        elif self.overlay == "progression":
+            if self._overlay_back_rect().collidepoint(logical):
+                self._close_overlay()
+            elif self._progression_activate_rect().collidepoint(logical):
+                self._activate_progression_node(self.progression_selected)
+            elif not self._overlay_rect().collidepoint(logical):
                 self._close_overlay()
 
     def _update(self, dt: float) -> None:
@@ -620,6 +948,8 @@ class StartScreen:
             self._draw_branding()
             self._draw_menu()
             self._draw_footer()
+        elif self.page == "lobby":
+            self._draw_lobby()
         elif self.page == "game":
             self._draw_game()
         elif self.page == "result":
@@ -662,6 +992,113 @@ class StartScreen:
 
         player = pygame.transform.scale(self.assets.player, (72, 90))
         self.canvas.blit(player, (604, 486))
+
+    def _draw_lobby(self) -> None:
+        # The lobby is drawn from simple architectural shapes so it remains
+        # usable even when the prototype asset pack is replaced.
+        self.canvas.fill((8, 18, 31))
+        for y, color in ((92, (12, 35, 47)), (300, (10, 29, 41)), (520, (7, 20, 31))):
+            pygame.draw.rect(self.canvas, color, (0, y, 1280, 220))
+        pygame.draw.rect(self.canvas, (18, 52, 60), (0, 540, 1280, 180))
+        pygame.draw.line(self.canvas, COLORS["cyan"], (0, 540), (1280, 540), 2)
+        for x in range(24, 1280, 64):
+            pygame.draw.line(self.canvas, (23, 70, 75), (x, 540), (x + 22, 720), 1)
+
+        title = self.lobby_title_font.render("灰塔 · 回响大厅", True, COLORS["ice"])
+        self.canvas.blit(title, (52, 34))
+        subtitle = self.small_font.render(
+            "远征归航站  /  记忆重构区", True, COLORS["cyan"]
+        )
+        self.canvas.blit(subtitle, (56, 78))
+
+        relics = self.overlay_body_font.render(
+            f"回响遗晶  {self.echo_relics:04d}", True, COLORS["gold"]
+        )
+        self.canvas.blit(relics, (930, 44))
+        stats = self.small_font.render(
+            f"远征 {self._stat('settlements')}  ·  最高层数 {int(self.profile.get('best_floor', 0) or 0)}",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(stats, (930, 78))
+        if self.result_relics:
+            settlement = self.small_font.render(
+                f"本次远征凝结 +{self.result_relics} 遗晶",
+                True,
+                COLORS["gold"],
+            )
+            self.canvas.blit(settlement, (930, 104))
+
+        # Central gate: the primary interaction in the room.
+        pygame.draw.rect(self.canvas, (7, 17, 28), (480, 286, 320, 254))
+        pygame.draw.rect(self.canvas, (38, 104, 105), (480, 286, 320, 254), 2)
+        pygame.draw.rect(self.canvas, (15, 48, 56), (545, 330, 190, 210))
+        pygame.draw.rect(self.canvas, COLORS["cyan"], (545, 330, 190, 210), 2)
+        gate = pygame.transform.scale(self.assets.logo, (92, 92))
+        gate.set_alpha(190 + int(45 * math.sin(self.elapsed * 2.0)))
+        self.canvas.blit(gate, gate.get_rect(center=(640, 394)))
+        gate_label = self.overlay_body_font.render("远征城门", True, COLORS["ice"])
+        self.canvas.blit(gate_label, gate_label.get_rect(center=(640, 565)))
+
+        # Echo nexus above the gate.
+        pygame.draw.circle(self.canvas, (13, 47, 57), (640, 238), 66)
+        pygame.draw.circle(self.canvas, COLORS["cyan"], (640, 238), 66, 2)
+        nexus = pygame.transform.scale(self.assets.logo, (78, 78))
+        nexus.set_alpha(220)
+        self.canvas.blit(nexus, nexus.get_rect(center=(640, 238)))
+        self.canvas.blit(
+            self.small_font.render("回响中枢", True, COLORS["ice"]),
+            (587, 304),
+        )
+
+        # Left smith and right archive are NPC/building interaction points.
+        self._draw_lobby_smith()
+        self._draw_lobby_archive()
+        for index, (_, label, rect) in enumerate(self._lobby_actions()):
+            selected = index == self.lobby_selected
+            if selected:
+                pygame.draw.rect(self.canvas, (27, 78, 79), rect, 2)
+                marker = self.assets.cursor.get_rect(midright=(rect.left - 12, rect.centery))
+                self.canvas.blit(pygame.transform.scale(self.assets.cursor, (24, 24)), marker)
+            if index == 0:
+                text_rect = pygame.Rect(rect.x, rect.bottom + 4, rect.width, 32)
+                self.canvas.blit(
+                    self.small_font.render(label, True, COLORS["gold"] if selected else COLORS["muted"]),
+                    self.small_font.render(label, True, COLORS["gold"] if selected else COLORS["muted"]).get_rect(center=text_rect.center),
+                )
+
+        hint = self.small_font.render(
+            "方向键 / WASD 选择交互点    Enter 进入    Esc 返回主菜单",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(hint, hint.get_rect(center=(640, 688)))
+        self._draw_notification()
+
+    def _draw_lobby_smith(self) -> None:
+        pygame.draw.rect(self.canvas, (20, 35, 42), (88, 342, 240, 82))
+        pygame.draw.rect(self.canvas, (72, 119, 113), (88, 342, 240, 82), 2)
+        pygame.draw.rect(self.canvas, (122, 71, 54), (142, 388, 42, 46))
+        pygame.draw.rect(self.canvas, COLORS["gold"], (151, 365, 24, 24))
+        text = self.small_font.render("铸刃师 · 武装谱系", True, COLORS["ice"])
+        self.canvas.blit(text, (202, 365))
+        self.canvas.blit(
+            self.small_font.render("锻造与武器解锁", True, COLORS["muted"]),
+            (202, 390),
+        )
+
+    def _draw_lobby_archive(self) -> None:
+        pygame.draw.rect(self.canvas, (20, 35, 42), (920, 342, 280, 82))
+        pygame.draw.rect(self.canvas, (72, 119, 113), (920, 342, 280, 82), 2)
+        pygame.draw.rect(self.canvas, (44, 92, 98), (952, 366, 42, 36))
+        pygame.draw.line(self.canvas, COLORS["cyan"], (958, 374), (988, 374), 2)
+        pygame.draw.line(self.canvas, COLORS["cyan"], (958, 382), (988, 382), 2)
+        text = self.small_font.render("远征档案 · 排行记录", True, COLORS["ice"])
+        self.canvas.blit(text, (1020, 365))
+        self.canvas.blit(
+            self.small_font.render("查看历史战绩", True, COLORS["muted"]),
+            (1020, 390),
+        )
 
     def _menu_rect(self, index: int) -> pygame.Rect:
         return pygame.Rect(440, 315 + index * 68, 400, 58)
@@ -710,11 +1147,26 @@ class StartScreen:
         self._draw_notification()
 
     def _overlay_rect(self) -> pygame.Rect:
+        if self.overlay == "progression":
+            return pygame.Rect(72, 42, 1136, 636)
         return pygame.Rect(252, 96, 776, 528)
 
     def _overlay_back_rect(self) -> pygame.Rect:
         rect = self._overlay_rect()
+        if self.overlay == "progression":
+            return pygame.Rect(rect.x + 30, rect.bottom - 60, 220, 42)
         return pygame.Rect(rect.x + 30, rect.bottom - 76, 210, 44)
+
+    def _progression_node_rects(self) -> list[pygame.Rect]:
+        rect = self._overlay_rect()
+        return [
+            pygame.Rect(rect.x + 28, rect.y + 86 + index * 40, 520, 34)
+            for index in range(len(PROGRESSION_NODES))
+        ]
+
+    def _progression_activate_rect(self) -> pygame.Rect:
+        rect = self._overlay_rect()
+        return pygame.Rect(rect.right - 278, rect.bottom - 60, 248, 42)
 
     def _setting_rects(self) -> list[pygame.Rect]:
         rect = self._overlay_rect()
@@ -764,6 +1216,7 @@ class StartScreen:
         title_text = {
             "leaderboard": "本地排行榜",
             "keybinds": "键位设置",
+            "progression": "回响中枢 · 成长拓扑",
         }.get(self.overlay, "设置")
         title = self.overlay_title_font.render(title_text, True, COLORS["ice"])
         self.canvas.blit(title, (rect.x + 30, rect.y + 24))
@@ -772,16 +1225,84 @@ class StartScreen:
             self._draw_leaderboard(rect)
         elif self.overlay == "keybinds":
             self._draw_keybinds(rect)
+        elif self.overlay == "progression":
+            self._draw_progression(rect)
         else:
             self._draw_settings(rect)
 
         hint_text = (
             "↑↓ 选择    Enter 设置    Esc 返回"
             if self.overlay == "keybinds"
+            else "↑↓ 浏览节点    Enter 激活    Esc 返回"
+            if self.overlay == "progression"
             else "↑↓ 选择    ←→ 调整    Enter 确认    Esc 返回"
         )
         hint = self.small_font.render(hint_text, True, COLORS["muted"])
         self.canvas.blit(hint, (rect.right - hint.get_width() - 28, rect.bottom - 34))
+
+    def _draw_progression(self, rect: pygame.Rect) -> None:
+        unlocked = self._unlocked_nodes()
+        node_rects = self._progression_node_rects()
+        for index, (node, node_rect) in enumerate(zip(PROGRESSION_NODES, node_rects)):
+            is_unlocked = node.node_id in unlocked
+            is_selected = index == self.progression_selected
+            available = self._node_available(node)
+            if is_selected:
+                pygame.draw.rect(self.canvas, (20, 61, 66), node_rect)
+                pygame.draw.rect(self.canvas, COLORS["cyan"], node_rect, 2)
+            elif is_unlocked:
+                pygame.draw.rect(self.canvas, (15, 46, 49), node_rect)
+            branch_color = {
+                "锻刃谱系": COLORS["gold"],
+                "共鸣谱系": COLORS["cyan"],
+                "远征谱系": (166, 205, 184),
+                "终局节点": COLORS["red"],
+            }[node.branch]
+            pygame.draw.rect(self.canvas, branch_color, (node_rect.x + 10, node_rect.y + 9, 7, 16))
+            state = "已铭刻" if is_unlocked else "可激活" if available else "未解锁"
+            state_color = COLORS["cyan"] if is_unlocked else COLORS["gold"] if available else COLORS["muted"]
+            label = self.lobby_node_font.render(
+                f"{node.title}  ·  {node.branch}", True, COLORS["ice"] if is_selected else COLORS["muted"]
+            )
+            self.canvas.blit(label, (node_rect.x + 30, node_rect.y + 7))
+            state_text = self.small_font.render(state, True, state_color)
+            self.canvas.blit(state_text, (node_rect.right - state_text.get_width() - 16, node_rect.y + 8))
+
+        node = PROGRESSION_NODES[self.progression_selected]
+        detail = pygame.Rect(rect.x + 584, rect.y + 86, 514, 430)
+        pygame.draw.rect(self.canvas, (8, 25, 35), detail)
+        pygame.draw.rect(self.canvas, (42, 105, 106), detail, 2)
+        heading = self.overlay_body_font.render(node.title, True, COLORS["ice"])
+        self.canvas.blit(heading, (detail.x + 28, detail.y + 28))
+        branch = self.small_font.render(node.branch, True, COLORS["cyan"])
+        self.canvas.blit(branch, (detail.x + 30, detail.y + 64))
+        lines = [
+            f"消耗：{node.cost} 回响遗晶",
+            f"前置：{self._node_title(node.prerequisite)}",
+            f"门槛：{node.requirement}",
+            f"功能：{node.effect}",
+        ]
+        for index, line in enumerate(lines):
+            color = COLORS["gold"] if index == 0 else COLORS["muted"]
+            for line_index, wrapped in enumerate(self._wrap_text(line, self.small_font, detail.width - 56)):
+                y = detail.y + 112 + index * 60 + line_index * 21
+                self.canvas.blit(self.small_font.render(wrapped, True, color), (detail.x + 28, y))
+        self._draw_ui_button(
+            self._progression_activate_rect(),
+            "激活节点",
+            selected=True,
+            enabled=self._node_available(node) and self.echo_relics >= node.cost,
+        )
+        self._draw_ui_button(self._overlay_back_rect(), "离开中枢")
+
+    @staticmethod
+    def _node_title(node_id: str | None) -> str:
+        if node_id is None:
+            return "无"
+        for node in PROGRESSION_NODES:
+            if node.node_id == node_id:
+                return node.title
+        return "未知节点"
 
     def _draw_leaderboard(self, rect: pygame.Rect) -> None:
         rows: list[tuple[str, str, str]] = []
@@ -828,7 +1349,7 @@ class StartScreen:
             self.canvas.blit(detail_text, (rect.x + 112, y + 27))
         self._draw_ui_button(
             self._overlay_back_rect(),
-            "返回主菜单",
+            "返回大厅" if self.return_page == "lobby" else "返回主菜单",
             self.overlay_selected == 0,
         )
 
@@ -1004,11 +1525,12 @@ class StartScreen:
             SpearThrower(650, 522),
         ]
 
-    def _start_run(self, floor: int) -> None:
+    def _start_run(self, floor: int, *, tutorial: bool = True) -> None:
         self.pressed_keys.clear()
         self.page = "game"
         self.overlay = None
         self.confirm_exit = False
+        self.is_tutorial_run = tutorial
         self.run_floor = max(1, floor)
         self.run_score = 0
         self.run_combo = 0
@@ -1018,7 +1540,7 @@ class StartScreen:
         self._defeated_enemies.clear()
         self.room_enemies = self._build_training_room_enemies()
         self._refresh_tutorial_hints()
-        self.tutorial_index = 0
+        self.tutorial_index = 0 if tutorial else len(self.tutorial_steps) - 1
         self.tutorial_start_x = self.player.x
         self.tutorial_move_distance = 0.0
         self._notify("试炼房间已开启")
@@ -1045,7 +1567,7 @@ class StartScreen:
 
     def _activate_page_button(self, button: str | None) -> None:
         if button == "finish" and self.page == "game":
-            if self._current_tutorial_step.action != "finish":
+            if self.is_tutorial_run and self._current_tutorial_step.action != "finish":
                 self._notify(f"先完成教学：{self._current_tutorial_step.title}")
                 return
             self._finish_run()
@@ -1104,11 +1626,25 @@ class StartScreen:
             key=lambda score: int(score.get("score", 0) or 0),
             reverse=True,
         )[:20]
+        self.result_relics = 40 if self.is_tutorial_run else 30 + self.run_floor * 10 + min(
+            self.run_parries * 2, 30
+        )
+        self.profile["echo_relics"] = self.echo_relics + self.result_relics
+        self.profile["tutorial_completed"] = (
+            True if self.is_tutorial_run else self.tutorial_completed
+        )
+        lifetime_stats = self.profile.get("lifetime_stats", {})
+        if not isinstance(lifetime_stats, dict):
+            lifetime_stats = {}
+        lifetime_stats = lifetime_stats.copy()
+        lifetime_stats["settlements"] = self._stat("settlements") + 1
+        lifetime_stats["parries"] = self._stat("parries") + self.run_parries
+        self.profile["lifetime_stats"] = lifetime_stats
         self._save_profile()
         self.has_save = True
         self.items = self._build_items()
-        self.page = "result"
-        self._notify("本局记录已保存")
+        self._enter_lobby()
+        self._notify(f"远征已结算，凝结回响遗晶 +{self.result_relics}")
 
     def _draw_game(self) -> None:
         shade = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
@@ -1142,16 +1678,29 @@ class StartScreen:
         self.canvas.blit(gate, (520, 340))
         self._draw_player()
         self._draw_enemies()
-        self._draw_tutorial_panel()
+        if self.is_tutorial_run:
+            self._draw_tutorial_panel()
 
-        room_title = self.overlay_body_font.render("试炼房间已开启", True, COLORS["ice"])
-        room_hint = self.small_font.render(
-            self._current_tutorial_step.objective,
+        room_title = self.overlay_body_font.render(
+            "试炼房间已开启" if self.is_tutorial_run else "远征序章已开启",
             True,
-            COLORS["muted"],
+            COLORS["ice"],
         )
         self.canvas.blit(room_title, room_title.get_rect(center=(410, 296)))
-        self.canvas.blit(room_hint, room_hint.get_rect(center=(410, 325)))
+        if self.is_tutorial_run:
+            room_hint = self.small_font.render(
+                self._current_tutorial_step.objective,
+                True,
+                COLORS["muted"],
+            )
+            self.canvas.blit(room_hint, room_hint.get_rect(center=(410, 325)))
+        else:
+            room_hint = self.small_font.render(
+                "完成当前房间后可返回大厅",
+                True,
+                COLORS["muted"],
+            )
+            self.canvas.blit(room_hint, room_hint.get_rect(center=(410, 325)))
 
         combo = self.overlay_body_font.render(
             f"连击  x{self.run_combo}",
@@ -1168,7 +1717,10 @@ class StartScreen:
 
         for name, rect in self._page_buttons().items():
             if name == "finish":
-                unlocked = self._current_tutorial_step.action == "finish"
+                unlocked = (
+                    not self.is_tutorial_run
+                    or self._current_tutorial_step.action == "finish"
+                )
                 label = "完成当前房间" if unlocked else "完成教学后开启"
                 self._draw_ui_button(rect, label, enabled=unlocked)
             else:

@@ -1,3 +1,4 @@
+import json
 import os
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -352,7 +353,53 @@ def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
     assert app._current_tutorial_step.action == "finish"
 
     app._activate_page_button("finish")
-    assert app.page == "result"
+    assert app.page == "lobby"
+    assert app.tutorial_completed is True
+    assert app.echo_relics == 40
+    pygame.quit()
+
+
+def test_tutorial_completion_enters_lobby_and_lobby_starts_new_run(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1, tutorial=True)
+    app.tutorial_index = len(app.tutorial_steps) - 1
+    app._activate_page_button("finish")
+
+    assert app.page == "lobby"
+    assert app.is_tutorial_run is True
+    assert app.echo_relics == 40
+
+    app._activate_lobby_action(0)
+    assert app.page == "game"
+    assert app.is_tutorial_run is False
+    assert app.tutorial_index == len(app.tutorial_steps) - 1
+    pygame.quit()
+
+
+def test_lobby_nexus_unlocks_available_node_and_persists(monkeypatch, tmp_path):
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.profile["tutorial_completed"] = True
+    app.profile["echo_relics"] = 40
+    app._enter_lobby()
+    app._activate_lobby_action(1)
+
+    assert app.overlay == "progression"
+    app._activate_progression_node(0)
+
+    assert "aftershock_calibration" in app._unlocked_nodes()
+    assert app.echo_relics == 0
+    saved = json.loads(save_file.read_text(encoding="utf-8"))
+    assert "aftershock_calibration" in saved["progression"]["unlocked_nodes"]
+    assert saved["echo_relics"] == 0
     pygame.quit()
 
 
