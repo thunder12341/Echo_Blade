@@ -43,6 +43,9 @@ class Player:
     DASH_DISTANCE = 72.0
     DASH_COOLDOWN = 0.32
 
+    PARRY_DURATION = 0.32
+    PERFECT_PARRY_WINDOW = 0.12
+
     ATTACK_DURATION = 0.34
     ATTACK_ACTIVE_START = 0.06
     ATTACK_ACTIVE_END = 0.2
@@ -83,6 +86,7 @@ class Player:
         self._coyote_timer = self.COYOTE_TIME
         self._jump_buffer_timer = 0.0
         self._dash_cooldown = 0.0
+        self._parry_elapsed = -1.0
         self._attack_elapsed = -1.0
         self._attack_direction = "side"
         self._combo_index = 0
@@ -105,6 +109,14 @@ class Player:
     @property
     def attack_in_progress(self) -> bool:
         return 0.0 <= self._attack_elapsed < self.ATTACK_DURATION
+
+    @property
+    def parry_active(self) -> bool:
+        return 0.0 <= self._parry_elapsed < self.PARRY_DURATION
+
+    @property
+    def perfect_parry_active(self) -> bool:
+        return 0.0 <= self._parry_elapsed <= self.PERFECT_PARRY_WINDOW
 
     @property
     def attack_active(self) -> bool:
@@ -155,6 +167,9 @@ class Player:
         self._update_timers(elapsed)
 
         axis = max(-1.0, min(1.0, float(move_axis)))
+        if self.parry_active:
+            axis = 0.0
+            self.velocity_x = 0.0
         if abs(axis) > 0.01:
             self.facing = 1 if axis > 0 else -1
             target_speed = axis * self.MOVE_SPEED
@@ -210,11 +225,13 @@ class Player:
             self.grounded = True
 
     def request_jump(self) -> bool:
+        if self.parry_active:
+            return False
         self._jump_buffer_timer = self.JUMP_BUFFER_TIME
         return self.grounded or self._coyote_timer > 0.0
 
     def start_attack(self, direction: str = "side") -> bool:
-        if self.attack_in_progress:
+        if self.attack_in_progress or self.parry_active:
             return False
         if direction not in self.ATTACK_REACH:
             raise ValueError(f"不支持的攻击方向: {direction}")
@@ -239,7 +256,7 @@ class Player:
         return True
 
     def dash(self) -> bool:
-        if self._dash_cooldown > 0.0:
+        if self._dash_cooldown > 0.0 or self.parry_active:
             return False
         self._dash_cooldown = self.DASH_COOLDOWN
         self.x = max(
@@ -249,9 +266,26 @@ class Player:
         self.velocity_x = self.facing * self.MOVE_SPEED * 1.35
         return True
 
+    def start_parry(self) -> bool:
+        if self.parry_active:
+            return False
+        self._attack_elapsed = -1.0
+        self._parry_elapsed = 0.0
+        self.velocity_x = 0.0
+        return True
+
+    def take_damage(self, amount: int) -> int:
+        actual_damage = max(0, int(round(amount)))
+        self.hp = max(0, self.hp - actual_damage)
+        return actual_damage
+
     def _update_timers(self, dt: float) -> None:
         self._dash_cooldown = max(0.0, self._dash_cooldown - dt)
         self._jump_buffer_timer = max(0.0, self._jump_buffer_timer - dt)
+        if self._parry_elapsed >= 0.0:
+            self._parry_elapsed += dt
+            if self._parry_elapsed >= self.PARRY_DURATION:
+                self._parry_elapsed = -1.0
         if self._combo_timer > 0.0:
             self._combo_timer = max(0.0, self._combo_timer - dt)
             if self._combo_timer == 0.0 and not self.attack_in_progress:

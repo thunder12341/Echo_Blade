@@ -16,7 +16,23 @@ from game.entities import (
     ShieldGuard,
     SpearThrower,
 )
-from main import StartScreen
+from main import PendingEnemyAttack, StartScreen
+
+
+def test_font_loader_survives_broken_windows_font_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("WINDIR", str(tmp_path))
+
+    def broken_sysfont(*args, **kwargs):
+        raise TypeError("expected str, bytes or os.PathLike object, not int")
+
+    monkeypatch.setattr(pygame.font, "SysFont", broken_sysfont)
+    pygame.init()
+
+    font = StartScreen._font(18, bold=True)
+
+    assert isinstance(font, pygame.font.Font)
+    assert font.render("fallback", True, (255, 255, 255)).get_width() > 0
+    pygame.quit()
 
 
 def test_start_screen_menu_states(monkeypatch, tmp_path):
@@ -150,6 +166,102 @@ def test_player_jump_uses_gravity_and_lands():
     assert player.velocity_y == 0
 
 
+def test_player_parry_locks_movement_and_other_actions():
+    player = Player(300, 566)
+    player.velocity_x = 180
+
+    assert player.start_parry() is True
+    player.update(0.05, 1)
+
+    assert player.x == 300
+    assert player.velocity_x == 0
+    assert player.request_jump() is False
+    assert player.dash() is False
+    assert player.start_attack() is False
+
+    player.update(player.PARRY_DURATION, 0)
+    assert player.parry_active is False
+
+
+def test_parry_without_incoming_hit_does_not_count(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1)
+
+    app._handle_key(app.keybinds["parry"])
+
+    assert app.player.parry_active is True
+    assert app.run_parries == 0
+    pygame.quit()
+
+
+def test_perfect_parry_negates_hit_and_reflects_damage(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1, tutorial=False)
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+    starting_player_hp = app.player.hp
+    starting_enemy_hp = enemy.hp
+
+    app.player.start_parry()
+    app.player.update(app.player.PERFECT_PARRY_WINDOW * 0.75, 1)
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+
+    assert app.player.hp == starting_player_hp
+    assert enemy.hp < starting_enemy_hp
+    assert app.run_parries == 1
+    assert app.run_combo == 2
+    pygame.quit()
+
+
+def test_parry_pressed_too_early_does_not_negate_hit(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1, tutorial=False)
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+
+    app.player.start_parry()
+    app.player.update(app.player.PERFECT_PARRY_WINDOW + 0.02, 0)
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+
+    assert app.player.hp == app.player.max_hp - enemy.damage
+    assert enemy.hp == enemy.max_hp
+    assert app.run_parries == 0
+    pygame.quit()
+
+
+def test_non_parryable_attack_hits_during_perfect_window(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1, tutorial=False)
+    enemy = RiftWorm(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+
+    app.player.start_parry()
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+
+    assert app.player.hp == app.player.max_hp - enemy.damage
+    assert enemy.hp == enemy.max_hp
+    assert app.run_parries == 0
+    pygame.quit()
+
+
 def test_player_three_hit_attack_has_active_hitbox():
     player = Player(300, 566)
 
@@ -202,7 +314,7 @@ def test_game_attack_damages_enemy(monkeypatch, tmp_path):
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
-    app._start_run(1)
+    app._start_run(1, tutorial=False)
     enemy = app.room_enemies[0]
     starting_hp = enemy.hp
 
@@ -215,6 +327,29 @@ def test_game_attack_damages_enemy(monkeypatch, tmp_path):
     pygame.quit()
 
 
+def test_defeated_enemy_is_removed_from_active_room(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._start_run(1, tutorial=False)
+    enemy = app.room_enemies[0]
+    enemy.hp = 1
+
+    app._start_player_attack()
+    app.player.update(0.1, 0)
+    app._resolve_player_attack()
+    score_after_defeat = app.run_score
+
+    assert enemy.hp == 0
+    assert enemy not in app.room_enemies
+
+    app._resolve_player_attack()
+    assert app.run_score == score_after_defeat
+    pygame.quit()
+
+
 def test_initial_room_move_and_jump_use_game_loop_input(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
 
@@ -223,6 +358,8 @@ def test_initial_room_move_and_jump_use_game_loop_input(monkeypatch, tmp_path):
     app = StartScreen(screen)
     app._start_run(1)
     starting_x = app.player.x
+
+    assert app.room_enemies == []
 
     pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d))
     app._handle_events()
@@ -246,13 +383,33 @@ def test_initial_room_move_and_jump_use_game_loop_input(monkeypatch, tmp_path):
     pygame.quit()
 
 
+def test_tutorial_keeps_a_d_as_fallback_after_rebinding(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.keybinds["left"] = pygame.K_q
+    app.keybinds["right"] = pygame.K_e
+    app._start_run(1)
+    starting_x = app.player.x
+
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d))
+    app._handle_events()
+    for _ in range(20):
+        app._update(1.0 / 60.0)
+
+    assert app.player.x > starting_x
+    pygame.quit()
+
+
 def test_down_attack_hit_bounces_player_up(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
 
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
-    app._start_run(1)
+    app._start_run(1, tutorial=False)
     app.player.x = app.room_enemies[0].x
     app.player.y = 500
     app.player.grounded = False
@@ -327,6 +484,7 @@ def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
     app._handle_events()
     app._update(1.0 / 60.0)
     assert app._current_tutorial_step.action == "attack"
+    assert len(app.room_enemies) == 2
 
     app._handle_key(app.keybinds["attack"])
     assert app._current_tutorial_step.action == "up_attack"
@@ -349,7 +507,21 @@ def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
             break
     assert app._current_tutorial_step.action == "parry"
 
+    for _ in range(30):
+        app._update(1.0 / 60.0)
+        if (
+            app.pending_enemy_attacks
+            and app.pending_enemy_attacks[0].remaining
+            <= app.player.PERFECT_PARRY_WINDOW * 0.75
+        ):
+            break
+    assert app.pending_enemy_attacks
+
     app._handle_key(app.keybinds["parry"])
+    for _ in range(10):
+        app._update(1.0 / 60.0)
+        if app._current_tutorial_step.action == "finish":
+            break
     assert app._current_tutorial_step.action == "finish"
 
     app._activate_page_button("finish")

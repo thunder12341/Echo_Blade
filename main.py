@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import pygame
 
-from game.entities import Chaser, Enemy, Hitbox, Player, SpearThrower
+from game.entities import AttackProfile, Chaser, Enemy, Hitbox, Player, SpearThrower
 from settings import COLORS, FPS, IMAGE_DIR, LOGICAL_SIZE, SAVE_FILE, WINDOW_TITLE
 
 
@@ -23,6 +25,13 @@ class TutorialStep:
     objective: str
     hint: str
     action: str
+
+
+@dataclass
+class PendingEnemyAttack:
+    enemy: Enemy
+    profile: AttackProfile
+    remaining: float
 
 
 @dataclass(frozen=True)
@@ -247,6 +256,7 @@ class StartScreen:
         self._attack_hits: set[tuple[int, int]] = set()
         self._defeated_enemies: set[int] = set()
         self.room_enemies: list[Enemy] = []
+        self.pending_enemy_attacks: list[PendingEnemyAttack] = []
         self.result_score = 0
         self.result_new_record = False
         self.result_relics = 0
@@ -262,9 +272,32 @@ class StartScreen:
 
     @staticmethod
     def _font(size: int, bold: bool = False) -> pygame.font.Font:
-        for name in ("microsoftyahei", "simhei", "noto sans cjk sc", "arial"):
-            return pygame.font.SysFont(name, size, bold=bold)
-        return pygame.font.Font(None, size)
+        pygame.font.init()
+        windows_dir = Path(os.environ.get("WINDIR", "C:/Windows"))
+        filenames = (
+            ("msyhbd.ttc", "simhei.ttf", "msyh.ttc")
+            if bold
+            else ("msyh.ttc", "simhei.ttf", "simsun.ttc")
+        )
+        for filename in filenames:
+            font_path = windows_dir / "Fonts" / filename
+            if not font_path.is_file():
+                continue
+            try:
+                return pygame.font.Font(str(font_path), size)
+            except (OSError, TypeError, pygame.error):
+                continue
+
+        # On non-Windows platforms SysFont is still useful, but malformed
+        # Windows font registry values can make pygame's enumeration fail.
+        try:
+            return pygame.font.SysFont(
+                ("microsoftyahei", "simhei", "noto sans cjk sc", "arial"),
+                size,
+                bold=bold,
+            )
+        except (OSError, TypeError, pygame.error):
+            return pygame.font.Font(None, size)
 
     def _load_profile(self) -> dict:
         if not SAVE_FILE.exists():
@@ -538,11 +571,8 @@ class StartScreen:
             if key == self.keybinds["attack"]:
                 self._start_player_attack(self._attack_direction_from_input())
             elif key == self.keybinds["parry"]:
-                self.run_score += 260
-                self.run_combo += 2
-                self.run_parries += 1
-                self._notify("PERFECT  弹刀成功")
-                self._complete_tutorial_action("parry")
+                if self.player.start_parry():
+                    self._notify("弹刀架势")
             elif key in (pygame.K_LSHIFT, self.keybinds["dash"]):
                 if self.player.dash():
                     self._notify("冲刺")
@@ -854,13 +884,19 @@ class StartScreen:
         if not self.player.grounded:
             self._complete_tutorial_action("jump")
         self._resolve_player_attack()
+        if not self.is_tutorial_run or self._current_tutorial_step.action == "parry":
+            self._update_enemy_attacks(fixed_dt)
 
     def _move_axis(self) -> float:
-        left = self._is_key_down(pygame.K_LEFT) or self._is_key_down(
-            self.keybinds["left"]
+        left = (
+            self._is_key_down(pygame.K_LEFT)
+            or self._is_key_down(pygame.K_a)
+            or self._is_key_down(self.keybinds["left"])
         )
-        right = self._is_key_down(pygame.K_RIGHT) or self._is_key_down(
-            self.keybinds["right"]
+        right = (
+            self._is_key_down(pygame.K_RIGHT)
+            or self._is_key_down(pygame.K_d)
+            or self._is_key_down(self.keybinds["right"])
         )
         return float(right) - float(left)
 
@@ -899,14 +935,15 @@ class StartScreen:
         if attack_hitbox is None:
             return
 
-        for index, enemy in enumerate(self.room_enemies):
-            if enemy.defeated or (self.player.attack_id, index) in self._attack_hits:
+        for enemy in list(self.room_enemies):
+            enemy_id = id(enemy)
+            if enemy.defeated or (self.player.attack_id, enemy_id) in self._attack_hits:
                 continue
             enemy_hitbox = Hitbox(enemy.x - 18, enemy.y - 44, 36, 44)
             if not attack_hitbox.overlaps(enemy_hitbox):
                 continue
 
-            self._attack_hits.add((self.player.attack_id, index))
+            self._attack_hits.add((self.player.attack_id, enemy_id))
             damage = enemy.take_damage(
                 self.player.attack_damage,
                 source_x=self.player.x,
@@ -919,12 +956,80 @@ class StartScreen:
                 self._complete_tutorial_action("down_attack")
             self.run_score += 120
             self.run_combo += 1
-            if enemy.defeated and index not in self._defeated_enemies:
-                self._defeated_enemies.add(index)
-                self.run_score += enemy.bounty_score
-                self._notify(f"击败 {enemy.display_name}")
+            if enemy.defeated:
+                self._award_enemy_defeat(enemy)
             else:
                 self._notify(f"命中 {enemy.display_name}  -{damage}")
+
+        self._remove_defeated_enemies()
+
+    def _update_enemy_attacks(self, dt: float) -> None:
+        pending_enemy_ids = {
+            id(pending.enemy) for pending in self.pending_enemy_attacks
+        }
+        for enemy in list(self.room_enemies):
+            if enemy.defeated:
+                continue
+            intent = enemy.update(dt, self.player.position)
+            if intent.attack is not None and id(enemy) not in pending_enemy_ids:
+                self.pending_enemy_attacks.append(
+                    PendingEnemyAttack(enemy, intent.attack, intent.attack.telegraph_time)
+                )
+                pending_enemy_ids.add(id(enemy))
+
+        unresolved: list[PendingEnemyAttack] = []
+        for pending in self.pending_enemy_attacks:
+            if pending.enemy.defeated or pending.enemy not in self.room_enemies:
+                continue
+            pending.remaining -= dt
+            if pending.remaining > 0.0:
+                unresolved.append(pending)
+                continue
+            self._resolve_enemy_attack(pending)
+        self.pending_enemy_attacks = unresolved
+        self._remove_defeated_enemies()
+
+    def _resolve_enemy_attack(self, pending: PendingEnemyAttack) -> None:
+        enemy = pending.enemy
+        profile = pending.profile
+        if profile.parryable and self.player.perfect_parry_active:
+            reflected_damage = enemy.on_parried(perfect=True)
+            enemy.take_damage(reflected_damage, source_x=self.player.x)
+            self.run_score += 260
+            self.run_combo += 2
+            self.run_parries += 1
+            self._notify(
+                f"PERFECT  弹刀成功  反震 {reflected_damage}"
+            )
+            self._complete_tutorial_action("parry")
+            if enemy.defeated:
+                self._award_enemy_defeat(enemy)
+            return
+
+        damage = self.player.take_damage(profile.damage)
+        self.run_combo = 0
+        if profile.parryable and self.player.parry_active:
+            self._notify(f"弹刀过早  受到 {damage} 伤害")
+        elif not profile.parryable and self.player.parry_active:
+            self._notify(f"不可弹反攻击  受到 {damage} 伤害")
+        else:
+            self._notify(f"受到 {enemy.display_name} {damage} 点伤害")
+
+    def _award_enemy_defeat(self, enemy: Enemy) -> None:
+        enemy_id = id(enemy)
+        if enemy_id in self._defeated_enemies:
+            return
+        self._defeated_enemies.add(enemy_id)
+        self.run_score += enemy.bounty_score
+        self._notify(f"击败 {enemy.display_name}")
+
+    def _remove_defeated_enemies(self) -> None:
+        self.room_enemies = [enemy for enemy in self.room_enemies if not enemy.defeated]
+        self.pending_enemy_attacks = [
+            pending
+            for pending in self.pending_enemy_attacks
+            if not pending.enemy.defeated and pending.enemy in self.room_enemies
+        ]
 
     @property
     def _current_tutorial_step(self) -> TutorialStep:
@@ -936,10 +1041,27 @@ class StartScreen:
         if self._current_tutorial_step.action != action:
             return
         self.tutorial_index += 1
+        if self._current_tutorial_step.action == "attack" and not self.room_enemies:
+            self.room_enemies = self._build_training_room_enemies()
+            self._notify("战斗训练目标已投放")
+            return
+        if self._current_tutorial_step.action == "parry":
+            self._prepare_tutorial_parry_target()
         if self._current_tutorial_step.action == "finish":
             self._notify("教学完成，房门已开启")
         else:
             self._notify(f"下一步：{self._current_tutorial_step.title}")
+
+    def _prepare_tutorial_parry_target(self) -> None:
+        target = next(
+            (enemy for enemy in self.room_enemies if enemy.can_be_parried()),
+            None,
+        )
+        if target is None:
+            target = Chaser(self.player.x + 46, 522)
+            self.room_enemies.append(target)
+        target.x = self.player.x + self.player.facing * 46
+        self.pending_enemy_attacks.clear()
 
     def _draw(self) -> None:
         self.canvas.blit(self.assets.background, (0, 0))
@@ -1538,7 +1660,8 @@ class StartScreen:
         self.player = Player(230, 566)
         self._attack_hits.clear()
         self._defeated_enemies.clear()
-        self.room_enemies = self._build_training_room_enemies()
+        self.room_enemies = [] if tutorial else self._build_training_room_enemies()
+        self.pending_enemy_attacks.clear()
         self._refresh_tutorial_hints()
         self.tutorial_index = 0 if tutorial else len(self.tutorial_steps) - 1
         self.tutorial_start_x = self.player.x
@@ -1656,7 +1779,15 @@ class StartScreen:
         subtitle = self.small_font.render("ROOM 01  /  回响训练场", True, COLORS["cyan"])
         self.canvas.blit(subtitle, (56, 78))
 
-        self._draw_stat_bar("生命", 100, 104, 240, 14, 0.84, COLORS["red"])
+        self._draw_stat_bar(
+            "生命",
+            100,
+            104,
+            240,
+            14,
+            self.player.hp / self.player.max_hp,
+            COLORS["red"],
+        )
         self._draw_stat_bar("回响能量", 100, 142, 240, 14, 0.42, COLORS["cyan"])
         score = self.overlay_body_font.render(
             f"分数  {self.run_score:05d}",
@@ -1823,6 +1954,13 @@ class StartScreen:
         draw_x = round(self.player.x - player_image.get_width() / 2)
         draw_y = round(self.player.y - player_image.get_height() + bob)
         self.canvas.blit(player_image, (draw_x, draw_y))
+        if self.player.parry_active:
+            spark = pygame.transform.scale(self.assets.spark, (112, 112))
+            spark.set_alpha(230 if self.player.perfect_parry_active else 120)
+            self.canvas.blit(
+                spark,
+                spark.get_rect(center=(round(self.player.x), round(self.player.y - 58))),
+            )
         self._draw_attack_effect()
 
     def _draw_attack_effect(self) -> None:
@@ -1898,6 +2036,8 @@ class StartScreen:
             "resonance_mage": COLORS["cyan"],
         }
         for enemy in self.room_enemies:
+            if enemy.defeated:
+                continue
             x, y = int(enemy.x), int(enemy.y)
             sprite = self.assets.enemy_sprites.get(enemy.kind)
             if sprite is not None:
@@ -1937,6 +2077,27 @@ class StartScreen:
             )
             label = self.small_font.render(enemy.display_name, True, COLORS["ice"])
             self.canvas.blit(label, label.get_rect(center=(x, y - 72)))
+
+        for pending in self.pending_enemy_attacks:
+            if pending.enemy.defeated:
+                continue
+            ratio = max(
+                0.0,
+                min(1.0, pending.remaining / pending.profile.telegraph_time),
+            )
+            warning_color = (
+                (166, 99, 244)
+                if not pending.profile.parryable
+                else COLORS["ice"]
+            )
+            center = (round(pending.enemy.x), round(pending.enemy.y - 142))
+            pygame.draw.circle(self.canvas, (15, 31, 40), center, 11)
+            pygame.draw.circle(self.canvas, warning_color, center, 11, 2)
+            pygame.draw.rect(
+                self.canvas,
+                warning_color,
+                (center[0] - 2, center[1] - 6, 4, max(2, round(9 * ratio))),
+            )
 
     def _draw_stat_bar(
         self,
