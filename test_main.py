@@ -19,6 +19,48 @@ from game.entities import (
 from main import PendingEnemyAttack, StartScreen
 
 
+class _RecordingAudio:
+    """测试替身：记录游戏请求播放的音乐与音效。"""
+
+    def __init__(self) -> None:
+        self.played: list[str] = []
+        self.music: list[str] = []
+        self.volume: int | None = None
+        self.duck_count = 0
+
+    def play(self, name: str, volume: float = 1.0) -> None:
+        self.played.append(name)
+
+    def play_swing(self, stage: int) -> None:
+        self.played.append(f"swing_{max(1, min(3, int(stage)))}")
+
+    def play_music(self, track: str | None, fade: float = 1.0) -> None:
+        self.music.append(track or "none")
+
+    def set_volume(self, percent: int) -> None:
+        self.volume = percent
+
+    def duck(self, amount: float = 0.45, duration: float = 0.28) -> None:
+        self.duck_count += 1
+
+    def update(self, dt: float) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+
+def _app_with_recording_audio(monkeypatch, tmp_path):
+    """创建 StartScreen 并把音频替换成记录器，返回 (app, recorder)。"""
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    recorder = _RecordingAudio()
+    app.audio = recorder
+    return app, recorder
+
+
 def test_font_loader_survives_broken_windows_font_registry(monkeypatch, tmp_path):
     monkeypatch.setenv("WINDIR", str(tmp_path))
 
@@ -221,7 +263,8 @@ def test_perfect_parry_negates_hit_and_reflects_damage(monkeypatch, tmp_path):
     pygame.quit()
 
 
-def test_parry_pressed_too_early_does_not_negate_hit(monkeypatch, tmp_path):
+def test_parry_pressed_before_the_window_does_not_negate_hit(monkeypatch, tmp_path):
+    """弹刀窗口是“闪光亮起后的一段时间”，太早按不再算完美弹刀。"""
     monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
@@ -231,7 +274,7 @@ def test_parry_pressed_too_early_does_not_negate_hit(monkeypatch, tmp_path):
     app.room_enemies = [enemy]
 
     app.player.start_parry()
-    app.player.update(app.player.PERFECT_PARRY_WINDOW + 0.02, 0)
+    app.player.update(app.player.PARRY_INPUT_BUFFER + 0.05, 0)
     app._resolve_enemy_attack(
         PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
     )
@@ -704,4 +747,313 @@ def test_tutorial_hints_follow_custom_keybinds(monkeypatch, tmp_path):
     app._start_run(1)
     jump_step = next(step for step in app.tutorial_steps if step.action == "jump")
     assert jump_step.objective == "按 K 跳起"
+    pygame.quit()
+
+
+def test_audio_manager_degrades_gracefully_without_assets(tmp_path):
+    """缺少音频素材（或没有音频设备）时不能抛异常，游戏要能静音运行。"""
+    from game.audio import AudioManager
+
+    pygame.init()
+    manager = AudioManager(tmp_path, volume=50)
+
+    manager.play("parry")
+    manager.play("step")
+    manager.play_swing(3)
+    manager.play_music("battle")
+    manager.update(0.016)
+    manager.set_volume(30)
+    manager.duck()
+    manager.update(0.5)
+    manager.stop_music()
+    manager.shutdown()
+    manager.play("hit")
+
+    assert manager.volume == 30
+    pygame.quit()
+
+
+def test_music_switches_between_lobby_and_level(monkeypatch, tmp_path):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+
+    app._sync_music()
+    assert recorder.music[-1] == "lobby"
+
+    # 新手教程关卡也算进入关卡，必须切换到战斗音乐
+    app._start_run(1, tutorial=True)
+    app._sync_music()
+    assert recorder.music[-1] == "battle"
+
+    app._start_run(3, tutorial=False)
+    app._sync_music()
+    assert recorder.music[-1] == "battle"
+
+    # 结算/失败界面回到大厅音乐
+    app._enter_lobby()
+    app._sync_music()
+    assert recorder.music[-1] == "lobby"
+
+    app.page = "result"
+    app._sync_music()
+    assert recorder.music[-1] == "lobby"
+    pygame.quit()
+
+
+def test_combat_actions_emit_expected_sfx(monkeypatch, tmp_path):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+
+    # 角色动作：攻击（未命中也要有声）、冲刺、跳跃、弹刀架势
+    app._handle_key(app.keybinds["attack"])
+    assert recorder.played[-1] == "swing_1"
+    app.player.update(app.player.ATTACK_DURATION, 0)
+    app._handle_key(app.keybinds["dash"])
+    assert recorder.played[-1] == "dash"
+    app._handle_key(app.keybinds["jump"])
+    assert recorder.played[-1] == "jump"
+    app._handle_key(app.keybinds["parry"])
+    assert recorder.played[-1] == "parry_ready"
+    app.player.update(app.player.PARRY_DURATION, 0)
+
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+    app.pending_enemy_attacks.clear()
+
+    # 敌人发动攻击：起手即有提示音
+    app._update_enemy_attacks(0.016)
+    assert "enemy_attack" in recorder.played
+
+    # 玩家命中敌人：额外命中确认音
+    recorder.played.clear()
+    app.player.start_attack("side")
+    app.player.update(0.1, 0)
+    app._resolve_player_attack()
+    assert "hit" in recorder.played
+    assert recorder.duck_count > 0
+
+    # 完美弹刀：最响的确认音 + 压低音乐
+    recorder.played.clear()
+    app.player.start_parry()
+    app.player.update(app.player.PERFECT_PARRY_WINDOW * 0.75, 1)
+    app._resolve_enemy_attack(PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0))
+    assert "parry" in recorder.played
+
+    # 玩家被打中：额外受击确认音（先结束架势，避免再次触发弹刀）
+    recorder.played.clear()
+    app.player.update(app.player.PARRY_DURATION, 0)
+    app._resolve_enemy_attack(PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0))
+    assert "hurt" in recorder.played
+    pygame.quit()
+
+
+def test_running_emits_footsteps_and_idle_does_not(monkeypatch, tmp_path):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+
+    app.player.grounded = True
+    for _ in range(20):
+        app.player.velocity_x = Player.MOVE_SPEED
+        app._update_movement_audio(1.0 / 30.0)
+    assert recorder.played.count("step") >= 1
+
+    recorder.played.clear()
+    app.player.velocity_x = 0.0
+    app._update_movement_audio(1.0)
+    assert "step" not in recorder.played
+
+    # 落地时补一次落地音
+    app.player.landed_this_frame = True
+    app._update_movement_audio(1.0 / 60.0)
+    assert "land" in recorder.played
+    pygame.quit()
+
+
+def test_volume_setting_updates_audio_and_profile(monkeypatch, tmp_path):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+
+    app._set_volume(35)
+    assert app.settings["volume"] == 35
+    assert recorder.volume == 35
+    assert app.profile["settings"]["volume"] == 35
+
+    app._change_setting(0, 5)
+    assert app.settings["volume"] == 40
+    assert recorder.volume == 40
+    pygame.quit()
+
+
+def test_dash_has_cooldown_and_grants_invulnerability(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    player = app.player
+    enemy = Chaser(player.x + 40, 522)
+    app.room_enemies = [enemy]
+    starting_hp = player.hp
+
+    assert player.dash() is True
+    assert player.invulnerable is True
+    # 内置 CD：0.3 秒内不能再次闪避
+    assert player.dash() is False
+    assert player.DASH_COOLDOWN == 0.3
+
+    # 闪避期间无敌，攻击命中也不掉血、不打断连击
+    app.run_combo = 3
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+    assert player.hp == starting_hp
+    assert app.run_combo == 3
+
+    # 冲刺结束时无敌解除
+    player.update(player.DASH_DURATION, 0)
+    assert player.invulnerable is False
+
+    # CD 结束后可以再次闪避；无敌结束后会正常受伤
+    player.update(player.DASH_COOLDOWN, 0)
+    assert player.dash() is True
+    player.update(player.DASH_DURATION + 0.05, 0)
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+    assert player.hp == starting_hp - enemy.damage
+    pygame.quit()
+
+
+def test_dash_leaves_afterimages_that_fade(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    player = app.player
+
+    player.grounded = True
+    assert player.dash() is True
+    app._update_dash_trails(1.0 / 60.0)
+    assert len(app.dash_trails) == 1  # 冲刺起手立刻留下一格残影
+
+    for _ in range(19):
+        player.velocity_x = player.MOVE_SPEED
+        player.update(1.0 / 60.0, 1)
+        app._update_dash_trails(1.0 / 60.0)
+    assert len(app.dash_trails) >= 2
+    app._draw()  # 残影绘制路径不应抛异常
+
+    for _ in range(60):
+        player.update(1.0 / 60.0, 0)
+        app._update_dash_trails(1.0 / 60.0)
+    assert app.dash_trails == []
+    pygame.quit()
+
+
+def test_parry_window_matches_flash_lead():
+    """金色闪光提前量必须与弹刀输入缓冲一致，否则窗口提示会骗人。"""
+    assert main.MELEE_FLASH_LEAD == Player.PARRY_INPUT_BUFFER
+
+
+def test_melee_parry_accepts_press_inside_flash_window(monkeypatch, tmp_path):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+    starting_hp = app.player.hp
+
+    # 闪光亮起后按下弹刀（0.2 秒后命中），仍在窗口内
+    app._handle_key(app.keybinds["parry"])
+    app.player.update(0.2, 0)
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+
+    assert app.player.hp == starting_hp
+    assert app.run_parries == 1
+    assert enemy.hp < enemy.max_hp
+    assert "parry" in recorder.played
+    pygame.quit()
+
+
+def test_projectile_parry_requires_close_range(monkeypatch, tmp_path):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    thrower = SpearThrower(1000, 522)
+    app.room_enemies = [thrower]
+    profile = thrower.scaled_attack()
+    player_center = (app.player.x, app.player.y - 54)
+
+    # 子弹刚出膛，离角色很远：按下弹刀不生效
+    far = PendingEnemyAttack(
+        thrower,
+        profile,
+        profile.telegraph_time,
+        origin=(thrower.x, thrower.y - 52),
+        target=player_center,
+    )
+    app.pending_enemy_attacks = [far]
+    app._handle_key(app.keybinds["parry"])
+    assert app.pending_enemy_attacks == [far]
+    assert app.run_parries == 0
+
+    # 子弹飞到角色身边：按下弹刀立即弹开并反震
+    app.player.update(app.player.PARRY_DURATION, 0)
+    near = PendingEnemyAttack(
+        thrower,
+        profile,
+        profile.telegraph_time * 0.02,
+        origin=(thrower.x, thrower.y - 52),
+        target=player_center,
+    )
+    app.pending_enemy_attacks = [near]
+    app._handle_key(app.keybinds["parry"])
+    assert app.pending_enemy_attacks == []
+    assert app.run_parries == 1
+    assert "parry" in recorder.played
+    pygame.quit()
+
+
+def test_unparried_projectile_still_damages_player(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    thrower = SpearThrower(1000, 522)
+    app.room_enemies = [thrower]
+    profile = thrower.scaled_attack()
+    starting_hp = app.player.hp
+
+    # 没有按弹刀：弹道命中时正常结算伤害
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(
+            thrower,
+            profile,
+            0.0,
+            origin=(thrower.x, thrower.y - 52),
+            target=(app.player.x, app.player.y - 54),
+        )
+    )
+    assert app.player.hp == starting_hp - thrower.damage
+    pygame.quit()
+
+
+def test_lobby_music_stops_after_entering_level(monkeypatch, tmp_path):
+    """进入关卡后，大厅音乐必须真正淡出并停止，而不只是变小。"""
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    audio = app.audio
+
+    assert audio.requested_track == "lobby"
+    app._start_run(1, tutorial=True)
+    app._sync_music()
+    assert audio.requested_track == "battle"
+
+    if not audio.enabled:
+        pygame.quit()
+        return
+
+    assert audio.current_track == "battle"
+    for _ in range(90):  # 推进 1.5 秒，覆盖 1 秒交叉淡化
+        audio.update(1.0 / 60.0)
+
+    channels = [pygame.mixer.Channel(0), pygame.mixer.Channel(1)]
+    busy = [channel.get_busy() for channel in channels]
+    volumes = [channel.get_volume() for channel in channels]
+    assert busy.count(True) == 1  # 只剩战斗音乐在播放
+    assert max(volumes) > 0.0
+    assert min(volumes) == 0.0  # 大厅音乐声道音量为 0
     pygame.quit()

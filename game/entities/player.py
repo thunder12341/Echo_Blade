@@ -41,10 +41,14 @@ class Player:
     COYOTE_TIME = 0.11
     JUMP_BUFFER_TIME = 0.12
     DASH_DISTANCE = 72.0
-    DASH_COOLDOWN = 0.32
+    DASH_DURATION = 0.2
+    DASH_COOLDOWN = 0.3
 
     PARRY_DURATION = 0.32
     PERFECT_PARRY_WINDOW = 0.12
+    # 弹刀输入缓冲：按下后这么久内命中判定都算完美弹刀，
+    # 与提示闪光提前量（main.MELEE_FLASH_LEAD）保持一致。
+    PARRY_INPUT_BUFFER = 0.3
 
     ATTACK_DURATION = 0.34
     ATTACK_ACTIVE_START = 0.06
@@ -86,6 +90,8 @@ class Player:
         self._coyote_timer = self.COYOTE_TIME
         self._jump_buffer_timer = 0.0
         self._dash_cooldown = 0.0
+        self._dash_elapsed = -1.0
+        self._parry_buffer = 0.0
         self._parry_elapsed = -1.0
         self._attack_elapsed = -1.0
         self._attack_direction = "side"
@@ -113,6 +119,20 @@ class Player:
     @property
     def parry_active(self) -> bool:
         return 0.0 <= self._parry_elapsed < self.PARRY_DURATION
+
+    @property
+    def parry_buffered(self) -> bool:
+        """是否处于弹刀输入缓冲内（用于近战完美弹刀判定）。"""
+        return self._parry_buffer > 0.0
+
+    @property
+    def dash_active(self) -> bool:
+        return 0.0 <= self._dash_elapsed < self.DASH_DURATION
+
+    @property
+    def invulnerable(self) -> bool:
+        """闪避期间无敌：不受任何伤害。"""
+        return self.dash_active
 
     @property
     def perfect_parry_active(self) -> bool:
@@ -259,6 +279,7 @@ class Player:
         if self._dash_cooldown > 0.0 or self.parry_active:
             return False
         self._dash_cooldown = self.DASH_COOLDOWN
+        self._dash_elapsed = 0.0
         self.x = max(
             self.bounds_left,
             min(self.bounds_right, self.x + self.facing * self.DASH_DISTANCE),
@@ -270,17 +291,25 @@ class Player:
         if self.parry_active:
             return False
         self._attack_elapsed = -1.0
+        self._parry_buffer = self.PARRY_INPUT_BUFFER
         self._parry_elapsed = 0.0
         self.velocity_x = 0.0
         return True
 
     def take_damage(self, amount: int) -> int:
+        if self.invulnerable:
+            return 0
         actual_damage = max(0, int(round(amount)))
         self.hp = max(0, self.hp - actual_damage)
         return actual_damage
 
     def _update_timers(self, dt: float) -> None:
         self._dash_cooldown = max(0.0, self._dash_cooldown - dt)
+        self._parry_buffer = max(0.0, self._parry_buffer - dt)
+        if self._dash_elapsed >= 0.0:
+            self._dash_elapsed += dt
+            if self._dash_elapsed >= self.DASH_DURATION:
+                self._dash_elapsed = -1.0
         self._jump_buffer_timer = max(0.0, self._jump_buffer_timer - dt)
         if self._parry_elapsed >= 0.0:
             self._parry_elapsed += dt

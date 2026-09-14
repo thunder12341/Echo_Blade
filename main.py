@@ -8,8 +8,25 @@ from pathlib import Path
 
 import pygame
 
+from game.audio import AudioManager
 from game.entities import AttackProfile, Chaser, Enemy, Hitbox, Player, SpearThrower
-from settings import COLORS, FPS, IMAGE_DIR, LOGICAL_SIZE, SAVE_FILE, WINDOW_TITLE
+from settings import (
+    COLORS,
+    FPS,
+    IMAGE_DIR,
+    LOGICAL_SIZE,
+    SAVE_FILE,
+    SOUND_DIR,
+    WINDOW_TITLE,
+)
+
+# 近战完美弹刀提示：闪光出现的提前量，同时决定弹刀窗口长度
+MELEE_FLASH_LEAD = 0.3
+# 远程弹道的可弹刀范围（像素）：子弹进入角色身边这个范围内按下弹刀即成功
+PROJECTILE_PARRY_RANGE = 170.0
+# 闪避残影的生成间隔与存在时间
+DASH_TRAIL_INTERVAL = 0.035
+DASH_TRAIL_LIFE = 0.32
 
 
 @dataclass(frozen=True)
@@ -32,6 +49,9 @@ class PendingEnemyAttack:
     enemy: Enemy
     profile: AttackProfile
     remaining: float
+    # 远程弹道起点/终点：用于绘制弹道与“贴身范围内可弹刀”判定
+    origin: tuple[float, float] | None = None
+    target: tuple[float, float] | None = None
 
 
 @dataclass
@@ -40,7 +60,20 @@ class AttackImpact:
     y: float
     parried: bool
     parryable: bool
+    dodged: bool = False
     remaining: float = 0.24
+
+
+@dataclass
+class DashTrail:
+    """闪避残影：记录生成时的位置与朝向。"""
+
+    x: float
+    y: float
+    facing: int
+    sprite: str
+    remaining: float
+    total: float
 
 
 @dataclass(frozen=True)
@@ -248,6 +281,10 @@ class StartScreen:
         }
         self.keybinds = self._load_keybinds(saved_settings.get("keybinds", {}))
         self._refresh_tutorial_hints()
+        # 音频：音乐与音效分总线，音量沿用设置里的单一滑杆
+        self.audio = AudioManager(SOUND_DIR, volume=self.settings["volume"])
+        self._step_timer = 0.0
+        self.audio.play_music(self._music_for_page())
         if self.settings["fullscreen"]:
             self._apply_display_mode()
         self.has_save = self._load_save()
@@ -269,6 +306,10 @@ class StartScreen:
         self.room_enemies: list[Enemy] = []
         self.pending_enemy_attacks: list[PendingEnemyAttack] = []
         self.attack_impacts: list[AttackImpact] = []
+        self.dash_trails: list[DashTrail] = []
+        self._dash_trail_timer = 0.0
+        self._dash_was_active = False
+        self._trail_surface_cache: dict[tuple[str, int], pygame.Surface] = {}
         self.result_score = 0
         self.result_new_record = False
         self.result_relics = 0
@@ -429,8 +470,24 @@ class StartScreen:
             self.elapsed += dt
             self._handle_events()
             self._update(dt)
+            self._sync_music()
+            self.audio.update(dt)
             self._draw()
             pygame.display.flip()
+        self.audio.shutdown()
+
+    def _music_for_page(self) -> str:
+        """进入关卡（含新手教学关卡）使用战斗音乐，其余界面保持大厅音乐。"""
+        return "battle" if self.page == "game" else "lobby"
+
+    def _sync_music(self) -> None:
+        self.audio.play_music(self._music_for_page())
+
+    def _set_volume(self, percent: int) -> None:
+        self.settings["volume"] = max(0, min(100, int(percent)))
+        self.audio.set_volume(self.settings["volume"])
+        self._save_profile()
+        self._notify(f"音量 {self.settings['volume']}%")
 
     def _handle_events(self) -> None:
         for event in pygame.event.get():
@@ -584,12 +641,17 @@ class StartScreen:
                 self._start_player_attack(self._attack_direction_from_input())
             elif key == self.keybinds["parry"]:
                 if self.player.start_parry():
+                    self.audio.play("parry_ready")
+                    self._try_projectile_parry()
                     self._notify("弹刀架势")
             elif key in (pygame.K_LSHIFT, self.keybinds["dash"]):
                 if self.player.dash():
-                    self._notify("冲刺")
+                    self.audio.play("dash")
+                    self._dash_trail_timer = 0.0
+                    self._notify("闪避")
             elif key == self.keybinds["jump"]:
                 if self.player.request_jump():
+                    self.audio.play("jump")
                     self._notify("跳跃")
             elif key == pygame.K_ESCAPE:
                 self.confirm_exit = True
@@ -863,12 +925,7 @@ class StartScreen:
                     self.overlay_selected = index
                     if index == 0:
                         ratio = (logical[0] - (rect.x + 190)) / 270
-                        self.settings["volume"] = max(
-                            0,
-                            min(100, int(round(ratio * 20) * 5)),
-                        )
-                        self._save_profile()
-                        self._notify(f"音量 {self.settings['volume']}%")
+                        self._set_volume(int(round(ratio * 20) * 5))
                     else:
                         self._activate_setting(index)
                     return
@@ -899,6 +956,8 @@ class StartScreen:
         previous_x = self.player.x
         self.player.update(fixed_dt, self._move_axis())
         self._update_attack_impacts(fixed_dt)
+        self._update_dash_trails(fixed_dt)
+        self._update_movement_audio(fixed_dt)
         self.tutorial_move_distance += abs(self.player.x - previous_x)
         if abs(self.player.x - self.tutorial_start_x) >= 80 or (
             self._current_tutorial_step.action == "move"
@@ -924,6 +983,127 @@ class StartScreen:
         )
         return float(right) - float(left)
 
+    def _update_movement_audio(self, dt: float) -> None:
+        """按实际移动速度累积脚步节拍，落地时补一次轻柔的落地音。"""
+        player = self.player
+        if player.landed_this_frame:
+            self.audio.play("land")
+        if player.grounded and abs(player.velocity_x) > 40.0:
+            self._step_timer += dt * abs(player.velocity_x) / Player.MOVE_SPEED
+            if self._step_timer >= 0.33:
+                self._step_timer = 0.0
+                self.audio.play("step")
+        else:
+            self._step_timer = min(self._step_timer, 0.2)
+
+    def _player_sprite_name(self) -> str:
+        if self.player.attack_in_progress:
+            return f"attack_{self.player.attack_direction}"
+        if not self.player.grounded:
+            return "jump" if self.player.velocity_y < 0 else "fall"
+        if abs(self.player.velocity_x) > 20:
+            return f"run_{int(self.elapsed * 10) % 2}"
+        return "idle"
+
+    def _spawn_dash_trail(self) -> None:
+        """记录一格闪避残影。"""
+        self.dash_trails.append(
+            DashTrail(
+                self.player.x,
+                self.player.y,
+                self.player.facing,
+                self._player_sprite_name(),
+                DASH_TRAIL_LIFE,
+                DASH_TRAIL_LIFE,
+            )
+        )
+
+    def _update_dash_trails(self, dt: float) -> None:
+        if self.dash_trails:
+            for trail in self.dash_trails:
+                trail.remaining -= dt
+            self.dash_trails = [
+                trail for trail in self.dash_trails if trail.remaining > 0.0
+            ]
+        if self.player.dash_active:
+            if not self._dash_was_active:
+                # 冲刺起手立刻留下一格残影
+                self._dash_trail_timer = DASH_TRAIL_INTERVAL
+                self._spawn_dash_trail()
+            else:
+                self._dash_trail_timer -= dt
+                if self._dash_trail_timer <= 0.0:
+                    self._dash_trail_timer = DASH_TRAIL_INTERVAL
+                    self._spawn_dash_trail()
+            self._dash_was_active = True
+        else:
+            self._dash_trail_timer = 0.0
+            self._dash_was_active = False
+
+    def _dash_trail_surface(self, sprite: str, facing: int) -> pygame.Surface:
+        """把角色贴图染成青色并缓存，用于闪避残影。"""
+        key = (sprite, facing)
+        cached = self._trail_surface_cache.get(key)
+        if cached is not None:
+            return cached
+        image = self.assets.player_sprites.get(sprite) or self.assets.player
+        if facing < 0:
+            image = pygame.transform.flip(image, True, False)
+        ghost = pygame.transform.scale(image, (96, 120)).copy()
+        ghost.fill((70, 200, 235), special_flags=pygame.BLEND_RGB_MULT)
+        self._trail_surface_cache[key] = ghost
+        return ghost
+
+    def _projectile_position(self, pending: PendingEnemyAttack) -> tuple[float, float]:
+        """弹道当前位置：从出膛点线性飞向锁定点，命中时正好到达角色。"""
+        duration = max(0.001, pending.profile.telegraph_time)
+        progress = max(0.0, min(1.0, 1.0 - pending.remaining / duration))
+        origin = pending.origin or (pending.enemy.x, pending.enemy.y - 52)
+        target = pending.target or (self.player.x, self.player.y - 54)
+        return (
+            origin[0] + (target[0] - origin[0]) * progress,
+            origin[1] + (target[1] - origin[1]) * progress,
+        )
+
+    def _try_projectile_parry(self) -> bool:
+        """远程弹刀：子弹进入角色身边范围时按下弹刀键即直接弹开。"""
+        player_center = (self.player.x, self.player.y - 54)
+        for pending in list(self.pending_enemy_attacks):
+            if pending.enemy.defeated or not pending.profile.parryable:
+                continue
+            if pending.profile.projectile_speed is None:
+                continue
+            position = self._projectile_position(pending)
+            distance = math.hypot(
+                position[0] - player_center[0],
+                position[1] - player_center[1],
+            )
+            if distance > PROJECTILE_PARRY_RANGE:
+                continue
+            self.pending_enemy_attacks.remove(pending)
+            self._perfect_parry(pending)
+            return True
+        return False
+
+    def _perfect_parry(self, pending: PendingEnemyAttack) -> None:
+        enemy = pending.enemy
+        reflected_damage = enemy.on_parried(perfect=True)
+        enemy.take_damage(reflected_damage, source_x=self.player.x)
+        self.audio.play("parry")
+        self.audio.duck(0.5, 0.45)
+        self.run_score += 260
+        self.run_combo += 2
+        self.run_max_combo = max(self.run_max_combo, self.run_combo)
+        self.run_parries += 1
+        self.run_currency += 5
+        self.attack_impacts.append(
+            AttackImpact(self.player.x, self.player.y - 58, True, True)
+        )
+        self._notify(f"PERFECT  弹刀成功  反震 {reflected_damage}")
+        self._complete_tutorial_action("parry")
+        if enemy.defeated:
+            self._award_enemy_defeat(enemy)
+
     def _is_key_down(self, key: int) -> bool:
         if key in self.pressed_keys:
             return True
@@ -943,6 +1123,7 @@ class StartScreen:
 
     def _start_player_attack(self, direction: str = "side") -> None:
         if self.player.start_attack(direction):
+            self.audio.play_swing(self.player.attack_stage)
             direction_name = {
                 "side": f"第 {self.player.attack_stage} 段",
                 "up": "上劈",
@@ -975,6 +1156,8 @@ class StartScreen:
             )
             if damage <= 0:
                 continue
+            self.audio.play("hit")
+            self.audio.duck(0.22, 0.18)
             if self.player.attack_direction == "down":
                 self.player.bounce_from_down_attack()
                 self._complete_tutorial_action("down_attack")
@@ -998,10 +1181,17 @@ class StartScreen:
                 continue
             intent = enemy.update(dt, self.player.position)
             if intent.attack is not None and id(enemy) not in pending_enemy_ids:
-                self.pending_enemy_attacks.append(
-                    PendingEnemyAttack(enemy, intent.attack, intent.attack.telegraph_time)
+                pending = PendingEnemyAttack(
+                    enemy,
+                    intent.attack,
+                    intent.attack.telegraph_time,
+                    origin=(enemy.x, enemy.y - 52),
+                    target=(self.player.x, self.player.y - 54),
                 )
+                self.pending_enemy_attacks.append(pending)
                 pending_enemy_ids.add(id(enemy))
+                # 敌人起手就给出提示音，命中与否由后续音效补充确认
+                self.audio.play("enemy_attack")
 
         unresolved: list[PendingEnemyAttack] = []
         for pending in self.pending_enemy_attacks:
@@ -1029,26 +1219,34 @@ class StartScreen:
     def _resolve_enemy_attack(self, pending: PendingEnemyAttack) -> None:
         enemy = pending.enemy
         profile = pending.profile
-        if profile.parryable and self.player.perfect_parry_active:
-            reflected_damage = enemy.on_parried(perfect=True)
-            enemy.take_damage(reflected_damage, source_x=self.player.x)
-            self.run_score += 260
-            self.run_combo += 2
-            self.run_max_combo = max(self.run_max_combo, self.run_combo)
-            self.run_parries += 1
-            self.run_currency += 5
+        is_projectile = profile.projectile_speed is not None
+
+        # 近战：金色闪光亮起后的窗口内按下弹刀即为完美弹刀。
+        # 远程弹刀在按下瞬间按“贴身范围”判定（见 _try_projectile_parry），
+        # 因此这里不再用时间缓冲补判，避免离得很远也能弹。
+        if profile.parryable and not is_projectile and self.player.parry_buffered:
+            self._perfect_parry(pending)
+            return
+
+        # 闪避期间无敌：不受伤害，也不中断连击
+        if self.player.invulnerable:
+            self.audio.play("dash", 0.45)
+            self.run_score += 40
             self.attack_impacts.append(
-                AttackImpact(self.player.x, self.player.y - 58, True, True)
+                AttackImpact(
+                    self.player.x,
+                    self.player.y - 54,
+                    False,
+                    profile.parryable,
+                    dodged=True,
+                )
             )
-            self._notify(
-                f"PERFECT  弹刀成功  反震 {reflected_damage}"
-            )
-            self._complete_tutorial_action("parry")
-            if enemy.defeated:
-                self._award_enemy_defeat(enemy)
+            self._notify(f"闪避成功  躲开 {enemy.display_name}")
             return
 
         damage = self.player.take_damage(profile.damage)
+        self.audio.play("hurt")
+        self.audio.duck(0.34, 0.3)
         self.run_combo = 0
         self.attack_impacts.append(
             AttackImpact(
@@ -1072,6 +1270,7 @@ class StartScreen:
         self._defeated_enemies.add(enemy_id)
         self.run_score += enemy.bounty_score
         self.run_currency += max(4, enemy.bounty_score // 20)
+        self.audio.play("defeat")
         self._notify(f"击败 {enemy.display_name}")
 
     def _remove_defeated_enemies(self) -> None:
@@ -1628,9 +1827,7 @@ class StartScreen:
 
     def _change_setting(self, index: int, amount: int) -> None:
         if index == 0:
-            self.settings["volume"] = max(0, min(100, self.settings["volume"] + amount))
-            self._save_profile()
-            self._notify(f"音量 {self.settings['volume']}%")
+            self._set_volume(self.settings["volume"] + amount)
         elif index == 2:
             self._activate_setting(index)
 
@@ -1718,10 +1915,13 @@ class StartScreen:
         self.room_enemies = [] if tutorial else self._build_training_room_enemies()
         self.pending_enemy_attacks.clear()
         self.attack_impacts.clear()
+        self.dash_trails.clear()
+        self._dash_trail_timer = 0.0
         self._refresh_tutorial_hints()
         self.tutorial_index = 0 if tutorial else len(self.tutorial_steps) - 1
         self.tutorial_start_x = self.player.x
         self.tutorial_move_distance = 0.0
+        self._step_timer = 0.0
         self._notify("试炼房间已开启")
 
     def _page_buttons(self) -> dict[str, pygame.Rect]:
@@ -2081,13 +2281,17 @@ class StartScreen:
         return lines or [""]
 
     def _draw_player(self) -> None:
-        sprite_name = "idle"
-        if self.player.attack_in_progress:
-            sprite_name = f"attack_{self.player.attack_direction}"
-        elif not self.player.grounded:
-            sprite_name = "jump" if self.player.velocity_y < 0 else "fall"
-        elif abs(self.player.velocity_x) > 20:
-            sprite_name = f"run_{int(self.elapsed * 10) % 2}"
+        # 闪避残影先画在角色下方，形成拖尾
+        for trail in self.dash_trails:
+            ratio = max(0.0, min(1.0, trail.remaining / trail.total))
+            ghost = self._dash_trail_surface(trail.sprite, trail.facing)
+            ghost.set_alpha(max(0, min(255, round(165 * ratio))))
+            self.canvas.blit(
+                ghost,
+                (round(trail.x - 48), round(trail.y - 120)),
+            )
+
+        sprite_name = self._player_sprite_name()
         image = self.assets.player_sprites.get(sprite_name) or self.assets.player
         if self.player.facing < 0:
             image = pygame.transform.flip(image, True, False)
@@ -2228,149 +2432,32 @@ class StartScreen:
 
     def _draw_enemy_attack_effects(self) -> None:
         effect = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
-        player_center = (round(self.player.x), round(self.player.y - 54))
 
         for pending in self.pending_enemy_attacks:
             if pending.enemy.defeated:
                 continue
             duration = max(0.001, pending.profile.telegraph_time)
-            remaining_ratio = max(0.0, min(1.0, pending.remaining / duration))
-            progress = 1.0 - remaining_ratio
-            imminent = pending.remaining <= self.player.PERFECT_PARRY_WINDOW
-            color = (
-                (166, 99, 244)
-                if not pending.profile.parryable
-                else COLORS["ice"]
-            )
-            if imminent and pending.profile.parryable:
-                color = COLORS["white"]
-
             enemy_center = (
                 round(pending.enemy.x),
                 round(pending.enemy.y - 52),
             )
-            pulse = (math.sin(self.elapsed * 24.0) + 1.0) * 0.5
-            charge_radius = round(12 + 17 * progress + 3 * pulse)
-            pygame.draw.circle(
-                effect,
-                (*color, round(48 + 100 * progress)),
-                enemy_center,
-                charge_radius,
-                3,
-            )
-            pygame.draw.circle(effect, (*color, 210), enemy_center, 5)
-
-            line_alpha = round(55 + 105 * progress)
             if pending.profile.projectile_speed is not None:
-                pygame.draw.line(
-                    effect,
-                    (*color, line_alpha),
-                    enemy_center,
-                    player_center,
-                    2,
-                )
-                projectile_progress = min(0.9, 0.18 + progress * 0.72)
-                projectile = (
-                    round(
-                        enemy_center[0]
-                        + (player_center[0] - enemy_center[0]) * projectile_progress
-                    ),
-                    round(
-                        enemy_center[1]
-                        + (player_center[1] - enemy_center[1]) * projectile_progress
-                    ),
-                )
-                pygame.draw.circle(effect, (*color, 70), projectile, 13)
-                pygame.draw.circle(effect, (*color, 235), projectile, 6)
+                self._draw_projectile_telegraph(effect, pending)
+            elif pending.profile.parryable:
+                self._draw_melee_parry_flash(effect, enemy_center, pending.remaining)
             else:
-                dx = player_center[0] - enemy_center[0]
-                dy = player_center[1] - enemy_center[1]
-                distance = max(1.0, math.hypot(dx, dy))
-                reach = min(float(pending.profile.reach), 190.0)
-                end = (
-                    round(enemy_center[0] + dx / distance * reach),
-                    round(enemy_center[1] + dy / distance * reach),
-                )
-                side_x = -dy / distance * (10 + 18 * progress)
-                side_y = dx / distance * (10 + 18 * progress)
-                pygame.draw.polygon(
-                    effect,
-                    (*color, round(28 + 62 * progress)),
-                    (
-                        enemy_center,
-                        (round(end[0] + side_x), round(end[1] + side_y)),
-                        (round(end[0] - side_x), round(end[1] - side_y)),
-                    ),
-                )
-                pygame.draw.line(
-                    effect,
-                    (*color, line_alpha + 40),
-                    enemy_center,
-                    end,
-                    max(2, round(2 + progress * 4)),
-                )
-
-            target_radius = round(38 - 20 * progress)
-            pygame.draw.circle(
-                effect,
-                (*color, 220 if imminent else 125),
-                player_center,
-                target_radius,
-                3 if imminent else 2,
-            )
-            for angle in (0, math.pi / 2, math.pi, math.pi * 1.5):
-                inner = target_radius + 3
-                outer = target_radius + 9
-                pygame.draw.line(
-                    effect,
-                    (*color, 225),
-                    (
-                        round(player_center[0] + math.cos(angle) * inner),
-                        round(player_center[1] + math.sin(angle) * inner),
-                    ),
-                    (
-                        round(player_center[0] + math.cos(angle) * outer),
-                        round(player_center[1] + math.sin(angle) * outer),
-                    ),
-                    2,
-                )
-
-            marker = (enemy_center[0], enemy_center[1] - charge_radius - 15)
-            if pending.profile.parryable:
-                pygame.draw.polygon(
-                    effect,
-                    (*color, 245),
-                    (
-                        (marker[0], marker[1] - 7),
-                        (marker[0] + 7, marker[1]),
-                        (marker[0], marker[1] + 7),
-                        (marker[0] - 7, marker[1]),
-                    ),
-                    2,
-                )
-            else:
-                pygame.draw.line(
-                    effect,
-                    (*color, 245),
-                    (marker[0] - 6, marker[1] - 6),
-                    (marker[0] + 6, marker[1] + 6),
-                    3,
-                )
-                pygame.draw.line(
-                    effect,
-                    (*color, 245),
-                    (marker[0] + 6, marker[1] - 6),
-                    (marker[0] - 6, marker[1] + 6),
-                    3,
-                )
+                self._draw_unparryable_telegraph(effect, pending, enemy_center)
 
         for impact in self.attack_impacts:
             progress = 1.0 - max(0.0, impact.remaining / 0.24)
-            color = (
-                COLORS["cyan"]
-                if impact.parried
-                else ((166, 99, 244) if not impact.parryable else COLORS["red"])
-            )
+            if impact.parried:
+                color = COLORS["cyan"]
+            elif impact.dodged:
+                color = COLORS["ice"]
+            elif not impact.parryable:
+                color = (166, 99, 244)
+            else:
+                color = COLORS["red"]
             radius = round(16 + progress * 68)
             alpha = round(220 * (1.0 - progress))
             center = (round(impact.x), round(impact.y))
@@ -2387,8 +2474,148 @@ class StartScreen:
                     round(center[1] + math.sin(radians) * radius),
                 )
                 pygame.draw.line(effect, (*color, alpha), start, end, 2)
+            if impact.dodged:
+                label = self.small_font.render("闪避", True, COLORS["ice"])
+                label.set_alpha(alpha)
+                effect.blit(label, label.get_rect(center=(center[0], center[1] - 30)))
 
         self.canvas.blit(effect, (0, 0))
+
+    def _draw_melee_parry_flash(
+        self,
+        effect: pygame.Surface,
+        center: tuple[int, int],
+        remaining: float,
+    ) -> None:
+        """近战提示：闪光亮起后的这段时间内按弹刀即可完美弹反。"""
+        gold = COLORS["gold"]
+        flash_age = MELEE_FLASH_LEAD - remaining
+        if flash_age < 0.0:
+            # 闪光尚未亮起：只留一个暗金色信号，避免和弹刀窗口混淆
+            pygame.draw.circle(effect, (*gold, 55), center, 11, 2)
+            pygame.draw.circle(effect, (*gold, 80), center, 3)
+            return
+
+        progress = max(0.0, min(1.0, flash_age / MELEE_FLASH_LEAD))
+        burst = max(0.0, 1.0 - flash_age / 0.09)
+        # 由外向内叠三层光晕，形成“亮起”的闪光
+        for radius, alpha in (
+            (34 + 10 * progress, 34 + 40 * burst),
+            (24 + 8 * progress, 62 + 60 * burst),
+            (15 + 5 * progress, 104 + 70 * burst),
+        ):
+            pygame.draw.circle(
+                effect,
+                (*gold, max(0, min(255, round(alpha)))),
+                center,
+                round(radius),
+            )
+        pygame.draw.circle(
+            effect,
+            (*gold, max(0, min(255, round(210 * (1.0 - 0.5 * progress))))),
+            center,
+            round(30 + 34 * progress + 14 * burst),
+            3,
+        )
+        for index in range(8):
+            angle = math.tau * index / 8.0 + self.elapsed * 1.4
+            inner = 20 + 10 * progress
+            outer = inner + 12 + 12 * burst
+            pygame.draw.line(
+                effect,
+                (*gold, max(0, min(255, round(170 + 70 * burst)))),
+                (
+                    round(center[0] + math.cos(angle) * inner),
+                    round(center[1] + math.sin(angle) * inner),
+                ),
+                (
+                    round(center[0] + math.cos(angle) * outer),
+                    round(center[1] + math.sin(angle) * outer),
+                ),
+                3,
+            )
+        pygame.draw.circle(
+            effect,
+            (*COLORS["white"], max(0, min(255, round(180 + 70 * burst)))),
+            center,
+            6,
+        )
+
+    def _draw_projectile_telegraph(
+        self,
+        effect: pygame.Surface,
+        pending: PendingEnemyAttack,
+    ) -> None:
+        color = COLORS["ice"] if pending.profile.parryable else (166, 99, 244)
+        position = self._projectile_position(pending)
+        origin = pending.origin or (pending.enemy.x, pending.enemy.y - 52)
+        target = pending.target or (self.player.x, self.player.y - 54)
+        pygame.draw.line(effect, (*color, 40), origin, target, 2)
+        duration = max(0.001, pending.profile.telegraph_time)
+        progress = max(0.0, min(1.0, 1.0 - pending.remaining / duration))
+        for step in range(1, 4):
+            tail_progress = max(0.0, progress - 0.055 * step)
+            tail = (
+                round(origin[0] + (target[0] - origin[0]) * tail_progress),
+                round(origin[1] + (target[1] - origin[1]) * tail_progress),
+            )
+            pygame.draw.circle(
+                effect,
+                (*color, max(24, 70 - step * 18)),
+                tail,
+                max(2, 7 - step),
+            )
+        center = (round(position[0]), round(position[1]))
+        pygame.draw.circle(effect, (*color, 95), center, 12)
+        pygame.draw.circle(effect, (*color, 235), center, 6)
+        pygame.draw.circle(effect, (*COLORS["white"], 200), center, 2)
+
+    def _draw_unparryable_telegraph(
+        self,
+        effect: pygame.Surface,
+        pending: PendingEnemyAttack,
+        enemy_center: tuple[int, int],
+    ) -> None:
+        """不可弹反的攻击：紫色扇形提示，明确告诉玩家只能闪避或走位。"""
+        duration = max(0.001, pending.profile.telegraph_time)
+        progress = 1.0 - max(0.0, min(1.0, pending.remaining / duration))
+        color = (166, 99, 244)
+        player_center = (round(self.player.x), round(self.player.y - 54))
+        dx = player_center[0] - enemy_center[0]
+        dy = player_center[1] - enemy_center[1]
+        distance = max(1.0, math.hypot(dx, dy))
+        reach = min(float(pending.profile.reach), 190.0)
+        end = (
+            round(enemy_center[0] + dx / distance * reach),
+            round(enemy_center[1] + dy / distance * reach),
+        )
+        side_x = -dy / distance * (10 + 18 * progress)
+        side_y = dx / distance * (10 + 18 * progress)
+        pygame.draw.polygon(
+            effect,
+            (*color, round(28 + 62 * progress)),
+            (
+                enemy_center,
+                (round(end[0] + side_x), round(end[1] + side_y)),
+                (round(end[0] - side_x), round(end[1] - side_y)),
+            ),
+        )
+        pygame.draw.line(
+            effect,
+            (*color, round(95 + 105 * progress)),
+            enemy_center,
+            end,
+            max(2, round(2 + progress * 4)),
+        )
+        marker = (enemy_center[0], enemy_center[1] - 34)
+        pygame.draw.line(
+            effect, (*color, 245), (marker[0] - 6, marker[1] - 6),
+            (marker[0] + 6, marker[1] + 6), 3,
+        )
+        pygame.draw.line(
+            effect, (*color, 245), (marker[0] + 6, marker[1] - 6),
+            (marker[0] - 6, marker[1] + 6), 3,
+        )
 
     def _draw_stat_bar(
         self,
@@ -2566,12 +2793,16 @@ class StartScreen:
 
 
 def main() -> None:
+    # 先给混音器一个低延迟配置，保证挥刀与弹刀音效即时响应
+    pygame.mixer.pre_init(44100, -16, 2, 512)
     pygame.init()
     pygame.display.set_caption(WINDOW_TITLE)
     screen = pygame.display.set_mode(LOGICAL_SIZE, pygame.RESIZABLE)
     try:
         StartScreen(screen).run()
     finally:
+        if pygame.mixer.get_init():
+            pygame.mixer.stop()
         pygame.quit()
 
 

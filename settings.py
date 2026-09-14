@@ -3,6 +3,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 IMAGE_DIR = PROJECT_ROOT / "images"
+SOUND_DIR = PROJECT_ROOT / "sounds"
 SAVE_FILE = PROJECT_ROOT / "save.json"
 
 LOGICAL_SIZE = (1280, 720)
