@@ -2234,7 +2234,115 @@ def build_parry_ready_sfx() -> Buffer:
     return buf
 
 
+def build_spawn_sfx() -> Buffer:
+    """敌人登场：低位膨胀噪声“接近”+ 落地冲击 + 金属余韵。"""
+    rng = random.Random(2213)
+    buf = Buffer(0.9)
+    add_swell(buf, 0.0, 0.5, 0.55, pan=0.0, cutoff=2400.0, rng=rng)
+    add_kick(
+        buf,
+        0.48,
+        0.6,
+        start_freq=150.0,
+        end_freq=60.0,
+        decay=0.17,
+        click=0.18,
+        rng=rng,
+    )
+    add_bell(
+        buf,
+        0.48,
+        960.0,
+        0.24,
+        pan=0.0,
+        ratios=(1.0, 1.62, 2.4),
+        taus=(0.32, 0.19, 0.11),
+    )
+    normalize(buf, -13.0)
+    apply_fades(buf, 0.002, 0.1)
+    return buf
+
+
+def build_portal_open_sfx() -> Buffer:
+    """回响之门开启：上升的膨胀噪声 + 明亮钟体，像门被推开。"""
+    rng = random.Random(2311)
+    buf = Buffer(1.1)
+    add_swell(buf, 0.0, 0.55, 0.6, pan=0.0, cutoff=3200.0, rng=rng)
+    add_bell(
+        buf,
+        0.42,
+        1320.0,
+        0.5,
+        pan=0.06,
+        ratios=(1.0, 1.5, 2.25, 3.4),
+        taus=(0.42, 0.26, 0.16, 0.1),
+    )
+    add_bell(
+        buf,
+        0.5,
+        1980.0,
+        0.3,
+        pan=-0.08,
+        ratios=(1.0, 1.48, 2.2),
+        taus=(0.3, 0.18, 0.11),
+    )
+    add_whoosh(
+        buf,
+        0.4,
+        0.3,
+        0.35,
+        freq_start=900.0,
+        freq_end=4200.0,
+        attack=0.35,
+        shape=1.6,
+        rng=rng,
+    )
+    normalize(buf, -11.0)
+    apply_fades(buf, 0.002, 0.12)
+    return buf
+
+
+def build_portal_enter_sfx() -> Buffer:
+    """进入传送门：气流被吸入门内 + 明亮钟体 + 低频收束。"""
+    rng = random.Random(2317)
+    buf = Buffer(1.0)
+    add_whoosh(
+        buf,
+        0.0,
+        0.5,
+        0.7,
+        freq_start=5200.0,
+        freq_end=700.0,
+        attack=0.12,
+        shape=1.7,
+        rng=rng,
+    )
+    add_bell(
+        buf,
+        0.1,
+        1560.0,
+        0.55,
+        pan=0.0,
+        ratios=(1.0, 1.52, 2.3, 3.5),
+        taus=(0.4, 0.25, 0.15, 0.09),
+    )
+    add_kick(
+        buf,
+        0.42,
+        0.5,
+        start_freq=190.0,
+        end_freq=64.0,
+        decay=0.2,
+        click=0.12,
+        rng=rng,
+    )
+    normalize(buf, -10.0)
+    apply_fades(buf, 0.002, 0.14)
+    return buf
+
+
 def build_defeat_sfx() -> Buffer:
+    """敌人被击败：回响碎裂，短促但明确。"""
     """敌人被击败：回响碎裂，短促但明确。"""
     rng = random.Random(2113)
     buf = Buffer(0.7)
@@ -2303,6 +2411,9 @@ def build_sfx() -> dict[str, Buffer]:
     items["hurt"] = build_hurt_sfx()
     items["parry"] = build_parry_sfx()
     items["parry_ready"] = build_parry_ready_sfx()
+    items["spawn"] = build_spawn_sfx()
+    items["portal_open"] = build_portal_open_sfx()
+    items["portal_enter"] = build_portal_enter_sfx()
     items["defeat"] = build_defeat_sfx()
     return items
 

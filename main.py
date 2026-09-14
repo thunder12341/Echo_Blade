@@ -21,12 +21,24 @@ from settings import (
 )
 
 # 近战完美弹刀提示：闪光出现的提前量，同时决定弹刀窗口长度
-MELEE_FLASH_LEAD = 0.3
+MELEE_FLASH_LEAD = 0.45
 # 远程弹道的可弹刀范围（像素）：子弹进入角色身边这个范围内按下弹刀即成功
 PROJECTILE_PARRY_RANGE = 170.0
+# 弹开的子弹飞回敌人的速度（像素/秒）
+REFLECTED_PROJECTILE_SPEED = 900.0
+# 进入关卡后敌人登场延迟（秒）
+ENEMY_SPAWN_DELAY = 3.0
 # 闪避残影的生成间隔与存在时间
 DASH_TRAIL_INTERVAL = 0.035
 DASH_TRAIL_LIFE = 0.32
+# 关卡胜利后出现的传送门
+PORTAL_WIDTH = 96
+PORTAL_HEIGHT = 160
+PORTAL_CENTER_X = 1150.0
+PORTAL_GROUND_Y = 566.0
+PORTAL_APPEAR_TIME = 0.8
+PORTAL_ENTER_TIME = 0.75
+PORTAL_RETRIGGER_LOCK = 0.6
 
 
 @dataclass(frozen=True)
@@ -74,6 +86,17 @@ class DashTrail:
     sprite: str
     remaining: float
     total: float
+
+
+@dataclass
+class ReflectedProjectile:
+    """被弹开的子弹：飞回射击者的途中，命中后才结算伤害。"""
+
+    x: float
+    y: float
+    target: Enemy
+    damage: int
+    speed: float = REFLECTED_PROJECTILE_SPEED
 
 
 @dataclass(frozen=True)
@@ -220,6 +243,22 @@ class AssetStore:
                 "down": "slash_down.png",
             }.items()
         }
+        self.portal_idle = [
+            image
+            for image in (
+                self._load_optional("portal_idle_0.png"),
+                self._load_optional("portal_idle_1.png"),
+            )
+            if image is not None
+        ]
+        self.portal_enter = [
+            image
+            for image in (
+                self._load_optional(f"portal_enter_{index}.png")
+                for index in range(4)
+            )
+            if image is not None
+        ]
 
     @staticmethod
     def _load(filename: str, alpha: bool = True) -> pygame.Surface:
@@ -310,6 +349,14 @@ class StartScreen:
         self._dash_trail_timer = 0.0
         self._dash_was_active = False
         self._trail_surface_cache: dict[tuple[str, int], pygame.Surface] = {}
+        self.reflected_projectiles: list[ReflectedProjectile] = []
+        self.pending_spawn: list[Enemy] = []
+        self.enemy_spawn_timer = 0.0
+        self.portal_open = False
+        self.portal_appear = 0.0
+        self.portal_enter_timer = 0.0
+        self.portal_lock_timer = 0.0
+        self.portal_choice_index = 0
         self.result_score = 0
         self.result_new_record = False
         self.result_relics = 0
@@ -513,11 +560,12 @@ class StartScreen:
                 elif self.page == "menu":
                     self.pressed_item = self._item_at(event.pos)
                 elif self.page == "game":
-                    button = self._page_button_at(event.pos)
-                    if button is None and event.button == 1:
-                        self._start_player_attack(self._attack_direction_from_input())
+                    if self._settings_icon_rect().collidepoint(
+                        self._to_logical(event.pos)
+                    ):
+                        self._open_overlay("settings", return_page="game")
                     else:
-                        self.pressed_button = button
+                        self._start_player_attack(self._attack_direction_from_input())
                 elif self.page == "lobby":
                     logical = self._to_logical(event.pos)
                     for index, (_, _, rect) in enumerate(self._lobby_actions()):
@@ -597,9 +645,9 @@ class StartScreen:
             if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
                 self._close_overlay()
             elif key in (pygame.K_UP, pygame.K_w):
-                self.overlay_selected = (self.overlay_selected - 1) % 5
+                self.overlay_selected = (self.overlay_selected - 1) % 6
             elif key in (pygame.K_DOWN, pygame.K_s):
-                self.overlay_selected = (self.overlay_selected + 1) % 5
+                self.overlay_selected = (self.overlay_selected + 1) % 6
             elif key in (pygame.K_LEFT, pygame.K_RIGHT):
                 self._change_setting(
                     self.overlay_selected,
@@ -608,17 +656,21 @@ class StartScreen:
             elif key == pygame.K_a:
                 self._activate_setting(1)
             elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
-                if self.overlay_selected == 3:
-                    self._open_overlay("keybinds")
-                elif self.overlay_selected == 4:
-                    self._close_overlay()
-                else:
-                    self._activate_setting(self.overlay_selected)
+                self._activate_setting(self.overlay_selected)
             return
 
         if self.overlay == "leaderboard":
             if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE, pygame.K_RETURN, pygame.K_SPACE):
                 self._close_overlay()
+            return
+
+        if self.overlay == "portal":
+            if key in (pygame.K_LEFT, pygame.K_a, pygame.K_RIGHT, pygame.K_d):
+                self.portal_choice_index = 1 - self.portal_choice_index
+            elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
+                self._activate_portal_choice(self.portal_choice_index)
+            elif key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self._leave_portal_choice()
             return
 
         if self.overlay == "progression":
@@ -654,7 +706,7 @@ class StartScreen:
                     self.audio.play("jump")
                     self._notify("跳跃")
             elif key == pygame.K_ESCAPE:
-                self.confirm_exit = True
+                self._open_overlay("settings", return_page="game")
             return
 
         if self.page == "result":
@@ -917,9 +969,6 @@ class StartScreen:
             return
         if self.overlay == "settings":
             rects = self._setting_rects()
-            if self._overlay_back_rect().collidepoint(logical):
-                self._close_overlay()
-                return
             for index, rect in enumerate(rects[:4]):
                 if rect.collidepoint(logical):
                     self.overlay_selected = index
@@ -929,6 +978,14 @@ class StartScreen:
                     else:
                         self._activate_setting(index)
                     return
+            if rects[4].collidepoint(logical):
+                self.overlay_selected = 4
+                self._activate_setting(4)
+                return
+            if rects[5].collidepoint(logical):
+                self.overlay_selected = 5
+                self._close_overlay()
+                return
             if not self._overlay_rect().collidepoint(logical):
                 self._close_overlay()
         elif self.overlay == "leaderboard":
@@ -937,6 +994,14 @@ class StartScreen:
                 or not self._overlay_rect().collidepoint(logical)
             ):
                 self._close_overlay()
+        elif self.overlay == "portal":
+            for index, choice_rect in enumerate(self._portal_choice_rects()):
+                if choice_rect.collidepoint(logical):
+                    self.portal_choice_index = index
+                    self._activate_portal_choice(index)
+                    return
+            if not self._overlay_rect().collidepoint(logical):
+                self._leave_portal_choice()
         elif self.overlay == "progression":
             if self._overlay_back_rect().collidepoint(logical):
                 self._close_overlay()
@@ -954,9 +1019,14 @@ class StartScreen:
 
         fixed_dt = min(max(0.0, dt), 1.0 / 30.0)
         previous_x = self.player.x
-        self.player.update(fixed_dt, self._move_axis())
+        # 进入传送门时锁住操作，由动画把角色吸向门心
+        move_axis = 0.0 if self.portal_enter_timer > 0.0 else self._move_axis()
+        self.player.update(fixed_dt, move_axis)
         self._update_attack_impacts(fixed_dt)
         self._update_dash_trails(fixed_dt)
+        self._update_enemy_spawn(fixed_dt)
+        self._update_reflected_projectiles(fixed_dt)
+        self._update_portal(fixed_dt)
         self._update_movement_audio(fixed_dt)
         self.tutorial_move_distance += abs(self.player.x - previous_x)
         if abs(self.player.x - self.tutorial_start_x) >= 80 or (
@@ -1040,6 +1110,176 @@ class StartScreen:
             self._dash_trail_timer = 0.0
             self._dash_was_active = False
 
+    def _spawn_pending_enemies(self) -> None:
+        """立刻让待登场的敌人出现。"""
+        if not self.pending_spawn:
+            return
+        self.room_enemies.extend(self.pending_spawn)
+        self.pending_spawn.clear()
+        self.enemy_spawn_timer = 0.0
+
+    # -- 关卡胜利与传送门 -------------------------------------------------
+
+    def _portal_rect(self) -> pygame.Rect:
+        return pygame.Rect(
+            round(PORTAL_CENTER_X - PORTAL_WIDTH / 2),
+            round(PORTAL_GROUND_Y - PORTAL_HEIGHT),
+            PORTAL_WIDTH,
+            PORTAL_HEIGHT,
+        )
+
+    def _room_cleared(self) -> bool:
+        """敌人全部清空（教学关还要等教学步骤走完）才算房间胜利。"""
+        if self.pending_spawn or self.room_enemies:
+            return False
+        if self.is_tutorial_run and self._current_tutorial_step.action != "finish":
+            return False
+        return True
+
+    def _player_in_portal(self) -> bool:
+        body = self.player.body_hitbox
+        portal = self._portal_rect()
+        return (
+            body.left < portal.right
+            and body.right > portal.left
+            and body.top < portal.bottom
+            and body.bottom > portal.top
+        )
+
+    def _update_portal(self, dt: float) -> None:
+        if self.portal_lock_timer > 0.0:
+            self.portal_lock_timer = max(0.0, self.portal_lock_timer - dt)
+
+        if self.portal_enter_timer > 0.0:
+            self.portal_enter_timer = max(0.0, self.portal_enter_timer - dt)
+            # 把角色吸向门心
+            self.player.x += (PORTAL_CENTER_X - self.player.x) * min(1.0, dt * 7.0)
+            self.player.velocity_x = 0.0
+            if self.portal_enter_timer <= 0.0:
+                self._open_portal_choice()
+            return
+
+        if not self.portal_open:
+            if self._room_cleared():
+                self.portal_open = True
+                self.portal_appear = 0.0
+                self.audio.play("portal_open")
+                self._notify("回响之门已开启")
+            return
+
+        if self.portal_appear < 1.0:
+            self.portal_appear = min(
+                1.0,
+                self.portal_appear + dt / max(0.05, PORTAL_APPEAR_TIME),
+            )
+        if (
+            self.portal_appear >= 1.0
+            and self.portal_lock_timer <= 0.0
+            and self.overlay is None
+            and not self.confirm_exit
+            and self._player_in_portal()
+        ):
+            self.portal_enter_timer = PORTAL_ENTER_TIME
+            self.audio.play("portal_enter")
+            self.pressed_keys.clear()
+
+    def _open_portal_choice(self) -> None:
+        """进入动画结束后弹出「返回主菜单 / 下一关」选择。"""
+        self.portal_choice_index = 0
+        self._open_overlay("portal", return_page="game")
+        self._notify("回响之门：选择去向")
+
+    def _leave_portal_choice(self) -> None:
+        """取消选择：把角色推回门的左侧，避免立刻再次触发。"""
+        self.overlay = None
+        self.page = "game"
+        self.player.x = PORTAL_CENTER_X - 120.0
+        self.player.velocity_x = 0.0
+        self.portal_lock_timer = PORTAL_RETRIGGER_LOCK
+        self._notify("继续探索当前房间")
+
+    def _portal_choice_rects(self) -> list[pygame.Rect]:
+        return [
+            pygame.Rect(392, 404, 236, 62),
+            pygame.Rect(652, 404, 236, 62),
+        ]
+
+    def _portal_choice_labels(self) -> tuple[str, str]:
+        if self.is_tutorial_run:
+            return ("返回主菜单", "进入灰塔大厅")
+        return ("返回主菜单", f"进入第 {self.run_floor + 1} 层")
+
+    def _activate_portal_choice(self, index: int) -> None:
+        if index < 0 or index > 1:
+            return
+        relics = self._settle_run()
+        self.overlay = None
+        if index == 0:
+            self.page = "menu"
+            self.confirm_exit = False
+            self._notify(f"远征已结算，凝结回响遗晶 +{relics}")
+            return
+        if self.is_tutorial_run:
+            self._enter_lobby()
+            self._notify(f"远征已结算，凝结回响遗晶 +{relics}")
+            return
+        next_floor = self.run_floor + 1
+        self._start_run(next_floor, tutorial=False)
+        self._notify(f"进入第 {next_floor} 层  遗晶 +{relics}")
+
+    def _update_enemy_spawn(self, dt: float) -> None:
+        """进入关卡后延迟刷怪，给玩家观察场地的时间。"""
+        if not self.pending_spawn:
+            return
+        self.enemy_spawn_timer = max(0.0, self.enemy_spawn_timer - dt)
+        if self.enemy_spawn_timer > 0.0:
+            return
+        self._spawn_pending_enemies()
+        self.audio.play("spawn")
+        self._notify("敌人出现")
+
+    def _update_reflected_projectiles(self, dt: float) -> None:
+        """被弹开的子弹飞回射击者，命中后才结算伤害。"""
+        if not self.reflected_projectiles:
+            return
+        active: list[ReflectedProjectile] = []
+        for bullet in self.reflected_projectiles:
+            target = bullet.target
+            if target.defeated or target not in self.room_enemies:
+                continue  # 目标已消失，弹体自然消散
+            target_x = target.x
+            target_y = target.y - 30
+            dx = target_x - bullet.x
+            dy = target_y - bullet.y
+            distance = math.hypot(dx, dy)
+            step = bullet.speed * dt
+            if distance > step and distance > 0.0:
+                bullet.x += dx / distance * step
+                bullet.y += dy / distance * step
+                active.append(bullet)
+                continue
+            self._resolve_reflected_hit(target, bullet.damage)
+        self.reflected_projectiles = active
+        self._remove_defeated_enemies()
+
+    def _resolve_reflected_hit(self, enemy: Enemy, damage: int) -> None:
+        dealt = enemy.take_damage(damage, source_x=self.player.x)
+        self.audio.play("hit")
+        self.audio.duck(0.22, 0.18)
+        self.attack_impacts.append(
+            AttackImpact(enemy.x, enemy.y - 44, False, True)
+        )
+        if dealt <= 0:
+            return
+        self.run_score += 120
+        self.run_combo += 1
+        self.run_max_combo = max(self.run_max_combo, self.run_combo)
+        self.run_currency += 2
+        if enemy.defeated:
+            self._award_enemy_defeat(enemy)
+        else:
+            self._notify(f"反弹命中 {enemy.display_name}  -{dealt}")
+
     def _dash_trail_surface(self, sprite: str, facing: int) -> pygame.Surface:
         """把角色贴图染成青色并缓存，用于闪避残影。"""
         key = (sprite, facing)
@@ -1081,14 +1321,30 @@ class StartScreen:
             if distance > PROJECTILE_PARRY_RANGE:
                 continue
             self.pending_enemy_attacks.remove(pending)
-            self._perfect_parry(pending)
+            self._perfect_parry(pending, reflect=True)
             return True
         return False
 
-    def _perfect_parry(self, pending: PendingEnemyAttack) -> None:
+    def _perfect_parry(
+        self,
+        pending: PendingEnemyAttack,
+        *,
+        reflect: bool = False,
+    ) -> None:
         enemy = pending.enemy
         reflected_damage = enemy.on_parried(perfect=True)
-        enemy.take_damage(reflected_damage, source_x=self.player.x)
+        if reflect:
+            # 远程弹刀：子弹原样打回去，命中敌人才造成伤害
+            self.reflected_projectiles.append(
+                ReflectedProjectile(
+                    self.player.x,
+                    self.player.y - 54,
+                    enemy,
+                    reflected_damage,
+                )
+            )
+        else:
+            enemy.take_damage(reflected_damage, source_x=self.player.x)
         self.audio.play("parry")
         self.audio.duck(0.5, 0.45)
         self.run_score += 260
@@ -1099,7 +1355,10 @@ class StartScreen:
         self.attack_impacts.append(
             AttackImpact(self.player.x, self.player.y - 58, True, True)
         )
-        self._notify(f"PERFECT  弹刀成功  反震 {reflected_damage}")
+        if reflect:
+            self._notify(f"PERFECT  弹开子弹  反弹 {reflected_damage}")
+        else:
+            self._notify(f"PERFECT  弹刀成功  反震 {reflected_damage}")
         self._complete_tutorial_action("parry")
         if enemy.defeated:
             self._award_enemy_defeat(enemy)
@@ -1298,7 +1557,7 @@ class StartScreen:
         if self._current_tutorial_step.action == "parry":
             self._prepare_tutorial_parry_target()
         if self._current_tutorial_step.action == "finish":
-            self._notify("教学完成，房门已开启")
+            self._notify("教学完成，回响之门已开启")
         else:
             self._notify(f"下一步：{self._current_tutorial_step.title}")
 
@@ -1544,12 +1803,14 @@ class StartScreen:
 
     def _setting_rects(self) -> list[pygame.Rect]:
         rect = self._overlay_rect()
+        back = self._overlay_back_rect()
         return [
             pygame.Rect(rect.x + 34, rect.y + 104, rect.width - 68, 70),
             pygame.Rect(rect.x + 34, rect.y + 184, rect.width - 68, 70),
             pygame.Rect(rect.x + 34, rect.y + 264, rect.width - 68, 70),
             pygame.Rect(rect.x + 34, rect.y + 344, rect.width - 68, 70),
-            self._overlay_back_rect(),
+            pygame.Rect(back.right + 16, back.y, 220, back.height),  # 返回主菜单
+            back,  # 关闭设置
         ]
 
     @staticmethod
@@ -1591,6 +1852,7 @@ class StartScreen:
             "leaderboard": "本地排行榜",
             "keybinds": "键位设置",
             "progression": "回响中枢 · 成长拓扑",
+            "portal": "回响之门",
         }.get(self.overlay, "设置")
         title = self.overlay_title_font.render(title_text, True, COLORS["ice"])
         self.canvas.blit(title, (rect.x + 30, rect.y + 24))
@@ -1601,6 +1863,8 @@ class StartScreen:
             self._draw_keybinds(rect)
         elif self.overlay == "progression":
             self._draw_progression(rect)
+        elif self.overlay == "portal":
+            self._draw_portal_choice(rect)
         else:
             self._draw_settings(rect)
 
@@ -1609,10 +1873,45 @@ class StartScreen:
             if self.overlay == "keybinds"
             else "↑↓ 浏览节点    Enter 激活    Esc 返回"
             if self.overlay == "progression"
+            else "←→ 选择    Enter 确认    Esc 留在房间"
+            if self.overlay == "portal"
             else "↑↓ 选择    ←→ 调整    Enter 确认    Esc 返回"
         )
         hint = self.small_font.render(hint_text, True, COLORS["muted"])
         self.canvas.blit(hint, (rect.right - hint.get_width() - 28, rect.bottom - 34))
+
+    def _draw_portal_choice(self, rect: pygame.Rect) -> None:
+        """传送门选择界面：返回主菜单 / 下一关。"""
+        labels = self._portal_choice_labels()
+        info = self.overlay_body_font.render(
+            f"本局分数 {self.run_score:05d}    完美弹刀 {self.run_parries}    "
+            f"第 {self.run_floor} 层",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(info, info.get_rect(center=(rect.centerx, rect.y + 132)))
+        note = self.small_font.render(
+            "进入后本局结算，回响遗晶自动凝结",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(note, note.get_rect(center=(rect.centerx, rect.y + 168)))
+        for index, (label, choice_rect) in enumerate(
+            zip(labels, self._portal_choice_rects())
+        ):
+            selected = index == self.portal_choice_index
+            if selected:
+                pygame.draw.rect(self.canvas, (14, 43, 52), choice_rect)
+                pygame.draw.rect(self.canvas, COLORS["gold"], choice_rect, 2)
+            else:
+                pygame.draw.rect(self.canvas, (6, 16, 28), choice_rect)
+                pygame.draw.rect(self.canvas, COLORS["cyan"], choice_rect, 1)
+            text = self.menu_font.render(
+                label,
+                True,
+                COLORS["gold"] if selected else COLORS["ice"],
+            )
+            self.canvas.blit(text, text.get_rect(center=choice_rect.center))
 
     def _draw_progression(self, rect: pygame.Rect) -> None:
         unlocked = self._unlocked_nodes()
@@ -1736,7 +2035,7 @@ class StartScreen:
         ]
         setting_rects = self._setting_rects()
         for index, ((label, value), setting_rect) in enumerate(
-            zip(labels, setting_rects)
+            zip(labels, setting_rects[:4])
         ):
             selected = index == self.overlay_selected
             if selected:
@@ -1757,9 +2056,14 @@ class StartScreen:
                 )
                 pygame.draw.rect(self.canvas, COLORS["ice"], bar, 1)
         self._draw_ui_button(
-            self._overlay_back_rect(),
+            setting_rects[4],
             "返回主菜单",
             self.overlay_selected == 4,
+        )
+        self._draw_ui_button(
+            setting_rects[5],
+            "关闭设置",
+            self.overlay_selected == 5,
         )
 
     def _draw_keybinds(self, rect: pygame.Rect) -> None:
@@ -1824,6 +2128,18 @@ class StartScreen:
             self._notify("全屏已" + ("开启" if self.settings["fullscreen"] else "关闭"))
         elif index == 3:
             self._open_overlay("keybinds")
+        elif index == 4:
+            self._return_to_menu_from_settings()
+        elif index == 5:
+            self._close_overlay()
+
+    def _return_to_menu_from_settings(self) -> None:
+        """设置里的「返回主菜单」：在主菜单直接关闭，在关卡/大厅先确认。"""
+        if self.return_page == "menu":
+            self._close_overlay()
+            return
+        self.overlay = None
+        self.confirm_exit = True
 
     def _change_setting(self, index: int, amount: int) -> None:
         if index == 0:
@@ -1875,13 +2191,13 @@ class StartScreen:
             TutorialStep(
                 "弹刀训练",
                 f"按 {keys['parry']} 进行一次完美弹刀演示",
-                "正式战斗里需要看准白色预警，失败会中断连击。",
+                "正式战斗里要等金色闪光亮起再按，远程子弹靠近时也能弹开。",
                 "parry",
             ),
             TutorialStep(
                 "教学完成",
-                "点击右侧按钮或按提示完成当前房间",
-                "你已经完成基础操作，可以进入结算。",
+                "走进右侧的回响之门，选择前往灰塔大厅",
+                "你已经完成基础操作，进门后本局自动结算。",
                 "finish",
             ),
         ]
@@ -1912,24 +2228,35 @@ class StartScreen:
         self.player = Player(230, 566)
         self._attack_hits.clear()
         self._defeated_enemies.clear()
-        self.room_enemies = [] if tutorial else self._build_training_room_enemies()
+        self.room_enemies = []
+        # 进入关卡后敌人延迟登场，避免开门瞬间贴脸
+        if tutorial:
+            self.pending_spawn = []
+            self.enemy_spawn_timer = 0.0
+        else:
+            self.pending_spawn = self._build_training_room_enemies()
+            self.enemy_spawn_timer = ENEMY_SPAWN_DELAY
         self.pending_enemy_attacks.clear()
         self.attack_impacts.clear()
+        self.reflected_projectiles.clear()
         self.dash_trails.clear()
         self._dash_trail_timer = 0.0
+        self.portal_open = False
+        self.portal_appear = 0.0
+        self.portal_enter_timer = 0.0
+        self.portal_lock_timer = 0.0
+        self.portal_choice_index = 0
         self._refresh_tutorial_hints()
         self.tutorial_index = 0 if tutorial else len(self.tutorial_steps) - 1
         self.tutorial_start_x = self.player.x
         self.tutorial_move_distance = 0.0
         self._step_timer = 0.0
-        self._notify("试炼房间已开启")
+        if self.pending_spawn:
+            self._notify("敌影正在接近…")
+        else:
+            self._notify("试炼房间已开启")
 
     def _page_buttons(self) -> dict[str, pygame.Rect]:
-        if self.page == "game":
-            return {
-                "finish": pygame.Rect(860, 500, 320, 58),
-                "menu": pygame.Rect(860, 574, 320, 58),
-            }
         if self.page == "result":
             return {
                 "restart": pygame.Rect(430, 500, 200, 58),
@@ -1988,6 +2315,12 @@ class StartScreen:
             self.confirm_exit = False
 
     def _finish_run(self) -> None:
+        relics = self._settle_run()
+        self._enter_lobby()
+        self._notify(f"远征已结算，凝结回响遗晶 +{relics}")
+
+    def _settle_run(self) -> int:
+        """结算本局：分数、遗晶、存档与统计，返回获得的回响遗晶。"""
         self.result_score = self.run_score + self.run_floor * 500 + self.run_parries * 100
         previous_best = int(self.profile.get("best_score", 0) or 0)
         self.result_new_record = self.result_score > previous_best
@@ -2028,8 +2361,7 @@ class StartScreen:
         self._save_profile()
         self.has_save = True
         self.items = self._build_items()
-        self._enter_lobby()
-        self._notify(f"远征已结算，凝结回响遗晶 +{self.result_relics}")
+        return self.result_relics
 
     def _fail_run(self) -> None:
         if self.page != "game":
@@ -2096,6 +2428,9 @@ class StartScreen:
         subtitle = self.small_font.render("ROOM 01  /  回响训练场", True, COLORS["cyan"])
         self.canvas.blit(subtitle, (56, 78))
 
+        if self.pending_spawn:
+            self._draw_spawn_countdown()
+
         self._draw_stat_bar(
             "生命",
             100,
@@ -2120,11 +2455,13 @@ class StartScreen:
         self.canvas.blit(floor, (930, 76))
         self._draw_run_currency_ui()
 
-        pygame.draw.line(self.canvas, (37, 103, 103), (120, 566), (760, 566), 2)
-        pygame.draw.rect(self.canvas, (12, 37, 48), (165, 428, 500, 138), 2)
+        # 战斗区横跨整块画面，角色与敌人都可以在左右边界之间自由移动
+        pygame.draw.rect(self.canvas, (12, 37, 48), (48, 424, 1184, 142), 2)
+        pygame.draw.line(self.canvas, (37, 103, 103), (60, 566), (1220, 566), 2)
         gate = pygame.transform.scale(self.assets.logo, (96, 96))
         gate.set_alpha(100)
-        self.canvas.blit(gate, (520, 340))
+        self.canvas.blit(gate, (592, 330))
+        self._draw_portal()
         self._draw_player()
         self._draw_enemies()
         if self.is_tutorial_run:
@@ -2135,21 +2472,21 @@ class StartScreen:
             True,
             COLORS["ice"],
         )
-        self.canvas.blit(room_title, room_title.get_rect(center=(410, 296)))
+        self.canvas.blit(room_title, room_title.get_rect(center=(640, 296)))
         if self.is_tutorial_run:
             room_hint = self.small_font.render(
                 self._current_tutorial_step.objective,
                 True,
                 COLORS["muted"],
             )
-            self.canvas.blit(room_hint, room_hint.get_rect(center=(410, 325)))
+            self.canvas.blit(room_hint, room_hint.get_rect(center=(640, 325)))
         else:
             room_hint = self.small_font.render(
-                "完成当前房间后可返回大厅",
+                "清空房间后，右侧会开启回响之门",
                 True,
                 COLORS["muted"],
             )
-            self.canvas.blit(room_hint, room_hint.get_rect(center=(410, 325)))
+            self.canvas.blit(room_hint, room_hint.get_rect(center=(640, 325)))
 
         combo = self.overlay_body_font.render(
             f"连击  x{self.run_combo}",
@@ -2164,29 +2501,129 @@ class StartScreen:
         self.canvas.blit(combo, (100, 610))
         self.canvas.blit(parries, (100, 642))
 
-        for name, rect in self._page_buttons().items():
-            if name == "finish":
-                unlocked = (
-                    not self.is_tutorial_run
-                    or self._current_tutorial_step.action == "finish"
-                )
-                label = "完成当前房间" if unlocked else "完成教学后开启"
-                self._draw_ui_button(rect, label, enabled=unlocked)
-            else:
-                self._draw_ui_button(rect, "返回主菜单")
+        self._draw_settings_icon()
+        self._draw_portal_status()
         controls = self.small_font.render(
             (
                 f"{self._key_name(self.keybinds['left'])}/{self._key_name(self.keybinds['right'])} 移动    "
                 f"{self._key_name(self.keybinds['attack'])} 攻击    "
                 f"{self._key_name(self.keybinds['parry'])} 弹刀    "
                 f"{self._key_name(self.keybinds['dash'])} 冲刺    "
-                f"{self._key_name(self.keybinds['jump'])} 跳跃    Esc 返回"
+                f"{self._key_name(self.keybinds['jump'])} 跳跃    Esc 设置"
             ),
             True,
             COLORS["muted"],
         )
         self.canvas.blit(controls, controls.get_rect(center=(640, 690)))
         self._draw_notification()
+
+    def _settings_icon_rect(self) -> pygame.Rect:
+        return pygame.Rect(1224, 22, 34, 34)
+
+    def _draw_settings_icon(self) -> None:
+        """右上角小齿轮：点击或按 Esc 打开设置。"""
+        rect = self._settings_icon_rect()
+        hovered = rect.collidepoint(self._to_logical(pygame.mouse.get_pos()))
+        color = COLORS["cyan"] if hovered else COLORS["muted"]
+        pygame.draw.rect(self.canvas, (6, 16, 28), rect)
+        pygame.draw.rect(self.canvas, color, rect, 1)
+        center = rect.center
+        for index in range(8):
+            angle = math.tau * index / 8.0 + math.pi / 8.0
+            pygame.draw.line(
+                self.canvas,
+                color,
+                (
+                    round(center[0] + math.cos(angle) * 8),
+                    round(center[1] + math.sin(angle) * 8),
+                ),
+                (
+                    round(center[0] + math.cos(angle) * 13),
+                    round(center[1] + math.sin(angle) * 13),
+                ),
+                3,
+            )
+        pygame.draw.circle(self.canvas, color, center, 8, 2)
+        pygame.draw.circle(self.canvas, color, center, 2)
+
+    def _draw_portal(self) -> None:
+        """关卡胜利后的回响之门：出现动画 + 待机循环 + 进入动画。"""
+        if not self.portal_open:
+            return
+        rect = self._portal_rect()
+        appear = max(0.0, min(1.0, self.portal_appear))
+
+        if self.portal_enter_timer > 0.0:
+            progress = 1.0 - self.portal_enter_timer / max(0.05, PORTAL_ENTER_TIME)
+            frames = self.assets.portal_enter
+            if frames:
+                index = min(len(frames) - 1, int(progress * len(frames)))
+                image = frames[index]
+            else:
+                image = self.assets.portal_idle[0] if self.assets.portal_idle else None
+            if image is not None:
+                self.canvas.blit(image, rect.topleft)
+            # 白场闪光
+            flash = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+            alpha = round(150 * max(0.0, progress - 0.35) / 0.65)
+            flash.fill((*COLORS["ice"], min(200, alpha)))
+            self.canvas.blit(flash, (0, 0))
+            return
+
+        frames = self.assets.portal_idle
+        image = None
+        if frames:
+            image = frames[int(self.elapsed * 4.0) % len(frames)]
+        if image is None:
+            return
+
+        if appear < 1.0:
+            # 出现动画：由小放大 + 淡入
+            scale = 0.25 + 0.75 * appear
+            size = (
+                max(8, round(image.get_width() * scale)),
+                max(8, round(image.get_height() * scale)),
+            )
+            scaled = pygame.transform.scale(image, size)
+            scaled.set_alpha(round(255 * appear))
+            self.canvas.blit(
+                scaled,
+                scaled.get_rect(midbottom=(rect.centerx, rect.bottom)),
+            )
+            ring_radius = round(20 + 70 * appear)
+            surface = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+            pygame.draw.circle(
+                surface,
+                (*COLORS["gold"], round(200 * (1.0 - appear))),
+                (rect.centerx, rect.centery),
+                ring_radius,
+                3,
+            )
+            self.canvas.blit(surface, (0, 0))
+            return
+
+        self.canvas.blit(image, rect.topleft)
+        glow = 0.5 + 0.5 * math.sin(self.elapsed * 3.0)
+        surface = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+        pygame.draw.circle(
+            surface,
+            (*COLORS["cyan"], round(40 + 40 * glow)),
+            (rect.centerx, rect.centery),
+            round(rect.width * 0.62),
+            2,
+        )
+        self.canvas.blit(surface, (0, 0))
+
+    def _draw_portal_status(self) -> None:
+        """传送门相关提示：出现后提示走进门内。"""
+        if not self.portal_open or self.portal_enter_timer > 0.0:
+            return
+        if self.portal_appear < 1.0:
+            return
+        hint = self.small_font.render("走进回响之门继续", True, COLORS["gold"])
+        hint.set_alpha(180 + round(75 * (math.sin(self.elapsed * 5.0) + 1.0) * 0.5))
+        rect = self._portal_rect()
+        self.canvas.blit(hint, hint.get_rect(center=(rect.centerx, rect.top - 22)))
 
     def _draw_run_currency_ui(self) -> None:
         panel = pygame.Rect(1050, 98, 180, 42)
@@ -2448,6 +2885,8 @@ class StartScreen:
             else:
                 self._draw_unparryable_telegraph(effect, pending, enemy_center)
 
+        self._draw_reflected_projectiles(effect)
+
         for impact in self.attack_impacts:
             progress = 1.0 - max(0.0, impact.remaining / 0.24)
             if impact.parried:
@@ -2480,6 +2919,30 @@ class StartScreen:
                 effect.blit(label, label.get_rect(center=(center[0], center[1] - 30)))
 
         self.canvas.blit(effect, (0, 0))
+
+    def _draw_reflected_projectiles(self, effect: pygame.Surface) -> None:
+        """被弹开的子弹：青色回响弹体飞回射击者。"""
+        for bullet in self.reflected_projectiles:
+            dx = bullet.target.x - bullet.x
+            dy = (bullet.target.y - 30) - bullet.y
+            distance = max(1.0, math.hypot(dx, dy))
+            ux = dx / distance
+            uy = dy / distance
+            for step in range(1, 5):
+                trail = (
+                    round(bullet.x - ux * step * 9),
+                    round(bullet.y - uy * step * 9),
+                )
+                pygame.draw.circle(
+                    effect,
+                    (*COLORS["cyan"], max(12, 88 - step * 18)),
+                    trail,
+                    max(1, 5 - step),
+                )
+            center = (round(bullet.x), round(bullet.y))
+            pygame.draw.circle(effect, (*COLORS["cyan"], 110), center, 11)
+            pygame.draw.circle(effect, (*COLORS["ice"], 235), center, 6)
+            pygame.draw.circle(effect, (*COLORS["white"], 220), center, 2)
 
     def _draw_melee_parry_flash(
         self,
@@ -2745,6 +3208,47 @@ class StartScreen:
         )
         self.canvas.blit(hint, hint.get_rect(center=(640, 600)))
         self._draw_notification()
+
+    def _draw_spawn_countdown(self) -> None:
+        """敌人登场倒计时面板：会跳动的秒数 + 进度条，最后 1 秒转红。"""
+        remaining = max(0.0, self.enemy_spawn_timer)
+        total = max(0.001, ENEMY_SPAWN_DELAY)
+        ratio = 1.0 - max(0.0, min(1.0, remaining / total))
+        panel = pygame.Rect(0, 0, 320, 96)
+        panel.center = (640, 132)
+
+        layer = pygame.Surface(panel.size, pygame.SRCALPHA)
+        layer.fill((6, 16, 28, 208))
+        pulse = 0.5 + 0.5 * math.sin(self.elapsed * 7.0)
+        border_alpha = 150 + round(80 * pulse)
+        pygame.draw.rect(
+            layer,
+            (*COLORS["gold"], border_alpha),
+            layer.get_rect(),
+            2,
+        )
+
+        title = self.small_font.render("敌影接近", True, COLORS["gold"])
+        layer.blit(title, title.get_rect(center=(panel.width // 2, 20)))
+
+        if remaining <= 1.0:
+            number_color = COLORS["red"]
+        elif remaining <= 2.0:
+            number_color = COLORS["gold"]
+        else:
+            number_color = COLORS["white"]
+        number = self.overlay_title_font.render(f"{remaining:0.1f}", True, number_color)
+        layer.blit(number, number.get_rect(center=(panel.width // 2, 50)))
+
+        bar = pygame.Rect(26, 76, panel.width - 52, 8)
+        pygame.draw.rect(layer, (24, 57, 65), bar)
+        pygame.draw.rect(
+            layer,
+            COLORS["gold"],
+            (bar.x, bar.y, round(bar.width * ratio), bar.height),
+        )
+        pygame.draw.rect(layer, (*COLORS["muted"], 120), bar, 1)
+        self.canvas.blit(layer, panel.topleft)
 
     def _draw_notification(self) -> None:
         if self.notification_timer <= 0:

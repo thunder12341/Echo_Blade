@@ -60,9 +60,11 @@ class Enemy(ABC):
         threat: float = 0.0,
         elite: bool = False,
         facing: int = -1,
+        bounds: tuple[float, float] = (40.0, 1240.0),
     ) -> None:
         self.x = float(x)
         self.y = float(y)
+        self.bounds_left, self.bounds_right = bounds
         self.threat = max(0.0, float(threat))
         self.elite = elite
         self.facing = 1 if facing >= 0 else -1
@@ -114,6 +116,8 @@ class Enemy(ABC):
 
         intent = self.choose_intent(player_position)
         self.x += intent.move_x * elapsed
+        # 只被场地左右边界挡住，避免走出画面或被卡在半途
+        self.x = min(max(self.x, self.bounds_left), self.bounds_right)
         if intent.attack is not None and self.attack_ready:
             self._attack_cooldown = intent.attack.cooldown
         return intent

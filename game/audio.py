@@ -44,6 +44,9 @@ SFX_FILES = {
     "hurt": ("sfx/hurt.wav",),
     "parry": ("sfx/parry.wav",),
     "parry_ready": ("sfx/parry_ready.wav",),
+    "spawn": ("sfx/spawn.wav",),
+    "portal_open": ("sfx/portal_open.wav",),
+    "portal_enter": ("sfx/portal_enter.wav",),
     "defeat": ("sfx/defeat.wav",),
 }
 
@@ -61,6 +64,9 @@ SFX_GAIN = {
     "hurt": 0.9,
     "parry": 1.0,
     "parry_ready": 0.6,
+    "spawn": 0.9,
+    "portal_open": 0.9,
+    "portal_enter": 0.9,
     "defeat": 0.85,
 }
 

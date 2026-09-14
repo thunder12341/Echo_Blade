@@ -48,7 +48,7 @@ class Player:
     PERFECT_PARRY_WINDOW = 0.12
     # 弹刀输入缓冲：按下后这么久内命中判定都算完美弹刀，
     # 与提示闪光提前量（main.MELEE_FLASH_LEAD）保持一致。
-    PARRY_INPUT_BUFFER = 0.3
+    PARRY_INPUT_BUFFER = 0.45
 
     ATTACK_DURATION = 0.34
     ATTACK_ACTIVE_START = 0.06
@@ -71,7 +71,7 @@ class Player:
         x: float,
         ground_y: float,
         *,
-        bounds: tuple[float, float] = (110.0, 690.0),
+        bounds: tuple[float, float] = (72.0, 1208.0),
         max_hp: int = 100,
     ) -> None:
         self.x = float(x)

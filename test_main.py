@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
@@ -59,6 +60,26 @@ def _app_with_recording_audio(monkeypatch, tmp_path):
     recorder = _RecordingAudio()
     app.audio = recorder
     return app, recorder
+
+
+def _enter_level(app, floor: int = 1, *, tutorial: bool = False):
+    """进入关卡并跳过刷怪等待，便于测试战斗逻辑本身。"""
+    app._start_run(floor, tutorial=tutorial)
+    app._spawn_pending_enemies()
+    return app
+
+
+def _advance(app, seconds: float, step: float = 1.0 / 60.0) -> None:
+    for _ in range(max(1, int(round(seconds / step)))):
+        app._update(step)
+
+
+def _countdown_panel_digest(app) -> str:
+    """把倒计时面板区域画一遍并取指纹，用来验证它确实在随时间变化。"""
+    app._draw()
+    region = pygame.Rect(480, 84, 320, 96)
+    raw = pygame.image.tobytes(app.canvas.subsurface(region), "RGB")
+    return hashlib.sha1(raw).hexdigest()
 
 
 def test_font_loader_survives_broken_windows_font_registry(monkeypatch, tmp_path):
@@ -182,9 +203,12 @@ def test_player_moves_accelerates_faces_and_stops_at_bounds():
     assert player.velocity_x > 0
     assert player.facing == 1
 
-    for _ in range(180):
+    for _ in range(360):
         player.update(1.0 / 60.0, 1)
     assert player.x == player.bounds_right
+    # 战斗区横跨整块画面：左右只被屏幕边界挡住
+    assert player.bounds_right >= 1200.0
+    assert player.bounds_left <= 80.0
 
     player.update(0.1, -1)
     assert player.facing == -1
@@ -357,7 +381,7 @@ def test_game_attack_damages_enemy(monkeypatch, tmp_path):
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
-    app._start_run(1, tutorial=False)
+    _enter_level(app)
     enemy = app.room_enemies[0]
     starting_hp = enemy.hp
 
@@ -420,7 +444,7 @@ def test_defeated_enemy_is_removed_from_active_room(monkeypatch, tmp_path):
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
-    app._start_run(1, tutorial=False)
+    _enter_level(app)
     enemy = app.room_enemies[0]
     enemy.hp = 1
 
@@ -547,7 +571,7 @@ def test_down_attack_hit_bounces_player_up(monkeypatch, tmp_path):
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
-    app._start_run(1, tutorial=False)
+    _enter_level(app)
     app.player.x = app.room_enemies[0].x
     app.player.y = 500
     app.player.grounded = False
@@ -840,7 +864,7 @@ def test_combat_actions_emit_expected_sfx(monkeypatch, tmp_path):
 
     # 玩家被打中：额外受击确认音（先结束架势，避免再次触发弹刀）
     recorder.played.clear()
-    app.player.update(app.player.PARRY_DURATION, 0)
+    app.player.update(app.player.PARRY_INPUT_BUFFER + 0.05, 0)
     app._resolve_enemy_attack(PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0))
     assert "hurt" in recorder.played
     pygame.quit()
@@ -879,6 +903,208 @@ def test_volume_setting_updates_audio_and_profile(monkeypatch, tmp_path):
     app._change_setting(0, 5)
     assert app.settings["volume"] == 40
     assert recorder.volume == 40
+    pygame.quit()
+
+
+def test_level_escape_opens_settings_and_has_no_finish_button(monkeypatch, tmp_path):
+    """关卡里不再有「完成关卡/返回主菜单」按钮，Esc 直接开设置。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+
+    assert app._page_buttons() == {}
+    app._handle_key(pygame.K_ESCAPE)
+    assert app.overlay == "settings"
+    assert app.confirm_exit is False
+    assert app.return_page == "game"
+    pygame.quit()
+
+
+def test_settings_icon_click_opens_settings(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+
+    pygame.event.post(
+        pygame.event.Event(
+            pygame.MOUSEBUTTONDOWN,
+            button=1,
+            pos=app._settings_icon_rect().center,
+        )
+    )
+    app._handle_events()
+
+    assert app.overlay == "settings"
+    # 点图标不应该同时触发一次攻击
+    assert app.player.attack_in_progress is False
+    pygame.quit()
+
+
+def test_settings_can_return_to_menu_from_level(monkeypatch, tmp_path):
+    """设置里的「返回主菜单」：关卡中先确认，再回到主菜单。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    app._handle_key(pygame.K_ESCAPE)
+
+    app._activate_setting(4)
+    assert app.overlay is None
+    assert app.confirm_exit is True
+
+    app._activate_exit_button("confirm")
+    assert app.page == "menu"
+    assert app.confirm_exit is False
+    pygame.quit()
+
+
+def test_settings_from_main_menu_closes_without_confirmation(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._open_overlay("settings")
+
+    app._activate_setting(4)
+    assert app.overlay is None
+    assert app.confirm_exit is False
+    assert app.page == "menu"
+    pygame.quit()
+
+
+def test_settings_overlay_has_six_rows(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._open_overlay("settings")
+    assert len(app._setting_rects()) == 6
+
+    app._handle_key(pygame.K_DOWN)
+    assert app.overlay_selected == 1
+    for _ in range(5):
+        app._handle_key(pygame.K_DOWN)
+    assert app.overlay_selected == 0  # 6 项循环
+
+    app._activate_setting(5)
+    assert app.overlay is None
+    pygame.quit()
+
+
+def test_room_clear_opens_portal_and_assets_are_loaded(monkeypatch, tmp_path):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+
+    assert app.assets.portal_idle, "传送门待机素材应当存在"
+    assert len(app.assets.portal_enter) == 4, "传送门进入动画应当有 4 帧"
+
+    _advance(app, 0.2)
+    assert app.portal_open is True
+    assert "portal_open" in recorder.played
+
+    _advance(app, main.PORTAL_APPEAR_TIME)
+    assert app.portal_appear == 1.0
+    app._draw()  # 传送门绘制路径不应抛异常
+    pygame.quit()
+
+
+def test_walking_into_portal_plays_enter_animation_then_shows_choice(
+    monkeypatch, tmp_path
+):
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    _advance(app, main.PORTAL_APPEAR_TIME + 0.2)
+    assert app.portal_appear == 1.0
+
+    app.player.x = main.PORTAL_CENTER_X
+    app.player.y = main.PORTAL_GROUND_Y
+    _advance(app, 0.05)
+    assert app.portal_enter_timer > 0.0
+    assert "portal_enter" in recorder.played
+
+    _advance(app, main.PORTAL_ENTER_TIME + 0.1)
+    assert app.overlay == "portal"
+    pygame.quit()
+
+
+def test_portal_choice_next_level_and_menu(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=3)
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    app.portal_open = True
+    app.portal_appear = 1.0
+    app.portal_enter_timer = 0.0
+    app._open_portal_choice()
+
+    assert app._portal_choice_labels()[1] == "进入第 4 层"
+    app._activate_portal_choice(1)
+    assert app.page == "game"
+    assert app.run_floor == 4
+    assert app.is_tutorial_run is False
+    assert app.portal_open is False
+    assert app.has_save is True
+
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    app.portal_open = True
+    app.portal_appear = 1.0
+    app._open_portal_choice()
+    app._activate_portal_choice(0)
+    assert app.page == "menu"
+    pygame.quit()
+
+
+def test_tutorial_portal_leads_to_lobby(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=True)
+    app.tutorial_index = len(app.tutorial_steps) - 1
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    _advance(app, 0.2)
+    assert app.portal_open is True
+
+    assert app._portal_choice_labels()[1] == "进入灰塔大厅"
+    app._open_portal_choice()
+    app._activate_portal_choice(1)
+    assert app.page == "lobby"
+    assert app.tutorial_completed is True
+    pygame.quit()
+
+
+def test_portal_choice_cancel_keeps_player_in_room(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    app.portal_open = True
+    app.portal_appear = 1.0
+    app._open_portal_choice()
+
+    app._leave_portal_choice()
+    assert app.overlay is None
+    assert app.page == "game"
+    assert app.player.x < main.PORTAL_CENTER_X - 100
+    assert app.portal_lock_timer > 0.0
+    pygame.quit()
+
+
+def test_player_and_enemies_move_across_the_whole_screen(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+
+    # 玩家可以一路走到原来会被卡住的中段之后
+    app.player.x = 900
+    app.player.update(1.0 / 60.0, 1)
+    assert app.player.x > 900
+
+    # 追击者会从屏幕右侧一路向左追，且不会越过左侧边界
+    chaser = Chaser(1200, 522)
+    app.room_enemies = [chaser]
+    app.player.x = 100
+    for _ in range(600):
+        chaser.update(1.0 / 60.0, app.player.position)
+    assert chaser.x >= chaser.bounds_left
+    assert chaser.x < 400
+
+    # 反向：玩家在右侧时敌人向右移动也不会越过右侧边界
+    chaser.x = 1200
+    app.player.x = 1260
+    for _ in range(600):
+        chaser.update(1.0 / 60.0, app.player.position)
+    assert chaser.x <= chaser.bounds_right
     pygame.quit()
 
 
@@ -1026,6 +1252,96 @@ def test_unparried_projectile_still_damages_player(monkeypatch, tmp_path):
         )
     )
     assert app.player.hp == starting_hp - thrower.damage
+    pygame.quit()
+
+
+def test_level_spawns_enemies_after_delay(monkeypatch, tmp_path):
+    """进入新关卡不能秒刷怪：先等待，再让敌人登场。"""
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    assert app.room_enemies == []
+    assert len(app.pending_spawn) == 2
+    assert app.enemy_spawn_timer == main.ENEMY_SPAWN_DELAY
+
+    _advance(app, main.ENEMY_SPAWN_DELAY - 0.2)
+    assert app.room_enemies == []
+
+    _advance(app, 0.3)
+    assert len(app.room_enemies) == 2
+    assert app.pending_spawn == []
+    assert "spawn" in recorder.played
+    pygame.quit()
+
+
+def test_spawn_countdown_display_actually_ticks(monkeypatch, tmp_path):
+    """回归：倒计时面板必须随时间变化，且提示文案里不能写死秒数。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+
+    first = _countdown_panel_digest(app)
+    _advance(app, 1.0)
+    second = _countdown_panel_digest(app)
+    assert first != second
+
+    # 曾经在通知里写死“3 秒”，导致画面看起来一直停在 3
+    assert not any(character.isdigit() for character in app.notification)
+
+    _advance(app, main.ENEMY_SPAWN_DELAY)
+    assert app.pending_spawn == []
+    pygame.quit()
+
+
+def test_projectile_parry_reflects_bullet_back_to_shooter(monkeypatch, tmp_path):
+    """远程弹刀是“把子弹打回去”，伤害在飞回敌人时才结算。"""
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    thrower = SpearThrower(600, 522)
+    app.room_enemies = [thrower]
+    profile = thrower.scaled_attack()
+    enemy_hp = thrower.hp
+
+    near = PendingEnemyAttack(
+        thrower,
+        profile,
+        profile.telegraph_time * 0.02,
+        origin=(thrower.x, thrower.y - 52),
+        target=(app.player.x, app.player.y - 54),
+    )
+    app.pending_enemy_attacks = [near]
+    app._handle_key(app.keybinds["parry"])
+
+    # 弹开瞬间：子弹转为“反弹中”，敌人还没掉血
+    assert app.run_parries == 1
+    assert len(app.reflected_projectiles) == 1
+    assert thrower.hp == enemy_hp
+
+    recorder.played.clear()
+    _advance(app, 1.0)
+    assert thrower.hp < enemy_hp
+    assert app.reflected_projectiles == []
+    assert "hit" in recorder.played
+    pygame.quit()
+
+
+def test_melee_parry_window_is_longer_than_before(monkeypatch, tmp_path):
+    """近战弹刀窗口延长到 0.45 秒，闪光提前量与之保持一致。"""
+    assert main.MELEE_FLASH_LEAD == Player.PARRY_INPUT_BUFFER
+    assert Player.PARRY_INPUT_BUFFER >= 0.45
+
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+    starting_hp = app.player.hp
+
+    # 命中前 0.4 秒按键（旧窗口已经失效）仍然算完美弹刀
+    app._handle_key(app.keybinds["parry"])
+    app.player.update(0.4, 0)
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+    assert app.player.hp == starting_hp
+    assert app.run_parries == 1
     pygame.quit()
 
 
