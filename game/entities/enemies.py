@@ -22,6 +22,7 @@ class AttackProfile:
     projectile_speed: float | None = None
     posture_damage: int = 0
     warning_color: str = "white"
+    tag: str = ""
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,8 @@ class Enemy(ABC):
     speed: ClassVar[float] = 0.0
     bounty_score: ClassVar[int] = 100
     parry_tutorial: ClassVar[str] = ""
+    body_width: ClassVar[float] = 36.0
+    body_height: ClassVar[float] = 44.0
     attack_profile: ClassVar[AttackProfile] = AttackProfile(
         name="碰撞",
         damage=1,
@@ -174,6 +177,10 @@ class Enemy(ABC):
         posture_damage = self.attack_profile.posture_damage * (2 if perfect else 1)
         self.take_posture_damage(posture_damage)
         return round(self.damage * 1.5) if perfect else 0
+
+    def on_attack_parried(self, profile: AttackProfile, *, perfect: bool) -> int:
+        """Resolve an individual attack's parry consequence."""
+        return self.on_parried(perfect=perfect)
 
     def enter_vulnerable(self, seconds: float = 0.8) -> None:
         self._vulnerable_timer = max(self._vulnerable_timer, seconds)
@@ -425,10 +432,148 @@ class ResonanceMage(Enemy):
         return EnemyIntent("channel", note="蓄积共鸣能量")
 
 
+class RustCrownKnight(Enemy):
+    """First-region boss with a phase-two parry-or-punish mechanic."""
+
+    kind = "rust_crown_knight"
+    display_name = "锈冠骑士"
+    base_hp = 760
+    base_posture = 180
+    speed = 72.0
+    bounty_score = 1800
+    parry_tutorial = "二阶段的断忆敕令必须在金红闪光亮起后完美弹刀"
+    body_width = 88.0
+    body_height = 126.0
+    PHASE_TWO_THRESHOLD = 0.55
+    SPECIAL_INTERVAL = 7.0
+    SPECIAL_FIRST_DELAY = 3.2
+    DEFENSE_BREAK_DURATION = 3.0
+    NORMAL_DAMAGE_TAKEN = 0.78
+    BROKEN_DAMAGE_TAKEN = 1.35
+
+    attack_profile = AttackProfile(
+        name="王庭横斩",
+        damage=28,
+        reach=92,
+        telegraph_time=0.52,
+        cooldown=1.55,
+        parryable=True,
+        posture_damage=24,
+        warning_color="gold",
+        tag="boss_slash",
+    )
+    lunge_profile = AttackProfile(
+        name="锈链突刺",
+        damage=34,
+        reach=245,
+        telegraph_time=0.68,
+        cooldown=2.0,
+        parryable=True,
+        posture_damage=28,
+        warning_color="gold",
+        tag="boss_lunge",
+    )
+    execution_profile = AttackProfile(
+        name="断忆敕令",
+        damage=1,
+        reach=2000,
+        telegraph_time=1.2,
+        cooldown=2.2,
+        parryable=True,
+        posture_damage=0,
+        warning_color="crimson",
+        tag="boss_memory_sever",
+    )
+
+    def __init__(self, x: float, y: float, **kwargs) -> None:
+        super().__init__(x, y, **kwargs)
+        self.phase = 1
+        self._special_cooldown = self.SPECIAL_FIRST_DELAY
+        self._defense_break_timer = 0.0
+
+    @property
+    def defense_broken(self) -> bool:
+        return self._defense_break_timer > 0.0
+
+    def scaled_attack(self, profile: AttackProfile | None = None) -> AttackProfile:
+        source = profile or self.attack_profile
+        damage = max(1, round(source.damage * (1.0 + self.threat * 0.75)))
+        return replace(source, damage=damage)
+
+    def update(self, dt: float, player_position: Position) -> EnemyIntent:
+        elapsed = max(0.0, dt)
+        self._defense_break_timer = max(0.0, self._defense_break_timer - elapsed)
+        if self.phase == 2:
+            self._special_cooldown = max(0.0, self._special_cooldown - elapsed)
+        return super().update(dt, player_position)
+
+    def choose_intent(self, player_position: Position) -> EnemyIntent:
+        self.facing = self.direction_to(player_position)
+        distance = self.distance_to(player_position)
+        if self.phase == 2 and self._special_cooldown <= 0.0 and self.attack_ready:
+            self._special_cooldown = self.SPECIAL_INTERVAL
+            return EnemyIntent(
+                "memory_sever",
+                attack=self.scaled_attack(self.execution_profile),
+                note="断忆敕令：必须完美弹刀",
+            )
+        if distance <= self.attack_profile.reach and self.attack_ready:
+            return EnemyIntent(
+                "royal_slash",
+                attack=self.scaled_attack(self.attack_profile),
+                note="王庭横斩",
+            )
+        if self.phase == 2 and distance <= self.lunge_profile.reach and self.attack_ready:
+            return EnemyIntent(
+                "rust_lunge",
+                move_x=self.facing * self.speed * 0.55,
+                attack=self.scaled_attack(self.lunge_profile),
+                note="锈链突刺",
+            )
+        pace = 1.25 if self.phase == 2 else 1.0
+        return EnemyIntent(
+            "royal_advance",
+            move_x=self.facing * self.speed * pace,
+            note="持刃迫近",
+        )
+
+    def take_damage(
+        self,
+        amount: int,
+        *,
+        source_x: float | None = None,
+        posture_damage: int = 0,
+    ) -> int:
+        multiplier = (
+            self.BROKEN_DAMAGE_TAKEN if self.defense_broken else self.NORMAL_DAMAGE_TAKEN
+        )
+        dealt = super().take_damage(
+            round(amount * multiplier),
+            source_x=source_x,
+            posture_damage=posture_damage,
+        )
+        if self.phase == 1 and self.hp <= self.max_hp * self.PHASE_TWO_THRESHOLD:
+            self.phase = 2
+            self._special_cooldown = self.SPECIAL_FIRST_DELAY
+        return dealt
+
+    def on_attack_parried(self, profile: AttackProfile, *, perfect: bool) -> int:
+        if profile.tag == "boss_memory_sever" and perfect:
+            self.enter_vulnerable(self.DEFENSE_BREAK_DURATION)
+            self._defense_break_timer = self.DEFENSE_BREAK_DURATION
+            self._special_cooldown = self.SPECIAL_INTERVAL
+            return 0
+        return super().on_attack_parried(profile, perfect=perfect)
+
+
 ENEMY_CLASSES: dict[str, type[Enemy]] = {
     Chaser.kind: Chaser,
     SpearThrower.kind: SpearThrower,
     ShieldGuard.kind: ShieldGuard,
     RiftWorm.kind: RiftWorm,
     ResonanceMage.kind: ResonanceMage,
+}
+
+BOSS_CLASSES: dict[str, type[Enemy]] = {
+    RustCrownKnight.kind: RustCrownKnight,
 }

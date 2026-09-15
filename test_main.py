@@ -14,6 +14,7 @@ from game.entities import (
     Player,
     ResonanceMage,
     RiftWorm,
+    RustCrownKnight,
     ShieldGuard,
     SpearThrower,
 )
@@ -295,6 +296,29 @@ def test_player_jump_uses_gravity_and_lands():
     assert player.velocity_y == 0
 
 
+def test_air_jump_is_locked_by_default_and_refreshes_after_landing():
+    player = Player(300, 566)
+    player.request_jump()
+    player.update(0.016, 0)
+
+    assert player.request_jump() is False
+
+    player.unlock_air_jump()
+    player.update(0.05, 0)
+    assert player.request_jump() is True
+    assert player.velocity_y == -player.JUMP_SPEED
+    player.update(0.05, 0)
+    assert player.request_jump() is False
+
+    for _ in range(180):
+        player.update(1.0 / 60.0, 0)
+        if player.grounded:
+            break
+    player.request_jump()
+    player.update(0.016, 0)
+    assert player.request_jump() is True
+
+
 def test_player_parry_locks_movement_and_other_actions():
     player = Player(300, 566)
     player.velocity_x = 180
@@ -548,10 +572,17 @@ def test_lethal_enemy_attack_opens_failure_settlement_and_returns_lobby(
     assert app.player.hp == 0
     assert app.page == "failure"
     assert app.result_score == 420
-    assert app.result_relics == 25
+    assert app.result_relics == 21
+    assert dict(app.result_relic_breakdown) == {
+        "残响底蕴": 10,
+        "分数折算": 1,
+        "层级进度": 10,
+        "连击技艺": 0,
+        "弹刀技艺": 0,
+    }
     assert app.pending_enemy_attacks == []
     assert app._stat("failures") == 1
-    assert _saved_slot(save_file)["echo_relics"] == 25
+    assert _saved_slot(save_file)["echo_relics"] == 21
 
     app._handle_key(pygame.K_RETURN)
     assert app.page == "lobby"
@@ -818,6 +849,144 @@ def test_lobby_nexus_unlocks_available_node_and_persists(monkeypatch, tmp_path):
     saved = _saved_slot(save_file)
     assert "aftershock_calibration" in saved["progression"]["unlocked_nodes"]
     assert saved["echo_relics"] == 0
+    pygame.quit()
+
+
+def test_nexus_can_activate_multiple_nodes_without_overwriting_progress(
+    monkeypatch, tmp_path
+):
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app.profile["echo_relics"] = 200
+
+    aftershock_index = next(
+        index
+        for index, node in enumerate(main.PROGRESSION_NODES)
+        if node.node_id == "aftershock_calibration"
+    )
+    white_window_index = next(
+        index
+        for index, node in enumerate(main.PROGRESSION_NODES)
+        if node.node_id == "white_window_record"
+    )
+    app._activate_progression_node(aftershock_index)
+    app._activate_progression_node(white_window_index)
+
+    assert app._unlocked_nodes() == {
+        "aftershock_calibration",
+        "white_window_record",
+    }
+    assert app.echo_relics == 120
+    saved = _saved_slot(save_file)
+    assert set(saved["progression"]["unlocked_nodes"]) == {
+        "aftershock_calibration",
+        "white_window_record",
+    }
+    pygame.quit()
+
+
+def test_progression_branches_are_grouped_collapsible_and_directly_clickable(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app.profile["echo_relics"] = 200
+    app._open_overlay("progression", return_page="lobby")
+
+    assert set(app._progression_branch_rects()) == set(main.PROGRESSION_BRANCHES)
+    visible = app._progression_visible_node_rects()
+    assert visible
+    assert all(
+        main.PROGRESSION_NODES[index].branch == "锻刃谱系" for index in visible
+    )
+
+    branch_rect = app._progression_branch_rects()["锻刃谱系"]
+    app._handle_overlay_click(branch_rect.center)
+    assert app.progression_collapsed["锻刃谱系"] is True
+    assert app._progression_visible_node_rects() == {}
+
+    resonance_rect = app._progression_branch_rects()["共鸣谱系"]
+    app._handle_overlay_click(resonance_rect.center)
+    white_window_index = next(
+        index
+        for index, node in enumerate(main.PROGRESSION_NODES)
+        if node.node_id == "white_window_record"
+    )
+    second_root_rect = app._progression_visible_node_rects()[white_window_index]
+    app._handle_overlay_click(second_root_rect.center)
+    assert app.progression_selected == white_window_index
+    app._handle_overlay_click(app._progression_activate_rect().center)
+    assert "white_window_record" in app._unlocked_nodes()
+    pygame.quit()
+
+
+def test_new_nexus_nodes_apply_attributes_and_mechanics(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.profile = app._new_profile()
+    app.profile["progression"] = {
+        "unlocked_nodes": [
+            "edge_tempering",
+            "execution_resonance",
+            "aerial_memory",
+            "resonant_reservoir",
+            "vital_lattice",
+            "salvage_protocol",
+        ],
+        "equipped_start_module": None,
+    }
+
+    app._start_run(1, tutorial=False)
+
+    assert app.player.max_hp == 320 + main.NEXUS_HP_BONUS
+    assert app.player.attack_bonus == main.NEXUS_ATTACK_BONUS
+    assert app.player.max_air_jumps == 1
+    assert app.echo_energy == main.RESONANT_START_ENERGY
+
+    app.player.hp = app.player.max_hp - 100
+    first = Chaser(300, 522)
+    second = Chaser(400, 522)
+    app._award_enemy_defeat(first)
+    hp_after_first = app.player.hp
+    assert hp_after_first > app.player.max_hp - 100
+    assert app.run_currency == 9
+
+    app._award_enemy_defeat(second)
+    assert app.player.hp == hp_after_first
+    assert app.run_currency == 18
+    pygame.quit()
+
+
+def test_failure_relics_scale_with_score_combo_and_parries(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.profile = app._new_profile()
+    app._start_run(3, tutorial=False)
+    app.run_score = 5000
+    app.run_max_combo = 20
+    app.run_parries = 5
+
+    app.player.hp = 0
+    app._fail_run()
+
+    assert app.result_relics == 70
+    assert app.echo_relics == 70
+    assert app.page == "failure"
+    app._fail_run()
+    assert app.echo_relics == 70
     pygame.quit()
 
 
@@ -1541,13 +1710,128 @@ def test_each_floor_builds_its_designed_wave_composition(monkeypatch, tmp_path):
             positions = [enemy.x for enemy in wave]
             assert len(set(positions)) == len(positions)
 
-    # 第四层沿用第三层编成，只提高威胁
+    # 第四层是非战斗商店，第五层固定生成第一阶段首领
     app._start_run(4, tutorial=False)
-    assert [enemy.kind for enemy in app.wave_plan[0]] == [
-        "shield_guard",
-        "rift_worm",
+    assert app.wave_plan == []
+    app._start_run(5, tutorial=False)
+    assert [[enemy.kind for enemy in wave] for wave in app.wave_plan] == [
+        ["rust_crown_knight"]
     ]
-    assert app.run_threat > main.StartScreen._floor_threat(3)
+    pygame.quit()
+
+
+def test_fourth_floor_shop_requires_interaction_and_carries_upgrades_to_boss(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(4, tutorial=False)
+
+    assert app.overlay == "floor_intro"
+    assert app._room_cleared() is False
+    app._dismiss_floor_intro()
+    assert app.overlay == "shop"
+
+    app.run_currency = 100
+    base_damage = app.player.attack_damage
+    base_hp = app.player.max_hp
+    assert app._purchase_shop_item(1) is True
+    assert app._purchase_shop_item(2) is True
+    assert app.player.attack_damage == base_damage + 4
+    assert app.player.max_hp == base_hp + 45
+    assert app.run_currency == 38
+    assert app._stat("shop_purchases") == 2
+
+    app._leave_shop()
+    assert app._room_cleared() is True
+    app._start_run(5, tutorial=False, keep_progress=True)
+    assert app.player.attack_damage == base_damage + 4
+    assert app.player.max_hp == base_hp + 45
+    assert app.run_currency == 38
+    pygame.quit()
+
+
+def test_first_stage_boss_enters_phase_two_and_casts_memory_sever_at_medium_rate():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+    boss.hp = round(boss.max_hp * boss.PHASE_TWO_THRESHOLD)
+    boss.take_damage(1)
+
+    assert boss.phase == 2
+    assert 5.0 <= boss.SPECIAL_INTERVAL <= 9.0
+
+    special = None
+    for _ in range(240):
+        intent = boss.update(1.0 / 30.0, (230, 566))
+        if intent.attack is not None and intent.attack.tag == "boss_memory_sever":
+            special = intent.attack
+            break
+    assert special is not None
+    assert special.parryable is True
+    assert special.telegraph_time >= 1.0
+
+
+def test_unparried_memory_sever_ignores_dash_and_removes_most_health(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    profile = boss.scaled_attack(boss.execution_profile)
+    starting_hp = app.player.hp
+    assert app.player.dash() is True
+    assert app.player.invulnerable is True
+
+    app._resolve_enemy_attack(PendingEnemyAttack(boss, profile, 0.0))
+
+    expected_loss = round(app.player.max_hp * main.BOSS_MEMORY_SEVER_DAMAGE_RATIO)
+    assert app.player.hp == starting_hp - expected_loss
+    assert expected_loss > app.player.max_hp * 0.75
+    pygame.quit()
+
+
+def test_parrying_memory_sever_stuns_boss_and_breaks_defense_for_three_seconds(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.phase = 2
+    profile = boss.scaled_attack(boss.execution_profile)
+    starting_hp = app.player.hp
+
+    assert app.player.start_parry() is True
+    app._resolve_enemy_attack(PendingEnemyAttack(boss, profile, 0.0))
+
+    assert app.player.hp == starting_hp
+    assert boss.vulnerable is True
+    assert boss.defense_broken is True
+    broken_damage = boss.take_damage(100, source_x=app.player.x)
+    assert boss.update(2.9, app.player.position).action == "vulnerable"
+    assert boss.defense_broken is True
+    boss.update(0.2, app.player.position)
+    assert boss.vulnerable is False
+    assert boss.defense_broken is False
+    normal_damage = boss.take_damage(100, source_x=app.player.x)
+    assert broken_damage > normal_damage
+    pygame.quit()
+
+
+def test_fifth_floor_portal_finishes_first_stage(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.hp = 0
+    app._award_enemy_defeat(boss)
+    assert app._stat("boss_kills") == 1
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    app.wave_plan = []
+    app.wave_index = 0
+
+    assert app._room_cleared() is True
+    assert app._portal_choice_labels()[1] == "完成阶段并返回大厅"
+    app._open_portal_choice()
+    app._activate_portal_choice(1)
+    assert app.page == "lobby"
     pygame.quit()
 
 

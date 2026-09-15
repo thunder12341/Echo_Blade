@@ -1,6 +1,7 @@
 """Entity classes used by rooms and combat systems."""
 
 from .enemies import (
+    BOSS_CLASSES,
     ENEMY_CLASSES,
     AttackProfile,
     Chaser,
@@ -8,12 +9,14 @@ from .enemies import (
     EnemyIntent,
     ResonanceMage,
     RiftWorm,
+    RustCrownKnight,
     ShieldGuard,
     SpearThrower,
 )
 from .player import Hitbox, Player
 
 __all__ = [
+    "BOSS_CLASSES",
     "ENEMY_CLASSES",
     "AttackProfile",
     "Chaser",
@@ -23,6 +26,7 @@ __all__ = [
     "Player",
     "ResonanceMage",
     "RiftWorm",
+    "RustCrownKnight",
     "ShieldGuard",
     "SpearThrower",
 ]

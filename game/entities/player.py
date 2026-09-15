@@ -92,6 +92,8 @@ class Player:
         self.facing = 1
         self.grounded = True
         self.landed_this_frame = False
+        self.max_air_jumps = 0
+        self._air_jumps_remaining = 0
 
         self._coyote_timer = self.COYOTE_TIME
         self._jump_buffer_timer = 0.0
@@ -258,12 +260,26 @@ class Player:
             self.y = self.ground_y
             self.velocity_y = 0.0
             self.grounded = True
+            self._air_jumps_remaining = self.max_air_jumps
 
     def request_jump(self) -> bool:
         if self.parry_active or self.skill_active:
             return False
-        self._jump_buffer_timer = self.JUMP_BUFFER_TIME
-        return self.grounded or self._coyote_timer > 0.0
+        if self.grounded or self._coyote_timer > 0.0:
+            self._jump_buffer_timer = self.JUMP_BUFFER_TIME
+            return True
+        if self._air_jumps_remaining <= 0:
+            return False
+        self._air_jumps_remaining -= 1
+        self._jump_buffer_timer = 0.0
+        self._coyote_timer = 0.0
+        self.velocity_y = -self.JUMP_SPEED
+        self.grounded = False
+        return True
+
+    def unlock_air_jump(self, count: int = 1) -> None:
+        self.max_air_jumps = max(self.max_air_jumps, max(0, int(count)))
+        self._air_jumps_remaining = self.max_air_jumps
 
     def start_attack(self, direction: str = "side") -> bool:
         if self.attack_in_progress or self.parry_active or self.skill_active:
@@ -332,12 +348,20 @@ class Player:
         self.hp += healed
         return healed
 
-    def take_damage(self, amount: int) -> int:
-        if self.invulnerable:
+    def take_damage(self, amount: int, *, ignore_invulnerability: bool = False) -> int:
+        if self.invulnerable and not ignore_invulnerability:
             return 0
         actual_damage = max(0, int(round(amount)))
         self.hp = max(0, self.hp - actual_damage)
         return actual_damage
+
+    def heal(self, amount: int) -> int:
+        actual_healing = min(
+            max(0, int(round(amount))),
+            self.max_hp - self.hp,
+        )
+        self.hp += actual_healing
+        return actual_healing
 
     def _update_timers(self, dt: float) -> None:
         self._dash_cooldown = max(0.0, self._dash_cooldown - dt)
