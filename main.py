@@ -748,6 +748,53 @@ class StartScreen:
             "echo_relics": 0,
             "progression": {"unlocked_nodes": [], "equipped_start_module": None},
             "lifetime_stats": {},
+            "active_run": None,
+        }
+
+    @staticmethod
+    def _normalise_run_checkpoint(data: object) -> dict | None:
+        """Validate a temporary expedition checkpoint from disk."""
+        if not isinstance(data, dict) or data.get("status") != "active":
+            return None
+
+        def number(name: str, default: int, lower: int, upper: int) -> int:
+            try:
+                value = int(data.get(name, default) or 0)
+            except (TypeError, ValueError):
+                value = default
+            return max(lower, min(upper, value))
+
+        floor = number("floor", 1, 1, BOSS_FLOOR)
+        player_hp = number("player_hp", 1, 0, 999999)
+        if player_hp <= 0:
+            return None
+        purchased = data.get("shop_purchased", [])
+        valid_shop_items = {item.item_id for item in SHOP_ITEMS}
+        if not isinstance(purchased, list):
+            purchased = []
+        return {
+            "version": 1,
+            "status": "active",
+            "floor": floor,
+            "run_score": number("run_score", 0, 0, 999999999),
+            "run_combo": number("run_combo", 0, 0, 999999),
+            "run_max_combo": number("run_max_combo", 0, 0, 999999),
+            "run_parries": number("run_parries", 0, 0, 999999),
+            "run_currency": number("run_currency", 0, 0, 999999),
+            "player_level": number("player_level", 1, 1, 999),
+            "player_exp": number("player_exp", 0, 0, 999999),
+            "player_hp": player_hp,
+            "echo_energy": number("echo_energy", 0, 0, ECHO_ENERGY_MAX),
+            "shop_attack_bonus": number("shop_attack_bonus", 0, 0, 9999),
+            "shop_hp_bonus": number("shop_hp_bonus", 0, 0, 99999),
+            "shop_purchased": sorted(
+                {
+                    item_id
+                    for item_id in purchased
+                    if isinstance(item_id, str) and item_id in valid_shop_items
+                }
+            ),
+            "shop_closed": bool(data.get("shop_closed", floor != SHOP_FLOOR)),
         }
 
     @staticmethod
@@ -773,6 +820,9 @@ class StartScreen:
             profile["lifetime_stats"] = {}
         if not isinstance(profile.get("scores"), list):
             profile["scores"] = []
+        profile["active_run"] = StartScreen._normalise_run_checkpoint(
+            profile.get("active_run")
+        )
         return profile
 
     def _load_store(self) -> dict:
@@ -804,6 +854,7 @@ class StartScreen:
             "echo_relics",
             "progression",
             "lifetime_stats",
+            "active_run",
         ):
             if key in self.save_store:
                 profile[key] = self.save_store[key]
@@ -850,6 +901,77 @@ class StartScreen:
             return 0
         return max(0, int(stats.get(name, 0) or 0))
 
+    def _active_run_checkpoint(self) -> dict | None:
+        return self._normalise_run_checkpoint(self.profile.get("active_run"))
+
+    def _build_run_checkpoint(self) -> dict:
+        return {
+            "version": 1,
+            "status": "active",
+            "floor": self.run_floor,
+            "run_score": self.run_score,
+            "run_combo": self.run_combo,
+            "run_max_combo": self.run_max_combo,
+            "run_parries": self.run_parries,
+            "run_currency": self.run_currency,
+            "player_level": self.player_level,
+            "player_exp": self.player_exp,
+            "player_hp": max(0, self.player.hp),
+            "echo_energy": self.echo_energy,
+            "shop_attack_bonus": self.run_shop_attack_bonus,
+            "shop_hp_bonus": self.run_shop_hp_bonus,
+            "shop_purchased": sorted(self.shop_purchased),
+            "shop_closed": self.shop_closed,
+        }
+
+    def _save_run_checkpoint(self) -> None:
+        """Persist the current floor checkpoint for the active save slot."""
+        if self.is_tutorial_run:
+            return
+        self.profile["active_run"] = self._build_run_checkpoint()
+        self._save_profile()
+
+    def _clear_run_checkpoint(self) -> None:
+        self.profile["active_run"] = None
+
+    def _resume_run_checkpoint(self, checkpoint: object) -> bool:
+        saved = self._normalise_run_checkpoint(checkpoint)
+        if saved is None:
+            return False
+
+        self._start_run(saved["floor"], tutorial=False)
+        self.run_score = saved["run_score"]
+        self.run_combo = saved["run_combo"]
+        self.run_max_combo = max(saved["run_max_combo"], self.run_combo)
+        self.run_parries = saved["run_parries"]
+        self.run_currency = saved["run_currency"]
+        self.player_level = saved["player_level"]
+        self.player_exp = min(saved["player_exp"], self.exp_to_next - 1)
+        self.run_shop_attack_bonus = saved["shop_attack_bonus"]
+        self.run_shop_hp_bonus = saved["shop_hp_bonus"]
+        self.shop_purchased = set(saved["shop_purchased"])
+        self.shop_closed = saved["shop_closed"] if self.run_floor == SHOP_FLOOR else True
+
+        gained_levels = max(0, self.player_level - 1)
+        self.player.max_hp += self.run_shop_hp_bonus + gained_levels * HP_PER_LEVEL
+        self.player.attack_bonus += (
+            self.run_shop_attack_bonus + gained_levels * ATTACK_PER_LEVEL
+        )
+        self.player.hp = min(saved["player_hp"], self.player.max_hp)
+        self.echo_energy = saved["echo_energy"]
+        self._save_run_checkpoint()
+        return True
+
+    def _start_or_resume_expedition(self) -> None:
+        checkpoint = self._active_run_checkpoint()
+        if checkpoint is not None and self._resume_run_checkpoint(checkpoint):
+            self._notify(f"已读取暂存进度：从第 {self.run_floor} 层继续远征")
+            return
+        self._clear_run_checkpoint()
+        self._start_run(1, tutorial=False)
+        self._save_run_checkpoint()
+        self._notify("未发现暂存进度：从第一层第一关开始新远征")
+
     @staticmethod
     def _default_keybinds() -> dict[str, int]:
         return {
@@ -888,6 +1010,9 @@ class StartScreen:
             "echo_relics": self.echo_relics,
             "progression": self._progression(),
             "lifetime_stats": self.profile.get("lifetime_stats", {}),
+            "active_run": self._normalise_run_checkpoint(
+                self.profile.get("active_run")
+            ),
         }
 
     def _write_store(self) -> None:
@@ -957,6 +1082,8 @@ class StartScreen:
     def _handle_events(self) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
+                if self.page == "game" and not self.is_tutorial_run:
+                    self._save_run_checkpoint()
                 self.running = False
             elif event.type == pygame.KEYDOWN:
                 self.pressed_keys.add(event.key)
@@ -1307,10 +1434,15 @@ class StartScreen:
         elif action == "settings":
             self._open_overlay("settings")
 
-    @staticmethod
-    def _lobby_actions() -> list[tuple[str, str, pygame.Rect]]:
+    def _lobby_actions(self) -> list[tuple[str, str, pygame.Rect]]:
+        checkpoint = self._active_run_checkpoint()
+        gate_label = (
+            f"继续远征 · 第 {checkpoint['floor']} 层"
+            if checkpoint is not None
+            else "开启新远征"
+        )
         return [
-            ("gate", "开启远征", pygame.Rect(490, 414, 300, 72)),
+            ("gate", gate_label, pygame.Rect(490, 414, 300, 72)),
             ("nexus", "进入回响中枢", pygame.Rect(485, 196, 310, 100)),
             ("smith", "铸刃师", pygame.Rect(78, 420, 260, 86)),
             ("records", "查看远征记录", pygame.Rect(920, 420, 280, 86)),
@@ -1350,11 +1482,17 @@ class StartScreen:
             else 0
         )
         tutorial = "已完成教学" if profile.get("tutorial_completed") else "未完成教学"
+        checkpoint = StartScreen._normalise_run_checkpoint(profile.get("active_run"))
+        run_state = (
+            f"暂存第 {checkpoint['floor']} 层"
+            if checkpoint is not None
+            else "无暂存远征"
+        )
         return (
             f"最高层 {int(profile.get('best_floor', 0) or 0)}   "
             f"最高分 {int(profile.get('best_score', 0) or 0):05d}   "
             f"遗晶 {max(0, int(profile.get('echo_relics', 0) or 0))}   "
-            f"共鸣节点 {unlocked}   {tutorial}"
+            f"共鸣节点 {unlocked}   {run_state}   {tutorial}"
         )
 
     def _bind_slot(self, index: int, *, fresh: bool = False) -> None:
@@ -1411,10 +1549,7 @@ class StartScreen:
             return
         action = actions[index][0]
         if action == "gate":
-            self._start_run(
-                max(1, int(self.profile.get("best_floor", 1) or 1)),
-                tutorial=False,
-            )
+            self._start_or_resume_expedition()
         elif action == "nexus":
             self._open_overlay("progression", return_page="lobby")
         elif action == "smith":
@@ -1536,6 +1671,7 @@ class StartScreen:
         self.shop_closed = True
         self.overlay = None
         self.page = "game"
+        self._save_run_checkpoint()
         self._notify("整备结束，通往锈冠王庭的回响之门正在开启")
 
     def _shop_item_rects(self) -> list[pygame.Rect]:
@@ -1582,6 +1718,7 @@ class StartScreen:
         self.profile["lifetime_stats"] = lifetime_stats
         self.audio.play("hit", 0.5)
         self._notify(f"购入 {item.title}  铸币 -{item.cost}")
+        self._save_run_checkpoint()
         return True
 
     def _handle_overlay_click(self, position: tuple[int, int]) -> None:
@@ -1924,6 +2061,7 @@ class StartScreen:
             return
         next_floor = self.run_floor + 1
         self._start_run(next_floor, tutorial=False, keep_progress=True)
+        self._save_run_checkpoint()
         self._notify(f"进入第 {next_floor} 层  遗晶 +{relics}")
 
     def _update_enemy_spawn(self, dt: float) -> None:
@@ -2589,13 +2727,21 @@ class StartScreen:
             COLORS["muted"],
         )
         self.canvas.blit(stats, (930, 78))
+        checkpoint = self._active_run_checkpoint()
+        if checkpoint is not None:
+            suspended = self.small_font.render(
+                f"暂存远征  第 {checkpoint['floor']} 层  ·  Lv.{checkpoint['player_level']}",
+                True,
+                COLORS["cyan"],
+            )
+            self.canvas.blit(suspended, (930, 104))
         if self.result_relics:
             settlement = self.small_font.render(
                 f"本次远征凝结 +{self.result_relics} 遗晶",
                 True,
                 COLORS["gold"],
             )
-            self.canvas.blit(settlement, (930, 104))
+            self.canvas.blit(settlement, (930, 128 if checkpoint is not None else 104))
 
         # Central gate: the primary interaction in the room.
         pygame.draw.rect(self.canvas, (7, 17, 28), (480, 286, 320, 254))
@@ -3684,9 +3830,15 @@ class StartScreen:
             if self.page == "menu":
                 self.running = False
             else:
+                if self.page == "game" and not self.is_tutorial_run:
+                    self._save_run_checkpoint()
                 self.page = "menu"
                 self.confirm_exit = False
-                self._notify("已返回主菜单")
+                self._notify(
+                    "远征已暂存并返回主菜单"
+                    if self._active_run_checkpoint() is not None
+                    else "已返回主菜单"
+                )
         elif button == "cancel":
             self.confirm_exit = False
 
@@ -3737,6 +3889,7 @@ class StartScreen:
             self._stat("best_combo"), self.run_max_combo
         )
         self.profile["lifetime_stats"] = lifetime_stats
+        self._clear_run_checkpoint()
         self._save_profile()
         self.has_save = True
         self.items = self._build_items()
@@ -3813,6 +3966,7 @@ class StartScreen:
             self._stat("best_combo"), self.run_max_combo
         )
         self.profile["lifetime_stats"] = lifetime_stats
+        self._clear_run_checkpoint()
         self._save_profile()
         self.has_save = True
         self.items = self._build_items()

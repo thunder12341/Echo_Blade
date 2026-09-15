@@ -563,6 +563,7 @@ def test_lethal_enemy_attack_opens_failure_settlement_and_returns_lobby(
     app.player.hp = enemy.damage
     app.run_score = 420
     app.run_currency = 17
+    app._save_run_checkpoint()
     app.pending_enemy_attacks = [
         PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.001)
     ]
@@ -582,7 +583,9 @@ def test_lethal_enemy_attack_opens_failure_settlement_and_returns_lobby(
     }
     assert app.pending_enemy_attacks == []
     assert app._stat("failures") == 1
+    assert app._active_run_checkpoint() is None
     assert _saved_slot(save_file)["echo_relics"] == 21
+    assert _saved_slot(save_file)["active_run"] is None
 
     app._handle_key(pygame.K_RETURN)
     assert app.page == "lobby"
@@ -604,6 +607,25 @@ def test_tutorial_failure_does_not_grant_relics(monkeypatch, tmp_path):
     assert app.result_relics == 0
     assert app.echo_relics == 0
     assert app.tutorial_completed is False
+    pygame.quit()
+
+
+def test_successful_settlement_clears_active_expedition_checkpoint(
+    monkeypatch, tmp_path
+):
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app.profile = app._new_profile()
+    app._start_run(2, tutorial=False)
+    app._save_run_checkpoint()
+
+    app._settle_run()
+
+    assert app._active_run_checkpoint() is None
+    assert _saved_slot(save_file)["active_run"] is None
     pygame.quit()
 
 
@@ -825,7 +847,93 @@ def test_tutorial_completion_enters_lobby_and_lobby_starts_new_run(monkeypatch, 
     app._activate_lobby_action(0)
     assert app.page == "game"
     assert app.is_tutorial_run is False
+    assert app.run_floor == 1
     assert app.tutorial_index == len(app.tutorial_steps) - 1
+    assert app._active_run_checkpoint()["floor"] == 1
+    pygame.quit()
+
+
+def test_lobby_without_checkpoint_starts_at_floor_one_not_historical_best(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app.profile["best_floor"] = 5
+    app._enter_lobby()
+
+    app._activate_lobby_action(0)
+
+    assert app.page == "game"
+    assert app.run_floor == 1
+    assert app._active_run_checkpoint()["floor"] == 1
+    assert "第一层第一关" in app.notification
+    pygame.quit()
+
+
+def test_lobby_resumes_persisted_expedition_checkpoint_after_restart(
+    monkeypatch, tmp_path
+):
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._bind_slot(0, fresh=True)
+    app.profile["tutorial_completed"] = True
+    app._start_run(3, tutorial=False)
+    app.run_score = 1234
+    app.run_combo = 6
+    app.run_max_combo = 11
+    app.run_parries = 4
+    app.run_currency = 77
+    app.player_level = 4
+    app.player_exp = 20
+    app.run_shop_attack_bonus = 4
+    app.run_shop_hp_bonus = 45
+    app.player.hp = 211
+    app.echo_energy = 60
+    app._save_run_checkpoint()
+
+    again = StartScreen(screen)
+    again._load_slot(0)
+    assert again.page == "lobby"
+    assert "继续远征" in again._lobby_actions()[0][1]
+    again._activate_lobby_action(0)
+
+    assert again.page == "game"
+    assert again.run_floor == 3
+    assert again.run_score == 1234
+    assert again.run_combo == 6
+    assert again.run_max_combo == 11
+    assert again.run_parries == 4
+    assert again.run_currency == 77
+    assert again.player_level == 4
+    assert again.player_exp == 20
+    assert again.player.hp == 211
+    assert again.echo_energy == 60
+    assert again.player.max_hp == 320 + 45 + 3 * main.HP_PER_LEVEL
+    assert again.player.attack_damage == 18 + 4 + 3 * main.ATTACK_PER_LEVEL
+    assert "第 3 层" in again.notification
+    pygame.quit()
+
+
+def test_invalid_or_lethal_checkpoint_is_ignored_by_lobby(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app.profile["active_run"] = {
+        "status": "active",
+        "floor": 999,
+        "player_hp": 0,
+    }
+    app._enter_lobby()
+
+    app._activate_lobby_action(0)
+
+    assert app.run_floor == 1
+    assert app.player.hp > 0
+    assert app._active_run_checkpoint()["floor"] == 1
     pygame.quit()
 
 
@@ -978,6 +1086,7 @@ def test_failure_relics_scale_with_score_combo_and_parries(monkeypatch, tmp_path
     app.run_score = 5000
     app.run_max_combo = 20
     app.run_parries = 5
+    app._save_run_checkpoint()
 
     app.player.hp = 0
     app._fail_run()
@@ -985,6 +1094,7 @@ def test_failure_relics_scale_with_score_combo_and_parries(monkeypatch, tmp_path
     assert app.result_relics == 70
     assert app.echo_relics == 70
     assert app.page == "failure"
+    assert app._active_run_checkpoint() is None
     app._fail_run()
     assert app.echo_relics == 70
     pygame.quit()
