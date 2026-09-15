@@ -48,7 +48,11 @@ class Player:
     PERFECT_PARRY_WINDOW = 0.12
     # 弹刀输入缓冲：按下后这么久内命中判定都算完美弹刀，
     # 与提示闪光提前量（main.MELEE_FLASH_LEAD）保持一致。
-    PARRY_INPUT_BUFFER = 0.45
+    PARRY_INPUT_BUFFER = 0.65
+
+    # 回响剑气：起手到剑气出手的时间，以及整段无敌时间
+    SKILL_CAST_TIME = 0.18
+    SKILL_DURATION = 0.66
 
     ATTACK_DURATION = 0.34
     ATTACK_ACTIVE_START = 0.06
@@ -72,7 +76,7 @@ class Player:
         ground_y: float,
         *,
         bounds: tuple[float, float] = (72.0, 1208.0),
-        max_hp: int = 100,
+        max_hp: int = 320,
     ) -> None:
         self.x = float(x)
         self.y = float(ground_y)
@@ -80,6 +84,8 @@ class Player:
         self.bounds_left, self.bounds_right = bounds
         self.max_hp = max(1, int(max_hp))
         self.hp = self.max_hp
+        # 升级带来的伤害加成，会同时作用于普通攻击与回响剑气
+        self.attack_bonus = 0
 
         self.velocity_x = 0.0
         self.velocity_y = 0.0
@@ -93,6 +99,7 @@ class Player:
         self._dash_elapsed = -1.0
         self._parry_buffer = 0.0
         self._parry_elapsed = -1.0
+        self._skill_elapsed = -1.0
         self._attack_elapsed = -1.0
         self._attack_direction = "side"
         self._combo_index = 0
@@ -130,9 +137,17 @@ class Player:
         return 0.0 <= self._dash_elapsed < self.DASH_DURATION
 
     @property
+    def skill_active(self) -> bool:
+        return 0.0 <= self._skill_elapsed < self.SKILL_DURATION
+
+    @property
+    def skill_elapsed(self) -> float:
+        return self._skill_elapsed if self._skill_elapsed >= 0.0 else 0.0
+
+    @property
     def invulnerable(self) -> bool:
-        """闪避期间无敌：不受任何伤害。"""
-        return self.dash_active
+        """闪避与回响剑气期间无敌：不受任何伤害。"""
+        return self.dash_active or self.skill_active
 
     @property
     def perfect_parry_active(self) -> bool:
@@ -154,7 +169,7 @@ class Player:
 
     @property
     def attack_damage(self) -> int:
-        return self.ATTACK_DAMAGE[self.attack_stage - 1]
+        return self.ATTACK_DAMAGE[self.attack_stage - 1] + self.attack_bonus
 
     @property
     def posture_damage(self) -> int:
@@ -187,7 +202,7 @@ class Player:
         self._update_timers(elapsed)
 
         axis = max(-1.0, min(1.0, float(move_axis)))
-        if self.parry_active:
+        if self.parry_active or self.skill_active:
             axis = 0.0
             self.velocity_x = 0.0
         if abs(axis) > 0.01:
@@ -245,13 +260,13 @@ class Player:
             self.grounded = True
 
     def request_jump(self) -> bool:
-        if self.parry_active:
+        if self.parry_active or self.skill_active:
             return False
         self._jump_buffer_timer = self.JUMP_BUFFER_TIME
         return self.grounded or self._coyote_timer > 0.0
 
     def start_attack(self, direction: str = "side") -> bool:
-        if self.attack_in_progress or self.parry_active:
+        if self.attack_in_progress or self.parry_active or self.skill_active:
             return False
         if direction not in self.ATTACK_REACH:
             raise ValueError(f"不支持的攻击方向: {direction}")
@@ -276,7 +291,7 @@ class Player:
         return True
 
     def dash(self) -> bool:
-        if self._dash_cooldown > 0.0 or self.parry_active:
+        if self._dash_cooldown > 0.0 or self.parry_active or self.skill_active:
             return False
         self._dash_cooldown = self.DASH_COOLDOWN
         self._dash_elapsed = 0.0
@@ -288,13 +303,34 @@ class Player:
         return True
 
     def start_parry(self) -> bool:
-        if self.parry_active:
+        if self.parry_active or self.skill_active:
             return False
         self._attack_elapsed = -1.0
         self._parry_buffer = self.PARRY_INPUT_BUFFER
         self._parry_elapsed = 0.0
         self.velocity_x = 0.0
         return True
+
+    def cast_skill(self) -> bool:
+        """起手回响剑气：整段动作无敌，且能打断正在进行的普通攻击。"""
+        if self.skill_active or self.parry_active or self.dash_active:
+            return False
+        self._attack_elapsed = -1.0
+        self._parry_elapsed = -1.0
+        self._combo_index = 0
+        self._combo_timer = 0.0
+        self._skill_elapsed = 0.0
+        self.velocity_x = 0.0
+        return True
+
+    def gain_level(self, hp_gain: int, attack_gain: int) -> int:
+        """升级：提高生命上限与攻击力，并按上限比例回复生命，返回回复量。"""
+        hp_gain = max(0, int(hp_gain))
+        self.max_hp += hp_gain
+        self.attack_bonus += max(0, int(attack_gain))
+        healed = max(0, min(self.max_hp - self.hp, hp_gain + round(self.max_hp * 0.3)))
+        self.hp += healed
+        return healed
 
     def take_damage(self, amount: int) -> int:
         if self.invulnerable:
@@ -315,6 +351,10 @@ class Player:
             self._parry_elapsed += dt
             if self._parry_elapsed >= self.PARRY_DURATION:
                 self._parry_elapsed = -1.0
+        if self._skill_elapsed >= 0.0:
+            self._skill_elapsed += dt
+            if self._skill_elapsed >= self.SKILL_DURATION:
+                self._skill_elapsed = -1.0
         if self._combo_timer > 0.0:
             self._combo_timer = max(0.0, self._combo_timer - dt)
             if self._combo_timer == 0.0 and not self.attack_in_progress:

@@ -9,7 +9,15 @@ from pathlib import Path
 import pygame
 
 from game.audio import AudioManager
-from game.entities import AttackProfile, Chaser, Enemy, Hitbox, Player, SpearThrower
+from game.entities import (
+    ENEMY_CLASSES,
+    AttackProfile,
+    Chaser,
+    Enemy,
+    Hitbox,
+    Player,
+    SpearThrower,
+)
 from settings import (
     COLORS,
     FPS,
@@ -21,16 +29,24 @@ from settings import (
 )
 
 # 近战完美弹刀提示：闪光出现的提前量，同时决定弹刀窗口长度
-MELEE_FLASH_LEAD = 0.45
+MELEE_FLASH_LEAD = 0.65
 # 远程弹道的可弹刀范围（像素）：子弹进入角色身边这个范围内按下弹刀即成功
 PROJECTILE_PARRY_RANGE = 170.0
 # 弹开的子弹飞回敌人的速度（像素/秒）
 REFLECTED_PROJECTILE_SPEED = 900.0
 # 进入关卡后敌人登场延迟（秒）
 ENEMY_SPAWN_DELAY = 3.0
+# 同一层里两波敌人之间的等待时间（秒）
+WAVE_SPAWN_DELAY = 2.6
+# 一波敌人的横向落点范围：均匀铺开，避免叠在同一点
+WAVE_SPAWN_START_X = 320.0
+WAVE_SPAWN_END_X = 1180.0
+WAVE_GROUND_Y = 522.0
 # 闪避残影的生成间隔与存在时间
 DASH_TRAIL_INTERVAL = 0.035
 DASH_TRAIL_LIFE = 0.32
+# 存档槽位数量
+SAVE_SLOT_COUNT = 6
 # 关卡胜利后出现的传送门
 PORTAL_WIDTH = 96
 PORTAL_HEIGHT = 160
@@ -39,6 +55,49 @@ PORTAL_GROUND_Y = 566.0
 PORTAL_APPEAR_TIME = 0.8
 PORTAL_ENTER_TIME = 0.75
 PORTAL_RETRIGGER_LOCK = 0.6
+
+# -- 角色成长 ---------------------------------------------------------------
+# 每升一级提升的生命上限与攻击力
+HP_PER_LEVEL = 26
+ATTACK_PER_LEVEL = 3
+
+# -- 回响能量 ---------------------------------------------------------------
+# 每一层开局清零；普通攻击 < 上劈/下劈 < 击败敌人 = 完美弹刀
+ECHO_ENERGY_MAX = 100
+ENERGY_GAIN_ATTACK = 4
+ENERGY_GAIN_HEAVY_ATTACK = 7
+ENERGY_GAIN_DEFEAT = 20
+ENERGY_GAIN_PARRY = 20
+ENERGY_GAIN_REFLECT = 6
+
+# -- 回响剑气 ---------------------------------------------------------------
+# 伤害为普通攻击的若干倍，命中后把敌人击飞一段距离。
+SKILL_DAMAGE_MULTIPLIER = 3
+# 飞行速度与寿命：寿命足够长，保证从画面任意一侧出手都能一路斩到另一侧
+SKILL_WAVE_SPEED = 900.0
+SKILL_WAVE_LIFE = 1.6
+# 收尾淡出时长：这段时间剑气已经飞出画面，横穿全屏期间保持满亮度
+SKILL_WAVE_FADE_TIME = 0.22
+# 半月外形：比角色（48 x 108）略大一圈
+SKILL_WAVE_HALF_HEIGHT = 74.0
+SKILL_WAVE_HALF_WIDTH = 22.0
+SKILL_WAVE_THICKNESS = 26.0
+SKILL_KNOCKBACK_SPEED = 430.0
+SKILL_KNOCKBACK_LIFT = 470.0
+
+# -- 关卡难度 ---------------------------------------------------------------
+# 每往下一层，敌人的生命与伤害同步提高
+FLOOR_THREAT_BASE = 0.12
+FLOOR_THREAT_STEP = 0.18
+# 击败敌人获得的经验（按敌人种类），并随层数放大
+ENEMY_EXP = {
+    "chaser": 24,
+    "spear_thrower": 26,
+    "shield_guard": 42,
+    "rift_worm": 36,
+    "resonance_mage": 40,
+}
+FLOOR_EXP_STEP = 0.35
 
 
 @dataclass(frozen=True)
@@ -97,6 +156,44 @@ class ReflectedProjectile:
     target: Enemy
     damage: int
     speed: float = REFLECTED_PROJECTILE_SPEED
+
+
+@dataclass
+class SkillWave:
+    """回响剑气：向前平推的竖向半月斩，可反复命中不同敌人。"""
+
+    x: float
+    y: float
+    facing: int
+    damage: int
+    posture_damage: int
+    remaining: float
+    total: float
+    hits: set[int]
+    speed: float = SKILL_WAVE_SPEED
+
+    @property
+    def hitbox(self) -> Hitbox:
+        """半月本体的判定框：比角色略大一圈，跟着角色出手的高度走。"""
+        return Hitbox(
+            self.x - SKILL_WAVE_HALF_WIDTH,
+            self.y - SKILL_WAVE_HALF_HEIGHT,
+            SKILL_WAVE_HALF_WIDTH * 2,
+            SKILL_WAVE_HALF_HEIGHT * 2,
+        )
+
+    @property
+    def expired(self) -> bool:
+        return self.remaining <= 0.0
+
+
+@dataclass(frozen=True)
+class FloorBriefing:
+    """进入新一层时弹出的关卡简报。"""
+
+    title: str
+    summary: str
+    entries: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -204,6 +301,86 @@ PROGRESSION_NODES = (
 )
 
 
+# 三层关卡的波次编成：每一层三波，按顺序刷出。
+# 第四层及以后沿用第三层的编成，只提高威胁值。
+FLOOR_WAVE_PLANS: dict[int, tuple[tuple[str, ...], ...]] = {
+    1: (
+        ("chaser", "spear_thrower"),
+        ("chaser", "spear_thrower", "spear_thrower"),
+        ("chaser", "chaser", "spear_thrower", "spear_thrower"),
+    ),
+    2: (
+        ("shield_guard", "spear_thrower"),
+        ("shield_guard", "chaser", "spear_thrower"),
+        (
+            "shield_guard",
+            "chaser",
+            "chaser",
+            "spear_thrower",
+            "spear_thrower",
+        ),
+    ),
+    3: (
+        ("shield_guard", "rift_worm"),
+        ("rift_worm", "rift_worm", "chaser"),
+        ("shield_guard", "rift_worm", "resonance_mage"),
+    ),
+}
+
+# 每层的关卡简报：介绍本层首次登场的敌人及其攻击特点
+FLOOR_BRIEFINGS: dict[int, FloorBriefing] = {
+    1: FloorBriefing(
+        "锈蚀中庭",
+        "灰塔外围的巡逻残响，攻击节奏直来直去，适合熟悉弹刀。",
+        (
+            (
+                "追击者",
+                "近身三连斩：贴身挥出三段连斩，起手只有 0.28 秒。"
+                "等待金色闪光亮起再弹刀，可以完美反震。",
+            ),
+            (
+                "投矛手",
+                "可反射长矛：与你拉开距离后投出长矛，出手前摇 0.42 秒。"
+                "长矛属于可弹反的飞行物，弹回去会直接打在它自己身上。",
+            ),
+        ),
+    ),
+    2: FloorBriefing(
+        "镜面回廊",
+        "重甲与长矛开始协同推进，正面硬顶会吃亏。",
+        (
+            (
+                "盾卫",
+                "盾击：血厚韧高，正面来袭的伤害会被盾牌削减到 35%，"
+                "但会额外承受削韧。绕到背后攻击，或先打空韧性制造破绽。",
+            ),
+            (
+                "组合压力",
+                "盾卫负责正面顶住，追击者贴身压制，投矛手在远处消耗。"
+                "优先弹反长矛清掉后排，再处理盾卫的正面推进。",
+            ),
+        ),
+    ),
+    3: FloorBriefing(
+        "裂隙深庭",
+        "裂隙能量渗入回廊，出现无法弹反的突进。",
+        (
+            (
+                "裂隙虫",
+                "裂隙突进：唯一不可弹反的攻击，紫色扇形提示，"
+                "冲刺速度是平时的 1.65 倍。只能闪避或用走位躲开。",
+            ),
+            (
+                "共鸣法师",
+                "延迟能量球：预警长达 0.65 秒，弹道很慢但射程极远，"
+                "离得远会主动贴近，把你逼到墙角则就地施法。"
+                "看准弹道靠近后弹刀，可以把能量球原路打回去。",
+            ),
+        ),
+    ),
+}
+
+
 class AssetStore:
     def __init__(self) -> None:
         self.background = self._load("title_background.png", alpha=False)
@@ -309,8 +486,17 @@ class StartScreen:
         self.progression_selected = 0
         self.is_tutorial_run = False
 
-        self.profile = self._load_profile()
-        saved_settings = self.profile.get("settings", {})
+        # 存档：设置全局共享，六个槽位各自保存一份独立的远征档案
+        self.save_store = self._load_store()
+        self.save_slots = self._load_slots()
+        self.active_slot: int | None = None
+        self.profile: dict = {}
+        self.slot_mode = "new"
+        self.slot_selected = 0
+        self.slot_confirm_index: int | None = None
+        self.has_save = any(slot is not None for slot in self.save_slots)
+
+        saved_settings = self.save_store.get("settings", {})
         if not isinstance(saved_settings, dict):
             saved_settings = {}
         self.settings = {
@@ -326,7 +512,6 @@ class StartScreen:
         self.audio.play_music(self._music_for_page())
         if self.settings["fullscreen"]:
             self._apply_display_mode()
-        self.has_save = self._load_save()
         self.items = self._build_items()
         self.selected = next(
             (index for index, item in enumerate(self.items) if item.enabled),
@@ -352,6 +537,18 @@ class StartScreen:
         self.reflected_projectiles: list[ReflectedProjectile] = []
         self.pending_spawn: list[Enemy] = []
         self.enemy_spawn_timer = 0.0
+        # 波次：本层完整的刷怪编成、已经排到第几波、倒计时面板用的总量与文案
+        self.wave_plan: list[list[Enemy]] = []
+        self.wave_index = 0
+        self.spawn_countdown_total = ENEMY_SPAWN_DELAY
+        self.spawn_countdown_label = "敌影接近"
+        self.run_threat = FLOOR_THREAT_BASE
+        # 成长与回响能量
+        self.player_level = 1
+        self.player_exp = 0
+        self.echo_energy = 0
+        self.skill_waves: list[SkillWave] = []
+        self._skill_wave_spawned = False
         self.portal_open = False
         self.portal_appear = 0.0
         self.portal_enter_timer = 0.0
@@ -399,36 +596,95 @@ class StartScreen:
         except (OSError, TypeError, pygame.error):
             return pygame.font.Font(None, size)
 
-    def _load_profile(self) -> dict:
+    @staticmethod
+    def _new_profile() -> dict:
+        """一份全新的档案：等级、成长树与关卡进度都从头开始。"""
+        return {
+            "version": 2,
+            "best_score": 0,
+            "best_floor": 0,
+            "scores": [],
+            "tutorial_completed": False,
+            "echo_relics": 0,
+            "progression": {"unlocked_nodes": [], "equipped_start_module": None},
+            "lifetime_stats": {},
+        }
+
+    @staticmethod
+    def _normalise_profile(data: dict) -> dict:
+        """补全缺失字段，保证旧档案也能直接读。"""
+        profile = dict(data)
+        profile.pop("settings", None)
+        raw_echoes = profile.get(
+            "echo_relics",
+            profile.get("echo_tokens", profile.get("permanent_memory", 0)),
+        )
+        try:
+            echoes = int(raw_echoes or 0)
+        except (TypeError, ValueError):
+            echoes = 0
+        profile["echo_relics"] = max(0, echoes)
+        if not isinstance(profile.get("progression"), dict):
+            profile["progression"] = {
+                "unlocked_nodes": [],
+                "equipped_start_module": None,
+            }
+        if not isinstance(profile.get("lifetime_stats"), dict):
+            profile["lifetime_stats"] = {}
+        if not isinstance(profile.get("scores"), list):
+            profile["scores"] = []
+        return profile
+
+    def _load_store(self) -> dict:
         if not SAVE_FILE.exists():
             return {}
         try:
             data = json.loads(SAVE_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
-        if not isinstance(data, dict):
-            return {}
-        if "echo_relics" not in data:
-            data["echo_relics"] = max(
-                0,
-                int(data.get("echo_tokens", data.get("permanent_memory", 0)) or 0),
-            )
-        if not isinstance(data.get("progression"), dict):
-            data["progression"] = {
-                "unlocked_nodes": [],
-                "equipped_start_module": None,
-            }
-        if not isinstance(data.get("lifetime_stats"), dict):
-            data["lifetime_stats"] = {}
-        return data
+        return data if isinstance(data, dict) else {}
 
-    def _load_save(self) -> bool:
-        return bool(
-            self.profile.get("best_score")
-            or self.profile.get("best_floor")
-            or self.profile.get("scores")
-            or self.profile.get("tutorial_completed")
+    def _migrate_legacy_profile(self) -> dict | None:
+        """把旧版单档案格式迁移到 1 号槽，避免玩家进度凭空消失。"""
+        legacy_keys = (
+            "best_score",
+            "best_floor",
+            "tutorial_completed",
+            "echo_relics",
+            "progression",
         )
+        if not any(key in self.save_store for key in legacy_keys):
+            return None
+        profile = self._new_profile()
+        for key in (
+            "best_score",
+            "best_floor",
+            "scores",
+            "tutorial_completed",
+            "echo_relics",
+            "progression",
+            "lifetime_stats",
+        ):
+            if key in self.save_store:
+                profile[key] = self.save_store[key]
+        return self._normalise_profile(profile)
+
+    def _load_slots(self) -> list[dict | None]:
+        raw = self.save_store.get("slots")
+        if not isinstance(raw, list):
+            legacy = self._migrate_legacy_profile()
+            return (
+                [legacy] + [None] * (SAVE_SLOT_COUNT - 1)
+                if legacy
+                else [None] * SAVE_SLOT_COUNT
+            )
+        slots: list[dict | None] = []
+        for index in range(SAVE_SLOT_COUNT):
+            entry = raw[index] if index < len(raw) else None
+            slots.append(
+                self._normalise_profile(entry) if isinstance(entry, dict) else None
+            )
+        return slots
 
     @property
     def tutorial_completed(self) -> bool:
@@ -463,6 +719,7 @@ class StartScreen:
             "parry": pygame.K_k,
             "dash": pygame.K_l,
             "jump": pygame.K_SPACE,
+            "skill": pygame.K_u,
         }
 
     def _load_keybinds(self, saved: object) -> dict[str, int]:
@@ -478,8 +735,9 @@ class StartScreen:
     def _key_name(key: int) -> str:
         return pygame.key.name(key).upper() or "未设置"
 
-    def _save_profile(self) -> None:
-        data = {
+    def _profile_snapshot(self) -> dict:
+        """把当前档案整理成可写入存档文件的结构（设置单独存放）。"""
+        return {
             "version": 2,
             "best_score": int(self.profile.get("best_score", 0) or 0),
             "best_floor": int(self.profile.get("best_floor", 0) or 0),
@@ -490,17 +748,37 @@ class StartScreen:
             "echo_relics": self.echo_relics,
             "progression": self._progression(),
             "lifetime_stats": self.profile.get("lifetime_stats", {}),
-            "settings": self.settings.copy(),
         }
-        data["settings"]["keybinds"] = self.keybinds.copy()
+
+    def _write_store(self) -> None:
+        data = {
+            "version": 3,
+            "active_slot": self.active_slot,
+            "settings": {**self.settings, "keybinds": self.keybinds.copy()},
+            "slots": self.save_slots,
+        }
         try:
             SAVE_FILE.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            self.profile = data
+            self.save_store = data
         except OSError:
             self._notify("设置无法保存，请检查文件权限")
+
+    def _save_settings(self) -> None:
+        """设置是全局的：还没选槽位时也能保存。"""
+        self._write_store()
+
+    def _save_profile(self) -> None:
+        """把当前档案写回槽位。未选槽位时回落到 1 号槽，避免进度静默丢失。"""
+        slot = self.active_slot if self.active_slot is not None else 0
+        self.profile = self._profile_snapshot()
+        self.save_slots[slot] = self.profile
+        self.active_slot = slot
+        self.has_save = True
+        self.items = self._build_items()
+        self._write_store()
 
     def _build_items(self) -> list[MenuItem]:
         return [
@@ -533,7 +811,7 @@ class StartScreen:
     def _set_volume(self, percent: int) -> None:
         self.settings["volume"] = max(0, min(100, int(percent)))
         self.audio.set_volume(self.settings["volume"])
-        self._save_profile()
+        self._save_settings()
         self._notify(f"音量 {self.settings['volume']}%")
 
     def _handle_events(self) -> None:
@@ -624,17 +902,21 @@ class StartScreen:
                     action_name = dict(self._keybind_actions())[self.rebinding_action]
                     self.rebinding_action = None
                     self._refresh_tutorial_hints()
-                    self._save_profile()
+                    self._save_settings()
                     self._notify(f"{action_name} 已绑定为 {self._key_name(key)}")
                 return
             if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
                 self._close_overlay()
             elif key in (pygame.K_UP, pygame.K_w):
-                self.keybind_selected = (self.keybind_selected - 1) % 7
+                self.keybind_selected = (
+                    self.keybind_selected - 1
+                ) % (len(self._keybind_actions()) + 1)
             elif key in (pygame.K_DOWN, pygame.K_s):
-                self.keybind_selected = (self.keybind_selected + 1) % 7
+                self.keybind_selected = (
+                    self.keybind_selected + 1
+                ) % (len(self._keybind_actions()) + 1)
             elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
-                if self.keybind_selected == 6:
+                if self.keybind_selected >= len(self._keybind_actions()):
                     self._close_overlay()
                 else:
                     self.rebinding_action = self._keybind_actions()[self.keybind_selected][0]
@@ -688,6 +970,31 @@ class StartScreen:
                 self._activate_progression_node(self.progression_selected)
             return
 
+        if self.overlay == "floor_intro":
+            if key in (
+                pygame.K_RETURN,
+                pygame.K_SPACE,
+                pygame.K_ESCAPE,
+                pygame.K_j,
+                pygame.K_KP_ENTER,
+            ):
+                self._dismiss_floor_intro()
+            return
+
+        if self.overlay == "slots":
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.slot_confirm_index = None
+                self._close_overlay()
+            elif key in (pygame.K_UP, pygame.K_w):
+                self.slot_selected = (self.slot_selected - 1) % SAVE_SLOT_COUNT
+                self.slot_confirm_index = None
+            elif key in (pygame.K_DOWN, pygame.K_s):
+                self.slot_selected = (self.slot_selected + 1) % SAVE_SLOT_COUNT
+                self.slot_confirm_index = None
+            elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
+                self._activate_slot(self.slot_selected)
+            return
+
         if self.page == "game":
             if key == self.keybinds["attack"]:
                 self._start_player_attack(self._attack_direction_from_input())
@@ -696,6 +1003,8 @@ class StartScreen:
                     self.audio.play("parry_ready")
                     self._try_projectile_parry()
                     self._notify("弹刀架势")
+            elif key == self.keybinds["skill"]:
+                self._try_cast_skill()
             elif key in (pygame.K_LSHIFT, self.keybinds["dash"]):
                 if self.player.dash():
                     self.audio.play("dash")
@@ -771,7 +1080,13 @@ class StartScreen:
                 if rect.collidepoint(logical):
                     self.progression_selected = index
                     return
-        elif self.overlay is None and self.page == "menu":
+        if self.overlay == "slots":
+            logical = self._to_logical(position)
+            for index, rect in enumerate(self._slot_row_rects()):
+                if rect.collidepoint(logical):
+                    self.slot_selected = index
+                    return
+        if self.overlay is None and self.page == "menu":
             self._select_from_mouse(position)
         elif self.overlay is None and self.page == "lobby":
             logical = self._to_logical(position)
@@ -824,12 +1139,9 @@ class StartScreen:
         if action == "quit":
             self.confirm_exit = True
         elif action == "start":
-            if self.tutorial_completed:
-                self._enter_lobby()
-            else:
-                self._start_run(1, tutorial=True)
+            self._open_slot_select("new")
         elif action == "continue":
-            self._enter_lobby()
+            self._open_slot_select("continue")
         elif action == "leaderboard":
             self._open_overlay("leaderboard")
         elif action == "settings":
@@ -851,6 +1163,87 @@ class StartScreen:
         self.lobby_selected = 0
         self.run_currency = 0
         self._notify("灰塔大厅已就绪")
+
+    # -- 存档槽位 -----------------------------------------------------------
+
+    def _open_slot_select(self, mode: str) -> None:
+        """打开六格存档选择：new 用于新建/覆盖，continue 用于载入。"""
+        self.slot_mode = mode
+        self.slot_selected = 0
+        self.slot_confirm_index = None
+        self._open_overlay("slots", return_page="menu")
+
+    def _slot_row_rects(self) -> list[pygame.Rect]:
+        rect = self._overlay_rect()
+        return [
+            pygame.Rect(rect.x + 30, rect.y + 84 + index * 68, rect.width - 60, 62)
+            for index in range(SAVE_SLOT_COUNT)
+        ]
+
+    @staticmethod
+    def _slot_summary(profile: dict) -> str:
+        progression = profile.get("progression", {})
+        unlocked = (
+            len(progression.get("unlocked_nodes", []))
+            if isinstance(progression, dict)
+            and isinstance(progression.get("unlocked_nodes"), list)
+            else 0
+        )
+        tutorial = "已完成教学" if profile.get("tutorial_completed") else "未完成教学"
+        return (
+            f"最高层 {int(profile.get('best_floor', 0) or 0)}   "
+            f"最高分 {int(profile.get('best_score', 0) or 0):05d}   "
+            f"遗晶 {max(0, int(profile.get('echo_relics', 0) or 0))}   "
+            f"共鸣节点 {unlocked}   {tutorial}"
+        )
+
+    def _bind_slot(self, index: int, *, fresh: bool = False) -> None:
+        """把某个槽位设为当前档案；fresh=True 时先清空该槽位。"""
+        if fresh or self.save_slots[index] is None:
+            self.save_slots[index] = self._new_profile()
+        self.active_slot = index
+        self.profile = self.save_slots[index]
+        self.has_save = any(slot is not None for slot in self.save_slots)
+        self.items = self._build_items()
+
+    def _start_new_save(self, index: int) -> None:
+        """新建档案：等级、成长树与关卡进度全部重置，并重新走一遍新手教程。"""
+        self._bind_slot(index, fresh=True)
+        self.result_relics = 0
+        self._save_profile()
+        self._start_run(1, tutorial=True)
+        self._notify(f"存档 {index + 1}：新档案已建立，开始新手教程")
+
+    def _load_slot(self, index: int) -> None:
+        self._bind_slot(index)
+        if not self.tutorial_completed:
+            # 这份档案还没走完新手教程：继续游戏就直接接着教学
+            self._start_run(1, tutorial=True)
+            self._notify(f"已载入存档 {index + 1}：继续新手教程")
+            return
+        self._enter_lobby()
+        self._notify(f"已载入存档 {index + 1}")
+
+    def _activate_slot(self, index: int) -> None:
+        """在存档选择界面确认某个槽位。"""
+        if index < 0 or index >= SAVE_SLOT_COUNT:
+            return
+        occupied = self.save_slots[index] is not None
+        if self.slot_mode == "continue":
+            if not occupied:
+                self._notify(f"存档 {index + 1} 是空的")
+                return
+            self._close_overlay()
+            self._load_slot(index)
+            return
+        if occupied and self.slot_confirm_index != index:
+            # 覆盖会清掉已有进度，所以要求再确认一次
+            self.slot_confirm_index = index
+            self._notify(f"再确认一次：覆盖存档 {index + 1} 的进度")
+            return
+        self.slot_confirm_index = None
+        self._close_overlay()
+        self._start_new_save(index)
 
     def _activate_lobby_action(self, index: int) -> None:
         actions = self._lobby_actions()
@@ -948,8 +1341,33 @@ class StartScreen:
         self.overlay = None
         self.page = self.return_page
 
+    @staticmethod
+    def _floor_briefing(floor: int) -> FloorBriefing:
+        return FLOOR_BRIEFINGS.get(floor, FLOOR_BRIEFINGS[3])
+
+    def _open_floor_briefing(self) -> None:
+        """进入新一层时弹出简报，介绍本层敌人的攻击方式。"""
+        self._open_overlay("floor_intro", return_page="game")
+
+    def _dismiss_floor_intro(self) -> None:
+        if self.overlay == "floor_intro":
+            self._close_overlay()
+
     def _handle_overlay_click(self, position: tuple[int, int]) -> None:
+        if self.overlay == "floor_intro":
+            # 关卡简报不设按钮：点一下任意位置就开打
+            self._dismiss_floor_intro()
+            return
         logical = self._to_logical(position)
+        if self.overlay == "slots":
+            for index, row in enumerate(self._slot_row_rects()):
+                if row.collidepoint(logical):
+                    self.slot_selected = index
+                    self._activate_slot(index)
+                    return
+            if not self._overlay_rect().collidepoint(logical):
+                self._close_overlay()
+            return
         if self.overlay == "keybinds":
             rects = self._keybind_rects()
             if self._overlay_back_rect().collidepoint(logical):
@@ -1025,6 +1443,7 @@ class StartScreen:
         self._update_attack_impacts(fixed_dt)
         self._update_dash_trails(fixed_dt)
         self._update_enemy_spawn(fixed_dt)
+        self._update_skill_waves(fixed_dt)
         self._update_reflected_projectiles(fixed_dt)
         self._update_portal(fixed_dt)
         self._update_movement_audio(fixed_dt)
@@ -1037,6 +1456,8 @@ class StartScreen:
         if not self.player.grounded:
             self._complete_tutorial_action("jump")
         self._resolve_player_attack()
+        if self.energy_ready:
+            self._complete_tutorial_action("energy")
         if not self.is_tutorial_run or self._current_tutorial_step.action == "parry":
             self._update_enemy_attacks(fixed_dt)
 
@@ -1067,6 +1488,8 @@ class StartScreen:
             self._step_timer = min(self._step_timer, 0.2)
 
     def _player_sprite_name(self) -> str:
+        if self.player.skill_active:
+            return "attack_side"
         if self.player.attack_in_progress:
             return f"attack_{self.player.attack_direction}"
         if not self.player.grounded:
@@ -1118,6 +1541,22 @@ class StartScreen:
         self.pending_spawn.clear()
         self.enemy_spawn_timer = 0.0
 
+    def _queue_next_wave(self) -> bool:
+        """把下一波敌人放进待登场队列，并重置倒计时。"""
+        if self.wave_index >= len(self.wave_plan):
+            return False
+        self.pending_spawn = list(self.wave_plan[self.wave_index])
+        self.wave_index += 1
+        opening_wave = self.wave_index == 1
+        self.enemy_spawn_timer = (
+            ENEMY_SPAWN_DELAY if opening_wave else WAVE_SPAWN_DELAY
+        )
+        self.spawn_countdown_total = self.enemy_spawn_timer
+        self.spawn_countdown_label = (
+            "敌影接近" if opening_wave else f"第 {self.wave_index} 波敌影"
+        )
+        return True
+
     # -- 关卡胜利与传送门 -------------------------------------------------
 
     def _portal_rect(self) -> pygame.Rect:
@@ -1129,8 +1568,10 @@ class StartScreen:
         )
 
     def _room_cleared(self) -> bool:
-        """敌人全部清空（教学关还要等教学步骤走完）才算房间胜利。"""
+        """本层所有波次都清空（教学关还要等教学步骤走完）才算房间胜利。"""
         if self.pending_spawn or self.room_enemies:
+            return False
+        if self.wave_index < len(self.wave_plan):
             return False
         if self.is_tutorial_run and self._current_tutorial_step.action != "finish":
             return False
@@ -1224,19 +1665,24 @@ class StartScreen:
             self._notify(f"远征已结算，凝结回响遗晶 +{relics}")
             return
         next_floor = self.run_floor + 1
-        self._start_run(next_floor, tutorial=False)
+        self._start_run(next_floor, tutorial=False, keep_progress=True)
         self._notify(f"进入第 {next_floor} 层  遗晶 +{relics}")
 
     def _update_enemy_spawn(self, dt: float) -> None:
-        """进入关卡后延迟刷怪，给玩家观察场地的时间。"""
+        """按波次刷怪：每波之间留出倒计时间隔，清空后自动排下一波。"""
         if not self.pending_spawn:
-            return
+            # 当前波已经被清空，看看本层还有没有排队的波次
+            if self.room_enemies or not self._queue_next_wave():
+                return
         self.enemy_spawn_timer = max(0.0, self.enemy_spawn_timer - dt)
         if self.enemy_spawn_timer > 0.0:
             return
         self._spawn_pending_enemies()
         self.audio.play("spawn")
-        self._notify("敌人出现")
+        if self.wave_index >= len(self.wave_plan):
+            self._notify("最终波敌人出现")
+        else:
+            self._notify("敌人出现")
 
     def _update_reflected_projectiles(self, dt: float) -> None:
         """被弹开的子弹飞回射击者，命中后才结算伤害。"""
@@ -1275,6 +1721,7 @@ class StartScreen:
         self.run_combo += 1
         self.run_max_combo = max(self.run_max_combo, self.run_combo)
         self.run_currency += 2
+        self._gain_energy(ENERGY_GAIN_REFLECT)
         if enemy.defeated:
             self._award_enemy_defeat(enemy)
         else:
@@ -1352,6 +1799,7 @@ class StartScreen:
         self.run_max_combo = max(self.run_max_combo, self.run_combo)
         self.run_parries += 1
         self.run_currency += 5
+        self._gain_energy(ENERGY_GAIN_PARRY)
         self.attack_impacts.append(
             AttackImpact(self.player.x, self.player.y - 58, True, True)
         )
@@ -1424,6 +1872,11 @@ class StartScreen:
             self.run_combo += 1
             self.run_max_combo = max(self.run_max_combo, self.run_combo)
             self.run_currency += 2
+            self._gain_energy(
+                ENERGY_GAIN_HEAVY_ATTACK
+                if self.player.attack_direction in ("up", "down")
+                else ENERGY_GAIN_ATTACK
+            )
             if enemy.defeated:
                 self._award_enemy_defeat(enemy)
             else:
@@ -1531,6 +1984,8 @@ class StartScreen:
         self.run_currency += max(4, enemy.bounty_score // 20)
         self.audio.play("defeat")
         self._notify(f"击败 {enemy.display_name}")
+        self._gain_energy(ENERGY_GAIN_DEFEAT)
+        self._gain_exp(self._enemy_exp(enemy))
 
     def _remove_defeated_enemies(self) -> None:
         self.room_enemies = [enemy for enemy in self.room_enemies if not enemy.defeated]
@@ -1539,6 +1994,160 @@ class StartScreen:
             for pending in self.pending_enemy_attacks
             if not pending.enemy.defeated and pending.enemy in self.room_enemies
         ]
+
+    # -- 等级与经验 -------------------------------------------------------
+
+    @staticmethod
+    def _exp_needed(level: int) -> int:
+        """升到下一级所需的经验：逐级提高。"""
+        step = max(0, level - 1)
+        return 60 + 45 * step + 6 * step * step
+
+    def _enemy_exp(self, enemy: Enemy) -> int:
+        """击败敌人获得的经验：按种类与所在层数计价。"""
+        base = ENEMY_EXP.get(enemy.kind, 30)
+        floor_scale = 1.0 + FLOOR_EXP_STEP * (self.run_floor - 1)
+        return max(1, round(base * floor_scale))
+
+    @property
+    def exp_to_next(self) -> int:
+        return self._exp_needed(self.player_level)
+
+    def _gain_exp(self, amount: int) -> None:
+        if amount <= 0:
+            return
+        self.player_exp += amount
+        while self.player_exp >= self.exp_to_next:
+            self.player_exp -= self.exp_to_next
+            self._level_up()
+
+    def _level_up(self) -> None:
+        self.player_level += 1
+        healed = self.player.gain_level(HP_PER_LEVEL, ATTACK_PER_LEVEL)
+        self.audio.play("parry_ready")
+        self._notify(
+            f"等级提升 Lv.{self.player_level}  "
+            f"生命上限 +{HP_PER_LEVEL}  攻击 +{ATTACK_PER_LEVEL}  回复 {healed}"
+        )
+
+    # -- 回响能量与回响剑气 -----------------------------------------------
+
+    @property
+    def energy_ready(self) -> bool:
+        return self.echo_energy >= ECHO_ENERGY_MAX
+
+    def _gain_energy(self, amount: int) -> None:
+        """普通攻击 / 上劈下劈 / 击败敌人 / 完美弹刀都会积攒回响能量。"""
+        if amount <= 0 or self.energy_ready:
+            return
+        self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + amount)
+        if self.energy_ready:
+            self.audio.play("parry_ready")
+            self._notify(
+                "回响能量已满  "
+                f"按 {self._key_name(self.keybinds['skill'])} 释放回响剑气"
+            )
+
+    def _try_cast_skill(self) -> None:
+        if self.page != "game" or self.overlay is not None or self.confirm_exit:
+            return
+        if not self.energy_ready:
+            self.audio.play("parry_ready", 0.4)
+            self._notify(f"回响能量不足  {self.echo_energy}/{ECHO_ENERGY_MAX}")
+            return
+        if not self.player.cast_skill():
+            return
+        self.echo_energy = 0
+        self._skill_wave_spawned = False
+        self.audio.play("parry")
+        self.audio.duck(0.6, 0.5)
+        self._notify("回响剑气")
+        self._complete_tutorial_action("skill")
+
+    def _spawn_skill_wave(self) -> None:
+        player = self.player
+        self.skill_waves.append(
+            SkillWave(
+                x=player.x + player.facing * 46.0,
+                y=player.y - player.BODY_HEIGHT / 2,
+                facing=player.facing,
+                damage=round(player.attack_damage * SKILL_DAMAGE_MULTIPLIER),
+                posture_damage=player.posture_damage * 2,
+                remaining=SKILL_WAVE_LIFE,
+                total=SKILL_WAVE_LIFE,
+                hits=set(),
+            )
+        )
+        self.audio.play("swing_3")
+
+    def _update_skill_waves(self, dt: float) -> None:
+        if self.player.skill_active and not self._skill_wave_spawned:
+            if self.player.skill_elapsed >= Player.SKILL_CAST_TIME:
+                self._skill_wave_spawned = True
+                self._spawn_skill_wave()
+        if not self.skill_waves:
+            return
+
+        active: list[SkillWave] = []
+        for wave in self.skill_waves:
+            wave.remaining -= dt
+            wave.x += wave.facing * wave.speed * dt
+            if wave.expired or wave.x < -180.0 or wave.x > LOGICAL_SIZE[0] + 180.0:
+                continue
+            self._resolve_skill_wave(wave)
+            active.append(wave)
+        self.skill_waves = active
+        self._remove_defeated_enemies()
+
+    def _resolve_skill_wave(self, wave: SkillWave) -> None:
+        """剑气命中：造成大量伤害、把敌人击飞，并斩灭沿途的敌方子弹。"""
+        hitbox = wave.hitbox
+        for enemy in list(self.room_enemies):
+            if enemy.defeated or id(enemy) in wave.hits:
+                continue
+            if not hitbox.overlaps(Hitbox(enemy.x - 18, enemy.y - 44, 36, 44)):
+                continue
+            wave.hits.add(id(enemy))
+            # 剑气是范围冲击：不吃盾卫的正面减伤，直接打满
+            damage = enemy.take_damage(wave.damage, posture_damage=wave.posture_damage)
+            enemy.apply_knockback(
+                wave.facing,
+                SKILL_KNOCKBACK_SPEED,
+                SKILL_KNOCKBACK_LIFT,
+            )
+            self.pending_enemy_attacks = [
+                pending
+                for pending in self.pending_enemy_attacks
+                if pending.enemy is not enemy
+            ]
+            self.audio.play("hit")
+            self.audio.duck(0.32, 0.26)
+            self.attack_impacts.append(
+                AttackImpact(enemy.x, enemy.y - 62, True, True)
+            )
+            if damage <= 0:
+                continue
+            self.run_score += 200
+            self.run_combo += 1
+            self.run_max_combo = max(self.run_max_combo, self.run_combo)
+            self.run_currency += 3
+            if enemy.defeated:
+                self._award_enemy_defeat(enemy)
+            else:
+                self._notify(f"剑气命中 {enemy.display_name}  -{damage}")
+
+        for pending in list(self.pending_enemy_attacks):
+            if pending.profile.projectile_speed is None:
+                continue
+            position = self._projectile_position(pending)
+            projectile_box = Hitbox(position[0] - 14, position[1] - 14, 28, 28)
+            if not hitbox.overlaps(projectile_box):
+                continue
+            self.pending_enemy_attacks.remove(pending)
+            self.attack_impacts.append(
+                AttackImpact(position[0], position[1], True, True)
+            )
+            self.audio.play("hit", 0.5)
 
     @property
     def _current_tutorial_step(self) -> TutorialStep:
@@ -1550,13 +2159,28 @@ class StartScreen:
         if self._current_tutorial_step.action != action:
             return
         self.tutorial_index += 1
-        if self._current_tutorial_step.action == "attack" and not self.room_enemies:
+        next_action = self._current_tutorial_step.action
+        if next_action == "attack" and not self.room_enemies:
             self.room_enemies = self._build_training_room_enemies()
             self._notify("战斗训练目标已投放")
             return
-        if self._current_tutorial_step.action == "parry":
+        if next_action == "parry":
             self._prepare_tutorial_parry_target()
-        if self._current_tutorial_step.action == "finish":
+        elif next_action == "energy":
+            # 教学关不要求慢慢攒：直接把能量推到只差一次行动
+            self.echo_energy = max(
+                self.echo_energy,
+                ECHO_ENERGY_MAX - ENERGY_GAIN_PARRY,
+            )
+            self._notify("回响能量已注入：用攻击或弹刀把它攒满")
+            return
+        elif next_action == "skill":
+            self.echo_energy = ECHO_ENERGY_MAX
+            self._notify(
+                f"能量已满  按 {self._key_name(self.keybinds['skill'])} 释放回响剑气"
+            )
+            return
+        if next_action == "finish":
             self._notify("教学完成，回响之门已开启")
         else:
             self._notify(f"下一步：{self._current_tutorial_step.title}")
@@ -1782,6 +2406,10 @@ class StartScreen:
     def _overlay_rect(self) -> pygame.Rect:
         if self.overlay == "progression":
             return pygame.Rect(72, 42, 1136, 636)
+        if self.overlay == "floor_intro":
+            return pygame.Rect(180, 62, 920, 596)
+        if self.overlay == "slots":
+            return pygame.Rect(240, 72, 800, 576)
         return pygame.Rect(252, 96, 776, 528)
 
     def _overlay_back_rect(self) -> pygame.Rect:
@@ -1822,6 +2450,7 @@ class StartScreen:
             ("parry", "弹刀 / 防御"),
             ("dash", "冲刺"),
             ("jump", "跳跃"),
+            ("skill", "回响剑气"),
         ]
 
     def _keybind_rects(self) -> list[pygame.Rect]:
@@ -1848,12 +2477,22 @@ class StartScreen:
             1,
         )
 
-        title_text = {
-            "leaderboard": "本地排行榜",
-            "keybinds": "键位设置",
-            "progression": "回响中枢 · 成长拓扑",
-            "portal": "回响之门",
-        }.get(self.overlay, "设置")
+        if self.overlay == "floor_intro":
+            briefing = self._floor_briefing(self.run_floor)
+            title_text = f"第 {self.run_floor} 层 · {briefing.title}"
+        elif self.overlay == "slots":
+            title_text = (
+                "开始游戏 · 选择存档位"
+                if self.slot_mode == "new"
+                else "继续游戏 · 选择存档位"
+            )
+        else:
+            title_text = {
+                "leaderboard": "本地排行榜",
+                "keybinds": "键位设置",
+                "progression": "回响中枢 · 成长拓扑",
+                "portal": "回响之门",
+            }.get(self.overlay, "设置")
         title = self.overlay_title_font.render(title_text, True, COLORS["ice"])
         self.canvas.blit(title, (rect.x + 30, rect.y + 24))
 
@@ -1865,11 +2504,19 @@ class StartScreen:
             self._draw_progression(rect)
         elif self.overlay == "portal":
             self._draw_portal_choice(rect)
+        elif self.overlay == "floor_intro":
+            self._draw_floor_briefing(rect)
+        elif self.overlay == "slots":
+            self._draw_slot_select(rect)
         else:
             self._draw_settings(rect)
 
         hint_text = (
-            "↑↓ 选择    Enter 设置    Esc 返回"
+            "Enter / 空格 / 点击 开始战斗"
+            if self.overlay == "floor_intro"
+            else "↑↓ 选择    Enter 确认    Esc 返回"
+            if self.overlay == "slots"
+            else "↑↓ 选择    Enter 设置    Esc 返回"
             if self.overlay == "keybinds"
             else "↑↓ 浏览节点    Enter 激活    Esc 返回"
             if self.overlay == "progression"
@@ -1879,6 +2526,124 @@ class StartScreen:
         )
         hint = self.small_font.render(hint_text, True, COLORS["muted"])
         self.canvas.blit(hint, (rect.right - hint.get_width() - 28, rect.bottom - 34))
+
+    def _draw_slot_select(self, rect: pygame.Rect) -> None:
+        """六格存档列表：显示每格摘要，并标明本次点击会做什么。"""
+        for index, row in enumerate(self._slot_row_rects()):
+            profile = self.save_slots[index]
+            occupied = profile is not None
+            selected = index == self.slot_selected
+            armed = self.slot_confirm_index == index
+            if armed:
+                pygame.draw.rect(self.canvas, (40, 14, 20), row)
+                pygame.draw.rect(self.canvas, COLORS["red"], row, 2)
+            elif selected:
+                pygame.draw.rect(self.canvas, (14, 43, 52), row)
+                pygame.draw.rect(self.canvas, COLORS["cyan"], row, 2)
+            else:
+                pygame.draw.rect(self.canvas, (8, 25, 35), row)
+                pygame.draw.rect(self.canvas, (42, 105, 106), row, 1)
+
+            badge = pygame.Rect(row.x + 12, row.y + 11, 76, 38)
+            badge_color = COLORS["gold"] if occupied else COLORS["muted"]
+            pygame.draw.rect(self.canvas, (6, 16, 28), badge)
+            pygame.draw.rect(self.canvas, badge_color, badge, 1)
+            number = self.lobby_node_font.render(
+                f"{index + 1:02d}", True, badge_color
+            )
+            self.canvas.blit(number, number.get_rect(center=badge.center))
+
+            if occupied:
+                label = self.overlay_body_font.render(
+                    f"存档 {index + 1}", True, COLORS["ice"]
+                )
+                self.canvas.blit(label, (row.x + 104, row.y + 6))
+                detail = self.small_font.render(
+                    self._slot_summary(profile), True, COLORS["muted"]
+                )
+                self.canvas.blit(detail, (row.x + 104, row.y + 33))
+            else:
+                label = self.overlay_body_font.render(
+                    "空存档位", True, COLORS["muted"]
+                )
+                self.canvas.blit(
+                    label, label.get_rect(midleft=(row.x + 104, row.centery))
+                )
+
+            if armed:
+                state, color = "确认覆盖", COLORS["red"]
+            elif self.slot_mode == "continue":
+                state, color = (
+                    ("载入", COLORS["cyan"]) if occupied else ("空", COLORS["muted"])
+                )
+            elif occupied:
+                state, color = "覆盖", COLORS["gold"]
+            else:
+                state, color = "新建", COLORS["cyan"]
+            state_text = self.small_font.render(state, True, color)
+            self.canvas.blit(
+                state_text,
+                state_text.get_rect(midright=(row.right - 18, row.centery)),
+            )
+
+        if self.slot_confirm_index is not None:
+            warning = self.small_font.render(
+                f"存档 {self.slot_confirm_index + 1} 已有进度，"
+                "再确认一次将清空它并重新开始教学",
+                True,
+                COLORS["red"],
+            )
+        else:
+            warning = self.small_font.render(
+                "开始游戏会建立全新档案：等级、成长树与关卡进度全部重置，"
+                "并重新走一遍新手教程"
+                if self.slot_mode == "new"
+                else "继续游戏会载入所选档案，进入灰塔大厅",
+                True,
+                COLORS["muted"],
+            )
+        self.canvas.blit(warning, (rect.x + 32, rect.y + 500))
+
+    def _draw_floor_briefing(self, rect: pygame.Rect) -> None:
+        """关卡简报：本层敌人的攻击方式与应对提示。"""
+        briefing = self._floor_briefing(self.run_floor)
+        summary = self.overlay_body_font.render(
+            briefing.summary, True, COLORS["muted"]
+        )
+        self.canvas.blit(summary, (rect.x + 34, rect.y + 76))
+
+        wave_text = self.small_font.render(
+            f"本层共 {len(self._floor_wave_plan(self.run_floor))} 波敌人    "
+            f"威胁 {round(self.run_threat * 100)}%    "
+            f"敌人生命与伤害同步提升",
+            True,
+            COLORS["gold"],
+        )
+        self.canvas.blit(wave_text, (rect.x + 34, rect.y + 110))
+
+        y = rect.y + 150
+        for name, description in briefing.entries:
+            panel = pygame.Rect(rect.x + 30, y, rect.width - 60, 118)
+            pygame.draw.rect(self.canvas, (8, 25, 35), panel)
+            pygame.draw.rect(self.canvas, (42, 105, 106), panel, 1)
+            pygame.draw.rect(self.canvas, COLORS["cyan"], (panel.x, panel.y, 6, 118))
+            title = self.overlay_body_font.render(name, True, COLORS["ice"])
+            self.canvas.blit(title, (panel.x + 24, panel.y + 14))
+            for index, line in enumerate(
+                self._wrap_text(description, self.small_font, panel.width - 56)
+            ):
+                self.canvas.blit(
+                    self.small_font.render(line, True, COLORS["muted"]),
+                    (panel.x + 24, panel.y + 48 + index * 22),
+                )
+            y += 130
+
+        hint = self.small_font.render(
+            "按 Enter / 空格 / 鼠标左键 开始战斗",
+            True,
+            COLORS["cyan"],
+        )
+        self.canvas.blit(hint, (rect.x + 34, rect.bottom - 70))
 
     def _draw_portal_choice(self, rect: pygame.Rect) -> None:
         """传送门选择界面：返回主菜单 / 下一关。"""
@@ -2117,13 +2882,13 @@ class StartScreen:
             self._change_setting(index, 5)
         elif index == 1:
             self.settings["assist_mode"] = not self.settings["assist_mode"]
-            self._save_profile()
+            self._save_settings()
             self._notify(
                 "辅助模式已" + ("开启" if self.settings["assist_mode"] else "关闭")
             )
         elif index == 2:
             self.settings["fullscreen"] = not self.settings["fullscreen"]
-            self._save_profile()
+            self._save_settings()
             self._apply_display_mode()
             self._notify("全屏已" + ("开启" if self.settings["fullscreen"] else "关闭"))
         elif index == 3:
@@ -2195,6 +2960,20 @@ class StartScreen:
                 "parry",
             ),
             TutorialStep(
+                "回响能量",
+                "用普通攻击或弹刀把回响能量攒满",
+                "普通攻击 +4、上劈下劈 +7、击败敌人与完美弹刀各 +20；"
+                "跳跃、冲刺与移动不产生能量。",
+                "energy",
+            ),
+            TutorialStep(
+                "回响剑气",
+                f"按 {keys['skill']} 释放回响剑气，一路斩到画面另一侧",
+                "剑气向前斩出，期间角色无敌，会把命中的敌人击飞，"
+                "并斩灭沿途碰到的敌方子弹。",
+                "skill",
+            ),
+            TutorialStep(
                 "教学完成",
                 "走进右侧的回响之门，选择前往灰塔大厅",
                 "你已经完成基础操作，进门后本局自动结算。",
@@ -2213,29 +2992,82 @@ class StartScreen:
             SpearThrower(650, 522),
         ]
 
-    def _start_run(self, floor: int, *, tutorial: bool = True) -> None:
+    @staticmethod
+    def _floor_threat(floor: int) -> float:
+        """层数越深，敌人生命与伤害同步提高。"""
+        return FLOOR_THREAT_BASE + FLOOR_THREAT_STEP * (max(1, floor) - 1)
+
+    @staticmethod
+    def _floor_wave_plan(floor: int) -> tuple[tuple[str, ...], ...]:
+        """三层关卡各有专属编成；更高层沿用第三层并靠威胁值加难。"""
+        return FLOOR_WAVE_PLANS.get(floor, FLOOR_WAVE_PLANS[3])
+
+    @staticmethod
+    def _wave_positions(count: int) -> list[float]:
+        """把一波敌人均匀铺在战斗区，避免全部叠在同一个落点。"""
+        if count <= 0:
+            return []
+        if count == 1:
+            return [WAVE_SPAWN_START_X]
+        step = (WAVE_SPAWN_END_X - WAVE_SPAWN_START_X) / (count - 1)
+        return [WAVE_SPAWN_START_X + step * index for index in range(count)]
+
+    def _build_wave(self, kinds: tuple[str, ...], threat: float) -> list[Enemy]:
+        return [
+            ENEMY_CLASSES[kind](x, WAVE_GROUND_Y, threat=threat)
+            for kind, x in zip(kinds, self._wave_positions(len(kinds)))
+        ]
+
+    def _start_run(
+        self,
+        floor: int,
+        *,
+        tutorial: bool = True,
+        keep_progress: bool = False,
+    ) -> None:
         self.pressed_keys.clear()
         self.page = "game"
         self.overlay = None
         self.confirm_exit = False
         self.is_tutorial_run = tutorial
         self.run_floor = max(1, floor)
+        self.run_threat = self._floor_threat(self.run_floor)
         self.run_score = 0
         self.run_combo = 0
         self.run_max_combo = 0
         self.run_parries = 0
         self.run_currency = 20 if "reserve_carry" in self._unlocked_nodes() else 0
         self.player = Player(230, 566)
+        if keep_progress:
+            # 进入下一层时保留等级收益：把累计加成重新套用到新角色上
+            gained_levels = max(0, self.player_level - 1)
+            self.player.max_hp += gained_levels * HP_PER_LEVEL
+            self.player.attack_bonus = gained_levels * ATTACK_PER_LEVEL
+            self.player.hp = self.player.max_hp
+        else:
+            self.player_level = 1
+            self.player_exp = 0
+        # 每一层开局回响能量都从 0 开始
+        self.echo_energy = 0
+        self.skill_waves.clear()
+        self._skill_wave_spawned = False
         self._attack_hits.clear()
         self._defeated_enemies.clear()
         self.room_enemies = []
-        # 进入关卡后敌人延迟登场，避免开门瞬间贴脸
+        self.wave_index = 0
+        self.pending_spawn = []
+        self.enemy_spawn_timer = 0.0
+        self.spawn_countdown_total = ENEMY_SPAWN_DELAY
+        self.spawn_countdown_label = "敌影接近"
         if tutorial:
-            self.pending_spawn = []
-            self.enemy_spawn_timer = 0.0
+            self.wave_plan = []
         else:
-            self.pending_spawn = self._build_training_room_enemies()
-            self.enemy_spawn_timer = ENEMY_SPAWN_DELAY
+            self.wave_plan = [
+                self._build_wave(kinds, self.run_threat)
+                for kinds in self._floor_wave_plan(self.run_floor)
+            ]
+            # 进入关卡后敌人延迟登场，避免开门瞬间贴脸
+            self._queue_next_wave()
         self.pending_enemy_attacks.clear()
         self.attack_impacts.clear()
         self.reflected_projectiles.clear()
@@ -2255,6 +3087,8 @@ class StartScreen:
             self._notify("敌影正在接近…")
         else:
             self._notify("试炼房间已开启")
+        if not tutorial:
+            self._open_floor_briefing()
 
     def _page_buttons(self) -> dict[str, pygame.Rect]:
         if self.page == "result":
@@ -2423,31 +3257,33 @@ class StartScreen:
         shade.fill((3, 8, 18, 80))
         self.canvas.blit(shade, (0, 0))
 
-        title = self.overlay_title_font.render("灰塔 · 序章试炼", True, COLORS["ice"])
+        briefing = self._floor_briefing(self.run_floor)
+        title = self.overlay_title_font.render(
+            "灰塔 · 序章试炼" if self.is_tutorial_run else f"灰塔 · 第 {self.run_floor} 层",
+            True,
+            COLORS["ice"],
+        )
         self.canvas.blit(title, (54, 36))
-        subtitle = self.small_font.render("ROOM 01  /  回响训练场", True, COLORS["cyan"])
+        subtitle = self.small_font.render(
+            "ROOM 01  /  回响训练场"
+            if self.is_tutorial_run
+            else f"ROOM {self.run_floor:02d}  /  {briefing.title}",
+            True,
+            COLORS["cyan"],
+        )
         self.canvas.blit(subtitle, (56, 78))
 
         if self.pending_spawn:
             self._draw_spawn_countdown()
 
-        self._draw_stat_bar(
-            "生命",
-            100,
-            104,
-            240,
-            14,
-            self.player.hp / self.player.max_hp,
-            COLORS["red"],
-        )
-        self._draw_stat_bar("回响能量", 100, 142, 240, 14, 0.42, COLORS["cyan"])
+        self._draw_vitals()
         score = self.overlay_body_font.render(
             f"分数  {self.run_score:05d}",
             True,
             COLORS["ice"],
         )
         floor = self.small_font.render(
-            f"第 {self.run_floor} 层  ·  威胁 12%",
+            f"第 {self.run_floor} 层  ·  威胁 {round(self.run_threat * 100)}%",
             True,
             COLORS["muted"],
         )
@@ -2464,11 +3300,14 @@ class StartScreen:
         self._draw_portal()
         self._draw_player()
         self._draw_enemies()
+        self._draw_skill_waves()
         if self.is_tutorial_run:
             self._draw_tutorial_panel()
 
         room_title = self.overlay_body_font.render(
-            "试炼房间已开启" if self.is_tutorial_run else "远征序章已开启",
+            "试炼房间已开启"
+            if self.is_tutorial_run
+            else f"{briefing.title}  ·  第 {self.run_floor} 层",
             True,
             COLORS["ice"],
         )
@@ -2481,12 +3320,14 @@ class StartScreen:
             )
             self.canvas.blit(room_hint, room_hint.get_rect(center=(640, 325)))
         else:
+            wave_now = min(self.wave_index, len(self.wave_plan))
             room_hint = self.small_font.render(
-                "清空房间后，右侧会开启回响之门",
+                f"第 {wave_now} / {len(self.wave_plan)} 波  ·  "
+                "清空全部波次后开启回响之门",
                 True,
                 COLORS["muted"],
             )
-            self.canvas.blit(room_hint, room_hint.get_rect(center=(640, 325)))
+        self.canvas.blit(room_hint, room_hint.get_rect(center=(640, 325)))
 
         combo = self.overlay_body_font.render(
             f"连击  x{self.run_combo}",
@@ -2508,6 +3349,7 @@ class StartScreen:
                 f"{self._key_name(self.keybinds['left'])}/{self._key_name(self.keybinds['right'])} 移动    "
                 f"{self._key_name(self.keybinds['attack'])} 攻击    "
                 f"{self._key_name(self.keybinds['parry'])} 弹刀    "
+                f"{self._key_name(self.keybinds['skill'])} 剑气    "
                 f"{self._key_name(self.keybinds['dash'])} 冲刺    "
                 f"{self._key_name(self.keybinds['jump'])} 跳跃    Esc 设置"
             ),
@@ -2740,6 +3582,44 @@ class StartScreen:
         player_image = pygame.transform.scale(image, (96, 120))
         draw_x = round(self.player.x - player_image.get_width() / 2)
         draw_y = round(self.player.y - player_image.get_height() + bob)
+        center = (round(self.player.x), round(self.player.y - 56))
+        if self.player.skill_active:
+            # 释放剑气期间：白色爆发光环提示这段时间无敌
+            progress = min(
+                1.0, self.player.skill_elapsed / max(0.01, Player.SKILL_CAST_TIME)
+            )
+            aura = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+            for radius, alpha in (
+                (round(72 + 26 * progress), round(120 * (1.0 - progress) + 30)),
+                (round(46 + 14 * progress), round(170 * (1.0 - progress) + 50)),
+            ):
+                pygame.draw.circle(
+                    aura,
+                    (*COLORS["white"], max(0, min(255, alpha))),
+                    center,
+                    radius,
+                    3,
+                )
+            self.canvas.blit(aura, (0, 0))
+        elif self.energy_ready:
+            # 回响能量满：身上不停闪白光，提示技能可用
+            pulse = 0.5 + 0.5 * math.sin(self.elapsed * 6.5)
+            aura = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+            pygame.draw.circle(
+                aura,
+                (*COLORS["white"], round(40 + 55 * pulse)),
+                center,
+                round(54 + 8 * pulse),
+                3,
+            )
+            pygame.draw.circle(
+                aura,
+                (*COLORS["white"], round(22 + 34 * pulse)),
+                center,
+                round(70 + 12 * pulse),
+                1,
+            )
+            self.canvas.blit(aura, (0, 0))
         self.canvas.blit(player_image, (draw_x, draw_y))
         if self.player.parry_active:
             spark = pygame.transform.scale(self.assets.spark, (112, 112))
@@ -2813,6 +3693,84 @@ class StartScreen:
                     width,
                 )
         self.canvas.blit(effect, (0, 0))
+
+    def _draw_skill_waves(self) -> None:
+        """回响剑气：竖着的白色半月斩，带残留辉光向前平推。"""
+        if not self.skill_waves:
+            return
+        layer = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+        for wave in self.skill_waves:
+            self._draw_skill_wave(layer, wave)
+        self.canvas.blit(layer, (0, 0))
+
+    def _draw_skill_wave(self, layer: pygame.Surface, wave: SkillWave) -> None:
+        # 亮度只看「还剩多少秒」：剑气横穿整屏期间保持满亮度，
+        # 只有在飞出画面之后才淡出，避免看起来像走到一半就消失了。
+        fade = min(1.0, max(0.0, wave.remaining / SKILL_WAVE_FADE_TIME))
+
+        def crescent(
+            radius: float,
+            thickness: float,
+            alpha: int,
+            offset: float = 0.0,
+        ) -> None:
+            """画一段半月：外弧向前凸，内弧按 cos 收窄，两端自然收尖。"""
+            if alpha <= 0 or thickness <= 0.0:
+                return
+            outer_points: list[tuple[int, int]] = []
+            inner_points: list[tuple[int, int]] = []
+            for step in range(29):
+                angle = -math.pi / 2 + math.pi * step / 28
+                taper = math.cos(angle) ** 0.72
+                for target, current in (
+                    (outer_points, radius),
+                    (inner_points, max(2.0, radius - thickness * taper)),
+                ):
+                    x = current * math.cos(angle) + offset
+                    y = current * math.sin(angle)
+                    target.append(
+                        (
+                            round(wave.x + x * wave.facing),
+                            round(wave.y + y),
+                        )
+                    )
+            pygame.draw.polygon(
+                layer,
+                (*COLORS["white"], alpha),
+                outer_points + inner_points[::-1],
+            )
+
+        # 后方残留的弧影，强调向前推进的速度感
+        for step in range(3, 0, -1):
+            crescent(
+                SKILL_WAVE_HALF_HEIGHT * 0.92,
+                SKILL_WAVE_THICKNESS * 0.4,
+                round(46 * fade / step),
+                offset=-42.0 * step,
+            )
+        crescent(
+            SKILL_WAVE_HALF_HEIGHT * 1.08,
+            SKILL_WAVE_THICKNESS * 1.35,
+            round(64 * fade),
+        )
+        crescent(
+            SKILL_WAVE_HALF_HEIGHT,
+            SKILL_WAVE_THICKNESS * 0.66,
+            round(150 * fade),
+        )
+        crescent(
+            SKILL_WAVE_HALF_HEIGHT * 0.94,
+            SKILL_WAVE_THICKNESS * 0.3,
+            round(238 * fade),
+        )
+
+        # 半月最前缘的高光
+        tip = (
+            round(wave.x + SKILL_WAVE_HALF_HEIGHT * 0.96 * wave.facing),
+            round(wave.y),
+        )
+        pygame.draw.circle(layer, (*COLORS["white"], round(220 * fade)), tip, 5)
+        pygame.draw.circle(layer, (*COLORS["white"], round(120 * fade)), tip, 13, 2)
 
     def _draw_enemies(self) -> None:
         colors = {
@@ -3089,17 +4047,84 @@ class StartScreen:
         height: int,
         ratio: float,
         color: tuple[int, int, int],
+        text: str = "",
+        highlight: bool = False,
     ) -> None:
         label_text = self.small_font.render(label, True, COLORS["muted"])
         self.canvas.blit(label_text, (x - label_text.get_width() - 14, y - 3))
         bar = pygame.Rect(x, y, width, height)
         pygame.draw.rect(self.canvas, (19, 42, 50), bar)
+        clamped = max(0.0, min(1.0, ratio))
         pygame.draw.rect(
             self.canvas,
             color,
-            (bar.x, bar.y, int(bar.width * ratio), bar.height),
+            (bar.x, bar.y, round(bar.width * clamped), bar.height),
         )
-        pygame.draw.rect(self.canvas, COLORS["ice"], bar, 1)
+        if highlight:
+            glow = pygame.Surface(bar.size, pygame.SRCALPHA)
+            glow.fill((*COLORS["white"], 40))
+            self.canvas.blit(glow, bar)
+        pygame.draw.rect(
+            self.canvas,
+            COLORS["white"] if highlight else COLORS["ice"],
+            bar,
+            2 if highlight else 1,
+        )
+        if text and height >= 14:
+            value = self.small_font.render(text, True, COLORS["white"])
+            self.canvas.blit(value, value.get_rect(center=bar.center))
+
+    def _draw_vitals(self) -> None:
+        """左上角状态区：生命值、等级经验与回响能量都带具体数值。"""
+        player = self.player
+        hp_ratio = player.hp / player.max_hp if player.max_hp else 0.0
+        self._draw_stat_bar(
+            "生命",
+            104,
+            102,
+            238,
+            18,
+            hp_ratio,
+            COLORS["red"],
+            text=f"{player.hp} / {player.max_hp}",
+            highlight=hp_ratio <= 0.3,
+        )
+        self._draw_stat_bar(
+            "经验",
+            104,
+            128,
+            238,
+            10,
+            self.player_exp / max(1, self.exp_to_next),
+            COLORS["gold"],
+        )
+        self.canvas.blit(
+            self.small_font.render(f"Lv.{self.player_level}", True, COLORS["gold"]),
+            (350, 120),
+        )
+        self.canvas.blit(
+            self.small_font.render(
+                f"{self.player_exp} / {self.exp_to_next}", True, COLORS["muted"]
+            ),
+            (404, 120),
+        )
+        # 能量满时整条转白并闪光，提示技能已就绪
+        ready = self.energy_ready
+        self._draw_stat_bar(
+            "回响能量",
+            104,
+            150,
+            238,
+            18,
+            self.echo_energy / ECHO_ENERGY_MAX,
+            COLORS["white"] if ready else COLORS["cyan"],
+            text=(
+                f"{self.echo_energy} / {ECHO_ENERGY_MAX}   剑气就绪"
+                if ready
+                else f"{self.echo_energy} / {ECHO_ENERGY_MAX}"
+            ),
+            highlight=ready,
+        )
 
     def _draw_result(self) -> None:
         shade = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
@@ -3114,13 +4139,14 @@ class StartScreen:
         )
         self.canvas.blit(subtitle, subtitle.get_rect(center=(640, 220)))
 
-        panel = pygame.Rect(390, 270, 500, 170)
+        panel = pygame.Rect(390, 266, 500, 204)
         pygame.draw.rect(self.canvas, (6, 16, 28), panel)
         pygame.draw.rect(self.canvas, COLORS["cyan"], panel, 2)
         rows = [
             ("本局分数", f"{self.result_score:05d}"),
             ("抵达层数", str(self.run_floor)),
             ("完美弹刀", str(self.run_parries)),
+            ("最终等级", f"Lv.{self.player_level}"),
         ]
         for index, (label, value) in enumerate(rows):
             y = panel.y + 28 + index * 42
@@ -3212,7 +4238,7 @@ class StartScreen:
     def _draw_spawn_countdown(self) -> None:
         """敌人登场倒计时面板：会跳动的秒数 + 进度条，最后 1 秒转红。"""
         remaining = max(0.0, self.enemy_spawn_timer)
-        total = max(0.001, ENEMY_SPAWN_DELAY)
+        total = max(0.001, self.spawn_countdown_total)
         ratio = 1.0 - max(0.0, min(1.0, remaining / total))
         panel = pygame.Rect(0, 0, 320, 96)
         panel.center = (640, 132)
@@ -3228,7 +4254,9 @@ class StartScreen:
             2,
         )
 
-        title = self.small_font.render("敌影接近", True, COLORS["gold"])
+        title = self.small_font.render(
+            self.spawn_countdown_label, True, COLORS["gold"]
+        )
         layer.blit(title, title.get_rect(center=(panel.width // 2, 20)))
 
         if remaining <= 1.0:

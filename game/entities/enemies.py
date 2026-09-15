@@ -51,6 +51,9 @@ class Enemy(ABC):
         telegraph_time=0.2,
         cooldown=1.0,
     )
+    # 被回响剑气击飞时的重力与水平摩擦
+    KNOCKBACK_GRAVITY: ClassVar[float] = 1750.0
+    KNOCKBACK_FRICTION: ClassVar[float] = 900.0
 
     def __init__(
         self,
@@ -68,6 +71,9 @@ class Enemy(ABC):
         self.threat = max(0.0, float(threat))
         self.elite = elite
         self.facing = 1 if facing >= 0 else -1
+        self.ground_y = float(y)
+        self.velocity_x = 0.0
+        self.velocity_y = 0.0
 
         elite_hp_bonus = 1.35 if elite else 1.0
         elite_damage_bonus = 1.15 if elite else 1.0
@@ -102,6 +108,16 @@ class Enemy(ABC):
     def defeated(self) -> bool:
         return self.hp <= 0
 
+    @property
+    def airborne(self) -> bool:
+        """是否处在滞空阶段（含刚被击飞、还没离开地面的那一帧）。"""
+        return self.y < self.ground_y - 0.01 or self.velocity_y < -0.01
+
+    @property
+    def being_knocked_back(self) -> bool:
+        """是否正处于被击飞的滑行/滞空阶段。"""
+        return self.airborne or abs(self.velocity_x) > 1.0
+
     def update(self, dt: float, player_position: Position) -> EnemyIntent:
         """Advance timers and return this frame's intended behavior."""
 
@@ -111,6 +127,10 @@ class Enemy(ABC):
 
         if self.defeated:
             return EnemyIntent("defeated", note="已被击败")
+        if self.being_knocked_back:
+            # 被剑气击飞期间脱离 AI：先横向滑出，再受重力落回地面
+            self._advance_knockback(elapsed)
+            return EnemyIntent("knocked_back", note="被击飞")
         if self.vulnerable:
             return EnemyIntent("vulnerable", note="破绽状态")
 
@@ -132,6 +152,12 @@ class Enemy(ABC):
     def direction_to(self, player_position: Position) -> int:
         return 1 if player_position[0] >= self.x else -1
 
+    def can_step(self, direction: int, margin: float = 60.0) -> bool:
+        """朝某个方向还能不能继续走：用于判断后撤是不是已经贴到画面边缘。"""
+        if direction > 0:
+            return self.x < self.bounds_right - margin
+        return self.x > self.bounds_left + margin
+
     def scaled_attack(self, profile: AttackProfile | None = None) -> AttackProfile:
         return replace(profile or self.attack_profile, damage=self.damage)
 
@@ -151,6 +177,27 @@ class Enemy(ABC):
 
     def enter_vulnerable(self, seconds: float = 0.8) -> None:
         self._vulnerable_timer = max(self._vulnerable_timer, seconds)
+
+    def apply_knockback(self, direction: int, speed: float, lift: float) -> None:
+        """被回响剑气击飞：横向推开并腾空，之后自然落下。"""
+        self.velocity_x = (1.0 if direction >= 0 else -1.0) * abs(float(speed))
+        self.velocity_y = -abs(float(lift))
+        self.enter_vulnerable(0.9)
+
+    def _advance_knockback(self, elapsed: float) -> None:
+        self.x += self.velocity_x * elapsed
+        self.x = min(max(self.x, self.bounds_left), self.bounds_right)
+
+        self.velocity_y += self.KNOCKBACK_GRAVITY * elapsed
+        self.y += self.velocity_y * elapsed
+        if self.y >= self.ground_y:
+            self.y = self.ground_y
+            self.velocity_y = 0.0
+
+        speed = abs(self.velocity_x)
+        if speed > 0.0:
+            speed = max(0.0, speed - self.KNOCKBACK_FRICTION * elapsed)
+            self.velocity_x = math.copysign(speed, self.velocity_x)
 
     def take_damage(
         self,
@@ -226,7 +273,8 @@ class SpearThrower(Enemy):
     def choose_intent(self, player_position: Position) -> EnemyIntent:
         self.facing = self.direction_to(player_position)
         distance = self.distance_to(player_position)
-        if distance < 150:
+        # 贴边时不再徒劳后撤，否则会被逼到画面边缘后彻底卡住
+        if distance < 150 and self.can_step(-self.facing):
             return EnemyIntent(
                 "backstep",
                 move_x=-self.facing * self.speed,
@@ -334,10 +382,13 @@ class ResonanceMage(Enemy):
     bounty_score = 170
     parry_tutorial = "学习延迟能量球和二次弹反站位"
     safe_distance = 220.0
+    # 离画面边缘这么近时不再后撤：否则会被逼到边缘后永远卡在原地
+    wall_margin = 60.0
     attack_profile = AttackProfile(
         name="延迟能量球",
         damage=16,
-        reach=620,
+        # 射程覆盖大半个战场：站在很远的地方也能继续施压
+        reach=900,
         telegraph_time=0.65,
         cooldown=2.1,
         parryable=True,
@@ -349,7 +400,10 @@ class ResonanceMage(Enemy):
     def choose_intent(self, player_position: Position) -> EnemyIntent:
         self.facing = self.direction_to(player_position)
         distance = self.distance_to(player_position)
-        if distance < self.safe_distance:
+        # 只有身后还有余地时才后撤；贴边就地施法，避免卡死在画面边缘
+        if distance < self.safe_distance and self.can_step(
+            -self.facing, self.wall_margin
+        ):
             return EnemyIntent(
                 "blink_back",
                 move_x=-self.facing * self.speed,
@@ -360,6 +414,13 @@ class ResonanceMage(Enemy):
                 "cast_delayed_orb",
                 attack=self.scaled_attack(),
                 note="释放延迟能量球",
+            )
+        if distance > self.attack_profile.reach:
+            # 距离太远时主动靠近，而不是站在原地什么都不做
+            return EnemyIntent(
+                "advance",
+                move_x=self.facing * self.speed,
+                note="缩短施法距离",
             )
         return EnemyIntent("channel", note="蓄积共鸣能量")
 

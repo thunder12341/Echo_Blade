@@ -65,13 +65,28 @@ def _app_with_recording_audio(monkeypatch, tmp_path):
 def _enter_level(app, floor: int = 1, *, tutorial: bool = False):
     """进入关卡并跳过刷怪等待，便于测试战斗逻辑本身。"""
     app._start_run(floor, tutorial=tutorial)
+    app._dismiss_floor_intro()
     app._spawn_pending_enemies()
     return app
+
+
+def _clear_room(app) -> None:
+    """清空整层：敌人、待登场的一波以及后面还没排到的波次。"""
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    app.wave_plan = []
+    app.wave_index = 0
 
 
 def _advance(app, seconds: float, step: float = 1.0 / 60.0) -> None:
     for _ in range(max(1, int(round(seconds / step)))):
         app._update(step)
+
+
+def _saved_slot(save_file) -> dict:
+    """读回存档文件里的当前槽位：设置是全局的，进度按槽位分开保存。"""
+    data = json.loads(save_file.read_text(encoding="utf-8"))
+    return data["slots"][data["active_slot"]]
 
 
 def _countdown_panel_digest(app) -> str:
@@ -173,6 +188,54 @@ def test_enemy_intents_match_game_design_roles():
     assert mage_intent.action == "cast_delayed_orb"
     assert mage_intent.attack is not None
     assert mage_intent.attack.name == "延迟能量球"
+
+
+def test_resonance_mage_keeps_fighting_at_any_distance():
+    """共鸣法师不会因为离得太远就发呆，也不会被逼到画面边缘后卡死。"""
+    # 远距离：主动靠近缩短施法距离，而不是站着不动
+    far = ResonanceMage(1180, 522)
+    far_intent = far.update(0.016, (80.0, 522.0))
+    assert far_intent.action == "advance"
+    assert far_intent.move_x < 0
+
+    # 中距离：正常施法
+    mid = ResonanceMage(600, 522)
+    assert mid.update(0.016, (900.0, 522.0)).action == "cast_delayed_orb"
+
+    # 贴脸且身后有余地：后撤保持施法距离
+    backoff = ResonanceMage(600, 522)
+    assert backoff.update(0.016, (700.0, 522.0)).action == "blink_back"
+
+    # 贴脸且已经贴到画面边缘：就地施法，不再徒劳后撤
+    cornered = ResonanceMage(45, 522)
+    cornered_intent = cornered.update(0.016, (200.0, 522.0))
+    assert cornered_intent.action == "cast_delayed_orb"
+    assert cornered_intent.attack is not None
+
+    right_corner = ResonanceMage(1235, 522)
+    right_intent = right_corner.update(0.016, (1080.0, 522.0))
+    assert right_intent.action == "cast_delayed_orb"
+
+
+def test_resonance_mage_walks_into_range_instead_of_standing_still():
+    mage = ResonanceMage(1180, 522)
+    player_position = (80.0, 522.0)
+    start_x = mage.x
+
+    for _ in range(900):
+        mage.update(1.0 / 60.0, player_position)
+
+    assert mage.x < start_x - 150.0
+    assert mage.distance_to(player_position) <= mage.attack_profile.reach
+
+
+def test_cornered_enemies_do_not_freeze_at_the_wall():
+    """贴到画面边缘的远程敌人要就地反击，不能永远重复后撤动作。"""
+    thrower = SpearThrower(45, 522)
+    intent = thrower.update(0.016, (100.0, 522.0))
+
+    assert intent.action == "throw_spear"
+    assert intent.attack is not None
 
 
 def test_shield_guard_blocks_front_damage_only():
@@ -470,6 +533,7 @@ def test_lethal_enemy_attack_opens_failure_settlement_and_returns_lobby(
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
     app._start_run(2, tutorial=False)
+    app._dismiss_floor_intro()
     enemy = Chaser(app.player.x + 40, 522)
     app.room_enemies = [enemy]
     app.player.hp = enemy.damage
@@ -487,7 +551,7 @@ def test_lethal_enemy_attack_opens_failure_settlement_and_returns_lobby(
     assert app.result_relics == 25
     assert app.pending_enemy_attacks == []
     assert app._stat("failures") == 1
-    assert json.loads(save_file.read_text(encoding="utf-8"))["echo_relics"] == 25
+    assert _saved_slot(save_file)["echo_relics"] == 25
 
     app._handle_key(pygame.K_RETURN)
     assert app.page == "lobby"
@@ -682,8 +746,28 @@ def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
     app._handle_key(app.keybinds["parry"])
     for _ in range(10):
         app._update(1.0 / 60.0)
-        if app._current_tutorial_step.action == "finish":
+        if app._current_tutorial_step.action == "energy":
             break
+    assert app._current_tutorial_step.action == "energy"
+
+    # 回响能量步骤：教学关把能量推到只差一次行动，攒满才能进入剑气步骤
+    assert app.echo_energy == main.ECHO_ENERGY_MAX - main.ENERGY_GAIN_PARRY
+    target = app.room_enemies[0]
+    app.player.start_parry()
+    app.player.update(app.player.PERFECT_PARRY_WINDOW * 0.75, 1)
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(target, target.scaled_attack(), 0.0)
+    )
+    assert app.echo_energy == main.ECHO_ENERGY_MAX
+    for _ in range(10):
+        app._update(1.0 / 60.0)
+        if app._current_tutorial_step.action == "skill":
+            break
+    assert app._current_tutorial_step.action == "skill"
+
+    # 回响剑气步骤：能量满时按下技能键即可斩出剑气（弹刀收招后才能出招）
+    app.player.update(app.player.PARRY_DURATION, 0)
+    app._handle_key(app.keybinds["skill"])
     assert app._current_tutorial_step.action == "finish"
 
     app._activate_page_button("finish")
@@ -731,7 +815,7 @@ def test_lobby_nexus_unlocks_available_node_and_persists(monkeypatch, tmp_path):
 
     assert "aftershock_calibration" in app._unlocked_nodes()
     assert app.echo_relics == 0
-    saved = json.loads(save_file.read_text(encoding="utf-8"))
+    saved = _saved_slot(save_file)
     assert "aftershock_calibration" in saved["progression"]["unlocked_nodes"]
     assert saved["echo_relics"] == 0
     pygame.quit()
@@ -826,6 +910,7 @@ def test_music_switches_between_lobby_and_level(monkeypatch, tmp_path):
 def test_combat_actions_emit_expected_sfx(monkeypatch, tmp_path):
     app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
 
     # 角色动作：攻击（未命中也要有声）、冲刺、跳跃、弹刀架势
     app._handle_key(app.keybinds["attack"])
@@ -898,7 +983,9 @@ def test_volume_setting_updates_audio_and_profile(monkeypatch, tmp_path):
     app._set_volume(35)
     assert app.settings["volume"] == 35
     assert recorder.volume == 35
-    assert app.profile["settings"]["volume"] == 35
+    # 设置是全局的：还没选存档位也要能写进存档文件
+    saved = json.loads(main.SAVE_FILE.read_text(encoding="utf-8"))
+    assert saved["settings"]["volume"] == 35
 
     app._change_setting(0, 5)
     assert app.settings["volume"] == 40
@@ -910,6 +997,7 @@ def test_level_escape_opens_settings_and_has_no_finish_button(monkeypatch, tmp_p
     """关卡里不再有「完成关卡/返回主菜单」按钮，Esc 直接开设置。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
 
     assert app._page_buttons() == {}
     app._handle_key(pygame.K_ESCAPE)
@@ -922,6 +1010,7 @@ def test_level_escape_opens_settings_and_has_no_finish_button(monkeypatch, tmp_p
 def test_settings_icon_click_opens_settings(monkeypatch, tmp_path):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
 
     pygame.event.post(
         pygame.event.Event(
@@ -984,8 +1073,7 @@ def test_settings_overlay_has_six_rows(monkeypatch, tmp_path):
 def test_room_clear_opens_portal_and_assets_are_loaded(monkeypatch, tmp_path):
     app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     _enter_level(app)
-    app.room_enemies.clear()
-    app.pending_spawn.clear()
+    _clear_room(app)
 
     assert app.assets.portal_idle, "传送门待机素材应当存在"
     assert len(app.assets.portal_enter) == 4, "传送门进入动画应当有 4 帧"
@@ -1005,8 +1093,7 @@ def test_walking_into_portal_plays_enter_animation_then_shows_choice(
 ):
     app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     _enter_level(app)
-    app.room_enemies.clear()
-    app.pending_spawn.clear()
+    _clear_room(app)
     _advance(app, main.PORTAL_APPEAR_TIME + 0.2)
     assert app.portal_appear == 1.0
 
@@ -1177,6 +1264,7 @@ def test_parry_window_matches_flash_lead():
 def test_melee_parry_accepts_press_inside_flash_window(monkeypatch, tmp_path):
     app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
     enemy = Chaser(app.player.x + 40, 522)
     app.room_enemies = [enemy]
     starting_hp = app.player.hp
@@ -1198,6 +1286,7 @@ def test_melee_parry_accepts_press_inside_flash_window(monkeypatch, tmp_path):
 def test_projectile_parry_requires_close_range(monkeypatch, tmp_path):
     app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
     thrower = SpearThrower(1000, 522)
     app.room_enemies = [thrower]
     profile = thrower.scaled_attack()
@@ -1262,6 +1351,7 @@ def test_level_spawns_enemies_after_delay(monkeypatch, tmp_path):
     assert app.room_enemies == []
     assert len(app.pending_spawn) == 2
     assert app.enemy_spawn_timer == main.ENEMY_SPAWN_DELAY
+    app._dismiss_floor_intro()
 
     _advance(app, main.ENEMY_SPAWN_DELAY - 0.2)
     assert app.room_enemies == []
@@ -1277,6 +1367,7 @@ def test_spawn_countdown_display_actually_ticks(monkeypatch, tmp_path):
     """回归：倒计时面板必须随时间变化，且提示文案里不能写死秒数。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
 
     first = _countdown_panel_digest(app)
     _advance(app, 1.0)
@@ -1295,6 +1386,7 @@ def test_projectile_parry_reflects_bullet_back_to_shooter(monkeypatch, tmp_path)
     """远程弹刀是“把子弹打回去”，伤害在飞回敌人时才结算。"""
     app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
     thrower = SpearThrower(600, 522)
     app.room_enemies = [thrower]
     profile = thrower.scaled_attack()
@@ -1324,12 +1416,13 @@ def test_projectile_parry_reflects_bullet_back_to_shooter(monkeypatch, tmp_path)
 
 
 def test_melee_parry_window_is_longer_than_before(monkeypatch, tmp_path):
-    """近战弹刀窗口延长到 0.45 秒，闪光提前量与之保持一致。"""
+    """近战弹刀窗口再延长 0.2 秒到 0.65 秒，闪光提前量与之保持一致。"""
     assert main.MELEE_FLASH_LEAD == Player.PARRY_INPUT_BUFFER
-    assert Player.PARRY_INPUT_BUFFER >= 0.45
+    assert Player.PARRY_INPUT_BUFFER >= 0.65
 
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
     enemy = Chaser(app.player.x + 40, 522)
     app.room_enemies = [enemy]
     starting_hp = app.player.hp
@@ -1372,4 +1465,595 @@ def test_lobby_music_stops_after_entering_level(monkeypatch, tmp_path):
     assert busy.count(True) == 1  # 只剩战斗音乐在播放
     assert max(volumes) > 0.0
     assert min(volumes) == 0.0  # 大厅音乐声道音量为 0
+    pygame.quit()
+
+
+# -- 角色生存力、波次关卡、等级与回响能量、回响剑气 -------------------------
+
+
+def test_player_survives_much_longer_than_before():
+    """角色血量提升到原来的三倍以上，不再被几刀打死。"""
+    player = Player(300, 566)
+
+    assert player.max_hp >= 300
+    assert player.hp == player.max_hp
+    # 最疼的敌人也要打十几下才放倒
+    assert player.max_hp / RiftWorm(0, 0).damage > 10
+
+
+def test_vitals_hud_shows_numbers_and_tracks_damage(monkeypatch, tmp_path):
+    """左上角状态区带具体数值，且血量变化必须反映在画面上。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    region = pygame.Rect(0, 92, 500, 84)
+
+    app.canvas.fill((0, 0, 0))
+    app._draw_vitals()
+    full = pygame.image.tobytes(app.canvas.subsurface(region), "RGB")
+    assert pygame.mask.from_threshold(
+        app.canvas, (0, 0, 0), threshold=(1, 1, 1, 255)
+    ).count() > 0
+
+    app.player.hp = app.player.max_hp // 4
+    app.canvas.fill((0, 0, 0))
+    app._draw_vitals()
+    hurt = pygame.image.tobytes(app.canvas.subsurface(region), "RGB")
+
+    assert full != hurt
+    pygame.quit()
+
+
+def test_each_floor_builds_its_designed_wave_composition(monkeypatch, tmp_path):
+    """三层关卡各自的波次编成按设计表执行，且一波内部不会叠在同一点。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    expected = {
+        1: [
+            ["chaser", "spear_thrower"],
+            ["chaser", "spear_thrower", "spear_thrower"],
+            ["chaser", "chaser", "spear_thrower", "spear_thrower"],
+        ],
+        2: [
+            ["shield_guard", "spear_thrower"],
+            ["shield_guard", "chaser", "spear_thrower"],
+            [
+                "shield_guard",
+                "chaser",
+                "chaser",
+                "spear_thrower",
+                "spear_thrower",
+            ],
+        ],
+        3: [
+            ["shield_guard", "rift_worm"],
+            ["rift_worm", "rift_worm", "chaser"],
+            ["shield_guard", "rift_worm", "resonance_mage"],
+        ],
+    }
+
+    for floor, waves in expected.items():
+        app._start_run(floor, tutorial=False)
+        app._dismiss_floor_intro()
+
+        assert [
+            [enemy.kind for enemy in wave] for wave in app.wave_plan
+        ] == waves
+        for wave in app.wave_plan:
+            positions = [enemy.x for enemy in wave]
+            assert len(set(positions)) == len(positions)
+
+    # 第四层沿用第三层编成，只提高威胁
+    app._start_run(4, tutorial=False)
+    assert [enemy.kind for enemy in app.wave_plan[0]] == [
+        "shield_guard",
+        "rift_worm",
+    ]
+    assert app.run_threat > main.StartScreen._floor_threat(3)
+    pygame.quit()
+
+
+def test_floor_one_runs_through_three_waves_with_countdown(monkeypatch, tmp_path):
+    """第一层按三波依次刷出，波与波之间用倒计时面板等待。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
+
+    spawned: list[str] = []
+    elapsed = 0.0
+    while elapsed < 30.0 and not (
+        app.wave_index >= len(app.wave_plan)
+        and not app.pending_spawn
+        and not app.room_enemies
+    ):
+        app.room_enemies.clear()
+        app.pending_enemy_attacks.clear()
+        app._update(1.0 / 60.0)
+        spawned.extend(enemy.kind for enemy in app.room_enemies)
+        elapsed += 1.0 / 60.0
+
+    assert spawned == [
+        "chaser",
+        "spear_thrower",
+        "chaser",
+        "spear_thrower",
+        "spear_thrower",
+        "chaser",
+        "chaser",
+        "spear_thrower",
+        "spear_thrower",
+    ]
+    # 后续波次用的是更短的间隔，面板上会写明是第几波
+    assert app.spawn_countdown_total == main.WAVE_SPAWN_DELAY
+    assert app.spawn_countdown_label.startswith("第 3 波")
+    # 三波清空后房间才判定为胜利
+    assert app._room_cleared() is True
+    pygame.quit()
+
+
+def test_new_floor_opens_a_briefing_about_its_enemies(monkeypatch, tmp_path):
+    """进入每一层都弹出简报，介绍本层敌人的攻击方式，并暂停游戏世界。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+
+    assert app.overlay == "floor_intro"
+    first_floor = [name for name, _ in app._floor_briefing(1).entries]
+    assert "追击者" in first_floor
+    assert "投矛手" in first_floor
+
+    # 简报期间敌人不会刷新，玩家也不能操作
+    _advance(app, 1.0)
+    assert app.enemy_spawn_timer == main.ENEMY_SPAWN_DELAY
+    app._draw()
+
+    app._dismiss_floor_intro()
+    assert app.overlay is None
+    assert app.page == "game"
+
+    # 后两层简报各自点名本层的新敌人
+    assert app._floor_briefing(2).entries[0][0] == "盾卫"
+    third_floor = [name for name, _ in app._floor_briefing(3).entries]
+    assert "裂隙虫" in third_floor
+    assert "共鸣法师" in third_floor
+    pygame.quit()
+
+
+def test_level_curve_grows_and_difficulty_scales_with_floor():
+    needs = [main.StartScreen._exp_needed(level) for level in range(1, 7)]
+
+    assert needs == sorted(needs)
+    assert len(set(needs)) == len(needs)
+    assert main.StartScreen._floor_threat(1) < main.StartScreen._floor_threat(2)
+    assert main.StartScreen._floor_threat(2) < main.StartScreen._floor_threat(3)
+
+
+def test_defeating_enemies_grants_exp_and_level_ups_raise_stats(monkeypatch, tmp_path):
+    """击败敌人给经验；升级同时提高生命上限与攻击力（技能一起吃加成）。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    base_max_hp = app.player.max_hp
+    base_damage = app.player.attack_damage
+
+    assert app.player_level == 1
+    assert app.player_exp == 0
+
+    enemy = app.room_enemies[0]
+    enemy.hp = 1
+    app._start_player_attack()
+    app.player.update(0.1, 0)
+    app._resolve_player_attack()
+
+    assert app.player_exp == app._enemy_exp(enemy) > 0
+
+    app._gain_exp(app.exp_to_next - app.player_exp)
+
+    assert app.player_level == 2
+    assert app.player_exp == 0
+    assert app.player.max_hp == base_max_hp + main.HP_PER_LEVEL
+    assert app.player.attack_damage == base_damage + main.ATTACK_PER_LEVEL
+    pygame.quit()
+
+
+def test_enemy_exp_rewards_grow_with_floor(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    chaser = Chaser(600, 522)
+
+    app._start_run(1, tutorial=False)
+    shallow = app._enemy_exp(chaser)
+    app._start_run(3, tutorial=False)
+    deep = app._enemy_exp(chaser)
+
+    assert deep > shallow
+    pygame.quit()
+
+
+def test_echo_energy_gains_match_design_and_cap_at_max(monkeypatch, tmp_path):
+    """跳跃闪避不给能量；普通攻击 < 上劈下劈 < 完美弹刀 = 击败敌人。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+
+    assert app.echo_energy == 0
+    assert main.ENERGY_GAIN_ATTACK < main.ENERGY_GAIN_HEAVY_ATTACK
+    assert main.ENERGY_GAIN_HEAVY_ATTACK < main.ENERGY_GAIN_PARRY
+    assert main.ENERGY_GAIN_PARRY == main.ENERGY_GAIN_DEFEAT
+    # 五次完美弹刀刚好攒满一次技能
+    assert main.ENERGY_GAIN_PARRY * 5 == main.ECHO_ENERGY_MAX
+
+    # 跳跃 / 闪避 / 移动都不增加能量
+    app._handle_key(app.keybinds["jump"])
+    app._handle_key(app.keybinds["dash"])
+    _advance(app, 0.3)
+    assert app.echo_energy == 0
+
+    # 完美弹刀会积攒能量
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+    app.player.start_parry()
+    app.player.update(app.player.PERFECT_PARRY_WINDOW * 0.75, 1)
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+    assert app.run_parries == 1
+    assert app.echo_energy == main.ENERGY_GAIN_PARRY
+
+    # 满能量后不再溢出累积
+    app.echo_energy = main.ECHO_ENERGY_MAX - 1
+    app._gain_energy(1)
+    assert app.energy_ready is True
+    app._gain_energy(60)
+    assert app.echo_energy == main.ECHO_ENERGY_MAX
+    pygame.quit()
+
+
+def test_energy_resets_at_the_start_of_every_floor(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    app.echo_energy = main.ECHO_ENERGY_MAX
+
+    app._start_run(2, tutorial=False, keep_progress=True)
+
+    assert app.echo_energy == 0
+    pygame.quit()
+
+
+def test_skill_needs_full_energy_and_makes_player_invulnerable(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    enemy = Chaser(app.player.x + 40, 522)
+    app.room_enemies = [enemy]
+
+    # 能量不满：按技能键没有任何反应
+    app._handle_key(app.keybinds["skill"])
+    assert app.player.skill_active is False
+    assert app.skill_waves == []
+    assert app.echo_energy == 0
+
+    app.echo_energy = main.ECHO_ENERGY_MAX
+    app._handle_key(app.keybinds["skill"])
+
+    assert app.player.skill_active is True
+    assert app.player.invulnerable is True
+    assert app.echo_energy == 0
+
+    # 释放期间无敌：敌人打中也不掉血、不打断连击
+    starting_hp = app.player.hp
+    app.run_combo = 4
+    app._resolve_enemy_attack(
+        PendingEnemyAttack(enemy, enemy.scaled_attack(), 0.0)
+    )
+    assert app.player.hp == starting_hp
+    assert app.run_combo == 4
+
+    app.player.update(Player.SKILL_DURATION, 0)
+    assert app.player.invulnerable is False
+    pygame.quit()
+
+
+def test_skill_wave_damages_launches_enemies_and_clears_bullets(monkeypatch, tmp_path):
+    """剑气：前方竖向半月、击飞敌人、斩灭沿途子弹，并造成大量伤害。"""
+    app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    guard = ShieldGuard(app.player.x + 80, 522, facing=-1)
+    thrower = SpearThrower(app.player.x + 300, 522)
+    app.room_enemies = [guard, thrower]
+    guard_hp = guard.hp
+    start_x = guard.x
+    profile = thrower.scaled_attack()
+    bullet = PendingEnemyAttack(
+        thrower,
+        profile,
+        profile.telegraph_time,
+        origin=(thrower.x, thrower.y - 52),
+        target=(app.player.x, app.player.y - 54),
+    )
+    app.pending_enemy_attacks = [bullet]
+    assert guard.vulnerable is False
+
+    app.echo_energy = main.ECHO_ENERGY_MAX
+    app._handle_key(app.keybinds["skill"])
+    _advance(app, Player.SKILL_CAST_TIME + 0.05)
+    assert app.skill_waves, "起手结束后应当斩出剑气"
+
+    launched = False
+    for _ in range(90):
+        app._update(1.0 / 60.0)
+        if guard.y < guard.ground_y:
+            launched = True
+        if launched and not guard.being_knocked_back:
+            break
+
+    # 伤害是普通攻击的数倍，且盾卫的正面减伤挡不住剑气
+    assert guard_hp - guard.hp >= app.player.attack_damage * 2
+    # 先被击飞腾空，再落回地面；横向也被推开一段距离
+    assert launched is True
+    assert guard.y == guard.ground_y
+    assert guard.x > start_x
+    # 沿途子弹被斩灭
+    assert bullet not in app.pending_enemy_attacks
+    assert "hit" in recorder.played
+    pygame.quit()
+
+
+def test_launched_enemy_falls_back_to_the_ground(monkeypatch, tmp_path):
+    """击退只持续一段滞空时间，敌人最终会落回地面并恢复行动。"""
+    enemy = Chaser(600, 522)
+    enemy.apply_knockback(-1, main.SKILL_KNOCKBACK_SPEED, main.SKILL_KNOCKBACK_LIFT)
+
+    assert enemy.airborne is True
+    assert enemy.update(1.0 / 60.0, (200, 522)).action == "knocked_back"
+
+    for _ in range(240):
+        enemy.update(1.0 / 60.0, (200, 522))
+
+    assert enemy.y == enemy.ground_y
+    assert enemy.being_knocked_back is False
+    assert enemy.x < 600
+    pygame.quit()
+
+
+# -- 剑气横穿全屏、存档槽位 -------------------------------------------------
+
+
+def test_skill_wave_travels_from_one_edge_to_the_other(monkeypatch, tmp_path):
+    """剑气必须一路斩到屏幕另一侧，而不是走到画面中间就消失。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    _clear_room(app)
+    app.player.x = app.player.bounds_left
+    app.echo_energy = main.ECHO_ENERGY_MAX
+
+    app._handle_key(app.keybinds["skill"])
+    _advance(app, Player.SKILL_CAST_TIME + 0.02)
+    assert app.skill_waves
+
+    # 亮度只在收招阶段衰减，而那时剑气已经飞出画面：全屏范围内都是满亮度
+    first = app.skill_waves[0]
+    fade_start_x = first.x + (
+        main.SKILL_WAVE_LIFE - main.SKILL_WAVE_FADE_TIME
+    ) * main.SKILL_WAVE_SPEED
+    assert fade_start_x >= main.LOGICAL_SIZE[0]
+
+    farthest = 0.0
+    for _ in range(150):
+        _advance(app, 1.0 / 60.0)
+        for wave in app.skill_waves:
+            farthest = max(farthest, wave.x)
+        if not app.skill_waves:
+            break
+
+    assert farthest >= main.LOGICAL_SIZE[0]
+    assert app.skill_waves == []
+    pygame.quit()
+
+
+def test_skill_wave_keeps_the_original_character_scale_crescent(monkeypatch, tmp_path):
+    """剑气的模型保持原来那版：比角色略大一圈的半月，不是贯通全屏的光柱。"""
+    assert main.SKILL_WAVE_HALF_HEIGHT * 2 > Player.BODY_HEIGHT
+    assert main.SKILL_WAVE_HALF_HEIGHT * 2 < main.LOGICAL_SIZE[1] * 0.5
+
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    _clear_room(app)
+    app.player.x = app.player.bounds_left
+    app.echo_energy = main.ECHO_ENERGY_MAX
+    app._handle_key(app.keybinds["skill"])
+    _advance(app, Player.SKILL_CAST_TIME + 0.02)
+
+    # 把剑气推到画面右半段再取样，避开左上角 HUD 与角色本身
+    for _ in range(120):
+        if not app.skill_waves or app.skill_waves[0].x >= 900.0:
+            break
+        app._update(1.0 / 60.0)
+    assert app.skill_waves
+    wave = app.skill_waves[0]
+
+    app._draw()
+    window = pygame.Rect(round(wave.x) + 24, 200, 60, 420)
+    raw = pygame.image.tobytes(app.canvas.subsurface(window), "RGB")
+    rows = {
+        (index // 3) // window.width
+        for index in range(0, len(raw), 3)
+        if raw[index] > 190 and raw[index + 1] > 190 and raw[index + 2] > 190
+    }
+
+    assert rows
+    extent = max(rows) - min(rows) + 1
+    assert extent > Player.BODY_HEIGHT * 0.8
+    assert extent < 300
+    pygame.quit()
+
+
+def test_start_game_offers_six_slots_and_starts_a_new_save(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+
+    assert main.SAVE_SLOT_COUNT == 6
+    app._activate(1)  # 开始游戏
+
+    assert app.overlay == "slots"
+    assert app.slot_mode == "new"
+    assert len(app._slot_row_rects()) == main.SAVE_SLOT_COUNT
+    assert app.save_slots == [None] * main.SAVE_SLOT_COUNT
+    app._draw()  # 六个槽位的列表必须能画出来
+
+    app._activate_slot(2)
+
+    assert app.active_slot == 2
+    assert app.overlay is None
+    assert app.page == "game"
+    assert app.is_tutorial_run is True
+    assert app.profile is app.save_slots[2]
+    pygame.quit()
+
+
+def test_new_save_resets_progress_and_restarts_the_tutorial(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.save_slots[0] = app._new_profile()
+    app.save_slots[0]["tutorial_completed"] = True
+    app.save_slots[0]["best_floor"] = 3
+    app.save_slots[0]["echo_relics"] = 500
+    app.save_slots[0]["progression"] = {
+        "unlocked_nodes": ["white_window_record"],
+        "equipped_start_module": None,
+    }
+    app._activate_slot(0)
+    app.player_level = 6
+    app.player_exp = 120
+
+    app._activate(1)  # 开始游戏
+    app._activate_slot(0)  # 点已有存档：先要求确认
+
+    assert app.slot_confirm_index == 0
+    assert app.page == "menu"
+    assert app.page != "game"
+
+    app._activate_slot(0)  # 再确认一次才真正覆盖
+
+    assert app.tutorial_completed is False
+    assert app.echo_relics == 0
+    assert app._unlocked_nodes() == set()
+    assert app.profile["best_floor"] == 0
+    assert app.is_tutorial_run is True
+    assert app.run_floor == 1
+    assert app.player_level == 1
+    assert app.player_exp == 0
+    pygame.quit()
+
+
+def test_continue_game_loads_the_selected_slot(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.save_slots[3] = app._new_profile()
+    app.save_slots[3]["tutorial_completed"] = True
+    app.save_slots[3]["best_floor"] = 2
+    app.save_slots[3]["echo_relics"] = 120
+    app.has_save = True
+    app.items = app._build_items()
+
+    app._activate(0)  # 继续游戏
+
+    assert app.overlay == "slots"
+    assert app.slot_mode == "continue"
+
+    # 空槽位不能载入，面板保持打开
+    app._activate_slot(3)
+    assert app.active_slot == 3
+    assert app.page == "lobby"
+    assert app.echo_relics == 120
+    assert app.profile["best_floor"] == 2
+    assert app.tutorial_completed is True
+    pygame.quit()
+
+
+def test_continue_game_on_empty_slot_is_rejected(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.save_slots[1] = app._new_profile()
+    app.save_slots[1]["tutorial_completed"] = True
+    app.has_save = True
+    app.items = app._build_items()
+    app._activate(0)
+
+    app._activate_slot(0)
+
+    assert app.overlay == "slots"
+    assert app.active_slot is None
+    assert "空" in app.notification
+    pygame.quit()
+
+
+def test_continue_game_resumes_an_unfinished_tutorial(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.save_slots[1] = app._new_profile()
+    app.has_save = True
+    app.items = app._build_items()
+
+    app._activate(0)
+    app._activate_slot(1)
+
+    assert app.page == "game"
+    assert app.is_tutorial_run is True
+    assert app.run_floor == 1
+    pygame.quit()
+
+
+def test_slots_and_global_settings_persist_across_restarts(monkeypatch, tmp_path):
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._set_volume(45)
+
+    app._activate_slot(1)
+    app.profile["tutorial_completed"] = True
+    app.profile["echo_relics"] = 77
+    app._save_profile()
+
+    app._activate_slot(4)
+    app.profile["echo_relics"] = 12
+    app._save_profile()
+
+    again = StartScreen(screen)
+
+    assert again.settings["volume"] == 45
+    assert again.save_slots[1]["echo_relics"] == 77
+    assert again.save_slots[4]["echo_relics"] == 12
+    assert again.save_slots[0] is None
+    assert again.has_save is True
+    pygame.quit()
+
+
+def test_legacy_single_profile_save_migrates_into_the_first_slot(monkeypatch, tmp_path):
+    """旧版单档案存档不能凭空消失：迁移到 1 号存档位。"""
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+    save_file.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "best_score": 900,
+                "best_floor": 2,
+                "scores": [{"score": 900, "floor": 2, "parries": 3}],
+                "tutorial_completed": True,
+                "echo_relics": 150,
+                "progression": {
+                    "unlocked_nodes": ["white_window_record"],
+                    "equipped_start_module": None,
+                },
+                "lifetime_stats": {"settlements": 4},
+                "settings": {"volume": 60, "keybinds": {"attack": 106}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+
+    assert app.save_slots[0] is not None
+    assert app.save_slots[0]["echo_relics"] == 150
+    assert app.save_slots[0]["best_floor"] == 2
+    assert app.save_slots[0]["tutorial_completed"] is True
+    assert all(slot is None for slot in app.save_slots[1:])
+    assert app.settings["volume"] == 60
+    assert app.keybinds["attack"] == 106
+    assert app.has_save is True
     pygame.quit()
