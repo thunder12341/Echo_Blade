@@ -59,6 +59,13 @@ class Enemy(ABC):
     KNOCKBACK_FRICTION: ClassVar[float] = 900.0
     # 韧性归零后的破绽窗口：窗口结束韧性回满，敌人重新投入战斗
     BREAK_WINDOW: ClassVar[float] = 0.8
+    # 被近战弹刀击退：横向速度与腾空高度
+    PARRY_KNOCKBACK_SPEED: ClassVar[float] = 330.0
+    PARRY_KNOCKBACK_LIFT: ClassVar[float] = 200.0
+    # 受击闪烁时长
+    HURT_FLASH_TIME: ClassVar[float] = 0.22
+    # 与角色之间必须保留的最小间距（在双方半身宽度之外再加一段）
+    MIN_BODY_GAP: ClassVar[float] = 22.0
 
     def __init__(
         self,
@@ -97,6 +104,7 @@ class Enemy(ABC):
         self._attack_cooldown = 0.0
         self._vulnerable_timer = 0.0
         self._posture_broken = False
+        self.hurt_flash = 0.0
 
     @property
     def position(self) -> Position:
@@ -134,6 +142,7 @@ class Enemy(ABC):
         elapsed = max(0.0, dt)
         self._attack_cooldown = max(0.0, self._attack_cooldown - elapsed)
         self._vulnerable_timer = max(0.0, self._vulnerable_timer - elapsed)
+        self.hurt_flash = max(0.0, self.hurt_flash - elapsed)
         # 破绽结束：韧性回满，否则一次破韧后敌人会永远站不起来
         if self._posture_broken and self._vulnerable_timer <= 0.0:
             self._posture_broken = False
@@ -150,6 +159,7 @@ class Enemy(ABC):
 
         intent = self.choose_intent(player_position)
         self.x += intent.move_x * elapsed
+        self._keep_distance_from(player_position)
         # 只被场地左右边界挡住，避免走出画面或被卡在半途
         self.x = min(max(self.x, self.bounds_left), self.bounds_right)
         if intent.attack is not None and self.attack_ready:
@@ -162,6 +172,15 @@ class Enemy(ABC):
 
     def distance_to(self, player_position: Position) -> float:
         return abs(player_position[0] - self.x)
+
+    def _keep_distance_from(self, player_position: Position) -> None:
+        """贴身停下就好：不让近战敌人和角色重叠在一起。"""
+        gap = self.body_width / 2 + self.MIN_BODY_GAP
+        delta = self.x - float(player_position[0])
+        if abs(delta) >= gap:
+            return
+        direction = 1.0 if delta >= 0 else -1.0
+        self.x = float(player_position[0]) + direction * gap
 
     def direction_to(self, player_position: Position) -> int:
         return 1 if player_position[0] >= self.x else -1
@@ -184,6 +203,8 @@ class Enemy(ABC):
         if not self.can_be_parried():
             return 0
 
+        # 弹刀特效：比普通受击更亮的闪烁
+        self.hurt_flash = self.HURT_FLASH_TIME * 1.8
         self.enter_vulnerable(0.8 if perfect else 0.35)
         posture_damage = self.attack_profile.posture_damage * (2 if perfect else 1)
         self.take_posture_damage(posture_damage)
@@ -231,6 +252,8 @@ class Enemy(ABC):
     ) -> int:
         actual_damage = max(0, int(round(amount)))
         self.hp = max(0, self.hp - actual_damage)
+        if actual_damage > 0:
+            self.hurt_flash = max(self.hurt_flash, self.HURT_FLASH_TIME)
         self.take_posture_damage(posture_damage)
         return actual_damage
 
@@ -469,6 +492,9 @@ class RustCrownKnight(Enemy):
     DEFENSE_BREAK_DURATION = 3.0
     # 首领韧性归零只中断当前行动，暴露 1.2 秒核心后重新起身
     BREAK_WINDOW = 1.2
+    # 重甲首领不会被弹刀远远震开，只后退一小步
+    PARRY_KNOCKBACK_SPEED = 200.0
+    PARRY_KNOCKBACK_LIFT = 0.0
     NORMAL_DAMAGE_TAKEN = 0.78
     BROKEN_DAMAGE_TAKEN = 1.35
 

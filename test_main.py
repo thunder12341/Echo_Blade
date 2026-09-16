@@ -71,6 +71,23 @@ def _enter_level(app, floor: int = 1, *, tutorial: bool = False):
     return app
 
 
+def _start_expedition(app, seconds: float = 2.0):
+    """从大厅点城门出发，并把漩涡过场动画走完。"""
+    app._activate_lobby_action(0)
+    _advance(app, seconds)
+    return app
+
+
+def _grant_tracks(app, **levels) -> None:
+    """直接点亮技能树分支，省去逐级升级的操作。"""
+    progression = app.profile.setdefault("progression", {})
+    progression["version"] = 2
+    stored = progression.setdefault("levels", {})
+    stored.update(levels)
+    app.profile["echo_relics"] = max(0, app.echo_relics)
+    app._save_profile()
+
+
 def _clear_room(app) -> None:
     """清空整层：敌人、待登场的一波以及后面还没排到的波次。"""
     app.room_enemies.clear()
@@ -514,14 +531,12 @@ def test_unlocked_reserve_carry_grants_starting_run_currency(monkeypatch, tmp_pa
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
-    app.profile["progression"] = {
-        "unlocked_nodes": ["reserve_carry"],
-        "equipped_start_module": None,
-    }
+    app.profile = app._new_profile()
+    app.profile["progression"]["levels"] = {"reserve_carry": 3}
 
     app._start_run(1, tutorial=False)
 
-    assert app.run_currency == 20
+    assert app.run_currency == 15
     pygame.quit()
 
 
@@ -844,7 +859,7 @@ def test_tutorial_completion_enters_lobby_and_lobby_starts_new_run(monkeypatch, 
     assert app.is_tutorial_run is True
     assert app.echo_relics == 40
 
-    app._activate_lobby_action(0)
+    _start_expedition(app)
     assert app.page == "game"
     assert app.is_tutorial_run is False
     assert app.run_floor == 1
@@ -863,7 +878,7 @@ def test_lobby_without_checkpoint_ignores_historical_best_floor(
     app.profile["best_floor"] = 5
     app._enter_lobby()
 
-    app._activate_lobby_action(0)
+    _start_expedition(app)
 
     assert app.page == "game"
     assert app.run_floor == 1
@@ -872,149 +887,30 @@ def test_lobby_without_checkpoint_ignores_historical_best_floor(
     pygame.quit()
 
 
-def test_lobby_without_checkpoint_starts_at_the_recorded_progress_floor(
-    monkeypatch, tmp_path
-):
-    """没打过的那一层就是远征起点：下次进城直接从那里再来一次。"""
+def test_lobby_gate_plays_the_vortex_before_entering_the_level(monkeypatch, tmp_path):
+    """点城门先播漩涡过场：动画期间还在大厅，走完才真正进入关卡。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app.profile = app._new_profile()
     app.profile["tutorial_completed"] = True
-    app.profile["best_floor"] = 5
-    app.profile["progress_floor"] = 3
     app._enter_lobby()
 
-    assert app._lobby_actions()[0][1] == "开启新远征 · 第 3 层"
     app._activate_lobby_action(0)
+    assert app.transition is not None
+    assert app.page == "lobby"
+    app._draw()
 
+    _advance(app, 1.6)
+
+    assert app.transition is None
     assert app.page == "game"
-    assert app.run_floor == 3
-    assert app._active_run_checkpoint()["floor"] == 3
-    assert "第 3 层" in app.notification
+    assert app.run_floor == 1
     pygame.quit()
 
 
-def test_stale_checkpoint_below_the_progress_floor_is_ignored(monkeypatch, tmp_path):
-    """旧存档里低于远征起点的暂存属于过期记录，不该把玩家拽回低层。"""
-    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
-    app.profile = app._new_profile()
-    app.profile["tutorial_completed"] = True
-    app.profile["progress_floor"] = 5
-    app.profile["active_run"] = {
-        "status": "active",
-        "floor": 1,
-        "player_level": 1,
-        "player_hp": 1,
-    }
-    app._enter_lobby()
-
-    assert app._lobby_actions()[0][1] == "开启新远征 · 第 5 层"
-    app._activate_lobby_action(0)
-
-    assert app.page == "game"
-    assert app.run_floor == 5
-    assert app._active_run_checkpoint()["floor"] == 5
-    assert "第 5 层" in app.notification
-    pygame.quit()
-
-
-def test_clearing_a_floor_moves_the_recorded_start_point_forward(
+def test_failure_sends_the_next_expedition_back_to_the_first_floor(
     monkeypatch, tmp_path
 ):
-    """打通一层之后，远征起点就顺延到还没打过的下一层。"""
-    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
-    app.profile = app._new_profile()
-    app.profile["tutorial_completed"] = True
-    _enter_level(app, floor=1)
-    app.room_enemies.clear()
-    app.pending_spawn.clear()
-    app.wave_plan = []
-    app.wave_index = 0
-
-    app._open_portal_choice()
-    app._activate_portal_choice(1)
-
-    assert app.run_floor == 2
-    assert app.profile["progress_floor"] == 2
-    assert app._active_run_checkpoint()["floor"] == 2
-    assert app.profile["retry_run"] is None
-    pygame.quit()
-
-
-def test_failure_keeps_run_growth_for_the_retry(monkeypatch, tmp_path):
-    """失败重打同一层时保留等级、经验、战时铸币与商店强化，不用从头练。"""
-    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
-    app.profile = app._new_profile()
-    app.profile["tutorial_completed"] = True
-    _enter_level(app, floor=3)
-    app.player_level = 4
-    app.player_exp = 30
-    app.run_currency = 96
-    app.run_shop_attack_bonus = 4
-    app.run_shop_hp_bonus = 45
-    app.shop_purchased = {"edge_plating"}
-    app.player.hp = 0
-
-    app._fail_run()
-
-    assert app.page == "failure"
-    assert app.profile["progress_floor"] == 3
-    assert app.profile["retry_run"]["floor"] == 3
-    assert app._active_run_checkpoint() is None
-
-    app._enter_lobby()
-    app._activate_lobby_action(0)
-
-    assert app.page == "game"
-    assert app.run_floor == 3
-    assert app.player_level == 4
-    assert app.player_exp == 30
-    assert app.run_currency == 96
-    assert app.run_shop_attack_bonus == 4
-    assert app.run_shop_hp_bonus == 45
-    assert app.shop_purchased == {"edge_plating"}
-    # 重打是满血开局，分数、连击与能量重新开始
-    assert app.player.max_hp == 320 + 45 + 3 * main.HP_PER_LEVEL
-    assert app.player.attack_damage == 18 + 4 + 3 * main.ATTACK_PER_LEVEL
-    assert app.player.hp == app.player.max_hp
-    assert app.run_score == 0
-    assert app.run_combo == 0
-    assert app.echo_energy == 0
-    # 续战记录同时写进暂存，重启游戏也能接上
-    assert app._active_run_checkpoint()["floor"] == 3
-    assert "第 3 层" in app.notification
-    pygame.quit()
-
-
-def test_retry_growth_survives_a_restart(monkeypatch, tmp_path):
-    """续战记录要落盘：关掉游戏再进来，仍然带着等级与铸币重打。"""
-    save_file = tmp_path / "save.json"
-    monkeypatch.setattr(main, "SAVE_FILE", save_file)
-    pygame.init()
-    screen = pygame.display.set_mode((1280, 720))
-    app = StartScreen(screen)
-    app._bind_slot(0, fresh=True)
-    app.profile["tutorial_completed"] = True
-    _enter_level(app, floor=2)
-    app.player_level = 3
-    app.run_currency = 64
-    app.player.hp = 0
-    app._fail_run()
-
-    again = StartScreen(screen)
-    again._load_slot(0)
-    again._activate_lobby_action(0)
-
-    assert again.run_floor == 2
-    assert again.player_level == 3
-    assert again.run_currency == 64
-    assert again.player.hp == again.player.max_hp
-    pygame.quit()
-
-
-def test_failure_keeps_the_expedition_start_on_the_uncleared_floor(
-    monkeypatch, tmp_path
-):
-    """哪一层没打过，远征起点就停在那一层，死亡结算后还能直接重来。"""
+    """一局=从第一层打到失败或通关：死亡结算之后，下一局重新从第一层开始。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app.profile = app._new_profile()
     app.profile["tutorial_completed"] = True
@@ -1023,24 +919,22 @@ def test_failure_keeps_the_expedition_start_on_the_uncleared_floor(
     app._fail_run()
 
     assert app.page == "failure"
-    assert app.profile["progress_floor"] == 3
     assert app._active_run_checkpoint() is None
 
     app._enter_lobby()
-    assert app._lobby_actions()[0][1] == "开启新远征 · 第 3 层"
-    app._activate_lobby_action(0)
+    assert app._lobby_actions()[0][1] == "开启新远征"
+    _start_expedition(app)
 
     assert app.page == "game"
-    assert app.run_floor == 3
-    assert app._active_run_checkpoint()["floor"] == 3
+    assert app.run_floor == 1
+    assert app._active_run_checkpoint()["floor"] == 1
     pygame.quit()
 
 
-def test_clearing_the_final_floor_keeps_the_start_point_at_floor_five(
-    monkeypatch, tmp_path
-):
-    """第五层打过后不要把存档退回第一层：起点先原地保留在第五层。"""
+def test_clearing_the_final_floor_opens_the_clear_settlement(monkeypatch, tmp_path):
+    """闯过第五层算通关：一局结束并弹出结算界面，下一局再从第一层开始。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
     app.profile["tutorial_completed"] = True
     _enter_level(app, floor=5)
     boss = app.room_enemies[0]
@@ -1054,15 +948,19 @@ def test_clearing_the_final_floor_keeps_the_start_point_at_floor_five(
     app._open_portal_choice()
     app._activate_portal_choice(1)
 
-    assert app.page == "lobby"
-    assert app.profile["progress_floor"] == main.BOSS_FLOOR == 5
+    assert app.page == "result"
+    assert app.result_cleared is True
     assert app._active_run_checkpoint() is None
-    assert app._lobby_actions()[0][1] == "开启新远征 · 第 5 层"
+    rows = dict(app._settlement_rows())
+    assert rows["抵达关卡"] == "第 5 层"
+    assert rows["击败敌人"] == "1"
+    app._draw()
 
-    app._activate_lobby_action(0)
+    app._handle_key(pygame.K_RETURN)
+    assert app.page == "lobby"
 
-    assert app.run_floor == 5
-    assert app._active_run_checkpoint()["floor"] == 5
+    _start_expedition(app)
+    assert app.run_floor == 1
     pygame.quit()
 
 
@@ -1094,7 +992,7 @@ def test_lobby_resumes_persisted_expedition_checkpoint_after_restart(
     again._load_slot(0)
     assert again.page == "lobby"
     assert "继续远征" in again._lobby_actions()[0][1]
-    again._activate_lobby_action(0)
+    _start_expedition(again)
 
     assert again.page == "game"
     assert again.run_floor == 3
@@ -1124,7 +1022,7 @@ def test_invalid_or_lethal_checkpoint_is_ignored_by_lobby(monkeypatch, tmp_path)
     }
     app._enter_lobby()
 
-    app._activate_lobby_action(0)
+    _start_expedition(app)
 
     assert app.run_floor == 1
     assert app.player.hp > 0
@@ -1132,30 +1030,36 @@ def test_invalid_or_lethal_checkpoint_is_ignored_by_lobby(monkeypatch, tmp_path)
     pygame.quit()
 
 
-def test_lobby_nexus_unlocks_available_node_and_persists(monkeypatch, tmp_path):
+def test_lobby_nexus_upgrades_a_track_and_persists(monkeypatch, tmp_path):
     save_file = tmp_path / "save.json"
     monkeypatch.setattr(main, "SAVE_FILE", save_file)
 
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
-    app.profile["tutorial_completed"] = True
+    app.profile = app._new_profile()
     app.profile["echo_relics"] = 40
     app._enter_lobby()
     app._activate_lobby_action(1)
 
     assert app.overlay == "progression"
-    app._activate_progression_node(0)
+    index = next(
+        position
+        for position, track in enumerate(main.PROGRESSION_TRACKS)
+        if track.track_id == "vital_lattice"
+    )
+    app.progression_selected = index
+    app._upgrade_track(index)
 
-    assert "aftershock_calibration" in app._unlocked_nodes()
-    assert app.echo_relics == 0
+    assert app._track_level("vital_lattice") == 1
+    assert app.echo_relics == 20
     saved = _saved_slot(save_file)
-    assert "aftershock_calibration" in saved["progression"]["unlocked_nodes"]
-    assert saved["echo_relics"] == 0
+    assert saved["progression"]["levels"]["vital_lattice"] == 1
+    assert saved["echo_relics"] == 20
     pygame.quit()
 
 
-def test_nexus_can_activate_multiple_nodes_without_overwriting_progress(
+def test_nexus_tracks_keep_previous_levels_without_being_overwritten(
     monkeypatch, tmp_path
 ):
     save_file = tmp_path / "save.json"
@@ -1164,32 +1068,29 @@ def test_nexus_can_activate_multiple_nodes_without_overwriting_progress(
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
     app.profile = app._new_profile()
-    app.profile["tutorial_completed"] = True
     app.profile["echo_relics"] = 200
 
-    aftershock_index = next(
-        index
-        for index, node in enumerate(main.PROGRESSION_NODES)
-        if node.node_id == "aftershock_calibration"
+    vital = next(
+        position
+        for position, track in enumerate(main.PROGRESSION_TRACKS)
+        if track.track_id == "vital_lattice"
     )
-    white_window_index = next(
-        index
-        for index, node in enumerate(main.PROGRESSION_NODES)
-        if node.node_id == "white_window_record"
+    attack = next(
+        position
+        for position, track in enumerate(main.PROGRESSION_TRACKS)
+        if track.track_id == "edge_tempering"
     )
-    app._activate_progression_node(aftershock_index)
-    app._activate_progression_node(white_window_index)
+    app._upgrade_track(vital)
+    app._upgrade_track(vital)
+    app._upgrade_track(attack)
 
-    assert app._unlocked_nodes() == {
-        "aftershock_calibration",
-        "white_window_record",
-    }
-    assert app.echo_relics == 120
+    levels = app._track_levels()
+    assert levels["vital_lattice"] == 2
+    assert levels["edge_tempering"] == 1
+    assert app.echo_relics == 200 - 20 - 40 - 30
     saved = _saved_slot(save_file)
-    assert set(saved["progression"]["unlocked_nodes"]) == {
-        "aftershock_calibration",
-        "white_window_record",
-    }
+    assert saved["progression"]["levels"]["vital_lattice"] == 2
+    assert saved["progression"]["levels"]["edge_tempering"] == 1
     pygame.quit()
 
 
@@ -1209,65 +1110,71 @@ def test_progression_branches_are_grouped_collapsible_and_directly_clickable(
     visible = app._progression_visible_node_rects()
     assert visible
     assert all(
-        main.PROGRESSION_NODES[index].branch == "锻刃谱系" for index in visible
+        main.PROGRESSION_TRACKS[index].branch == "基元谱系" for index in visible
     )
 
-    branch_rect = app._progression_branch_rects()["锻刃谱系"]
+    branch_rect = app._progression_branch_rects()["基元谱系"]
     app._handle_overlay_click(branch_rect.center)
-    assert app.progression_collapsed["锻刃谱系"] is True
+    assert app.progression_collapsed["基元谱系"] is True
     assert app._progression_visible_node_rects() == {}
 
-    resonance_rect = app._progression_branch_rects()["共鸣谱系"]
-    app._handle_overlay_click(resonance_rect.center)
-    white_window_index = next(
-        index
-        for index, node in enumerate(main.PROGRESSION_NODES)
-        if node.node_id == "white_window_record"
+    mechanism_rect = app._progression_branch_rects()["机制谱系"]
+    app._handle_overlay_click(mechanism_rect.center)
+    dash_index = next(
+        position
+        for position, track in enumerate(main.PROGRESSION_TRACKS)
+        if track.track_id == "shadow_dash"
     )
-    second_root_rect = app._progression_visible_node_rects()[white_window_index]
-    app._handle_overlay_click(second_root_rect.center)
-    assert app.progression_selected == white_window_index
+    dash_rect = app._progression_visible_node_rects()[dash_index]
+    app._handle_overlay_click(dash_rect.center)
+    assert app.progression_selected == dash_index
     app._handle_overlay_click(app._progression_activate_rect().center)
-    assert "white_window_record" in app._unlocked_nodes()
+    assert app._track_level("shadow_dash") == 1
     pygame.quit()
 
 
-def test_new_nexus_nodes_apply_attributes_and_mechanics(monkeypatch, tmp_path):
+def test_new_nexus_tracks_apply_attributes_and_mechanics(monkeypatch, tmp_path):
+    """技能树分支要真正作用到本局：数值、动作解锁、自动恢复与铸币。"""
     monkeypatch.setattr(main, "SAVE_FILE", tmp_path / "save.json")
     pygame.init()
     screen = pygame.display.set_mode((1280, 720))
     app = StartScreen(screen)
     app.profile = app._new_profile()
-    app.profile["progression"] = {
-        "unlocked_nodes": [
-            "edge_tempering",
-            "execution_resonance",
-            "aerial_memory",
-            "resonant_reservoir",
-            "vital_lattice",
-            "salvage_protocol",
-        ],
-        "equipped_start_module": None,
+    app.profile["progression"]["levels"] = {
+        "vital_lattice": 1,
+        "edge_tempering": 2,
+        "resonance_amplifier": 5,
+        "aerial_memory": 1,
+        "shadow_dash": 1,
+        "reserve_carry": 2,
+        "salvage_protocol": 1,
+        "vital_regeneration": 2,
+        "resonance_reflux": 1,
     }
 
     app._start_run(1, tutorial=False)
 
-    assert app.player.max_hp == 320 + main.NEXUS_HP_BONUS
-    assert app.player.attack_bonus == main.NEXUS_ATTACK_BONUS
+    assert app.player.max_hp == 320 + 100
+    assert app.player.attack_bonus == 10
     assert app.player.max_air_jumps == 1
-    assert app.echo_energy == main.RESONANT_START_ENERGY
+    assert app.player.dash_unlocked is True
+    assert app.run_currency == 10
+    assert app.skill_damage_scale == 1.5
+    assert app.auto_heal_per_second == 6
+    assert app.auto_energy_per_second == 1
 
-    app.player.hp = app.player.max_hp - 100
-    first = Chaser(300, 522)
-    second = Chaser(400, 522)
-    app._award_enemy_defeat(first)
-    hp_after_first = app.player.hp
-    assert hp_after_first > app.player.max_hp - 100
-    assert app.run_currency == 9
+    # 战利议价 +5%：追击者基础 6 铸币 → 7
+    app._award_enemy_defeat(Chaser(300, 522))
+    assert app.run_currency == 17
+    assert app.run_kills == 1
 
-    app._award_enemy_defeat(second)
-    assert app.player.hp == hp_after_first
-    assert app.run_currency == 18
+    # 自动回复：每秒 6 点生命与 1 点回响能量
+    app._dismiss_floor_intro()
+    app.player.hp = 100
+    app.echo_energy = 0
+    _advance(app, 1.02)
+    assert app.player.hp == 106
+    assert app.echo_energy == 1
     pygame.quit()
 
 
@@ -1383,6 +1290,7 @@ def test_music_switches_between_lobby_and_level(monkeypatch, tmp_path):
 
 def test_combat_actions_emit_expected_sfx(monkeypatch, tmp_path):
     app, recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _grant_tracks(app, shadow_dash=1)
     app._start_run(1, tutorial=False)
     app._dismiss_floor_intro()
 
@@ -1671,6 +1579,7 @@ def test_player_and_enemies_move_across_the_whole_screen(monkeypatch, tmp_path):
 
 def test_dash_has_cooldown_and_grants_invulnerability(monkeypatch, tmp_path):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _grant_tracks(app, shadow_dash=1)
     app._start_run(1, tutorial=False)
     player = app.player
     enemy = Chaser(player.x + 40, 522)
@@ -1708,6 +1617,7 @@ def test_dash_has_cooldown_and_grants_invulnerability(monkeypatch, tmp_path):
 
 def test_dash_leaves_afterimages_that_fade(monkeypatch, tmp_path):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _grant_tracks(app, shadow_dash=1)
     app._start_run(1, tutorial=False)
     player = app.player
 
@@ -2107,6 +2017,7 @@ def test_unparried_memory_sever_ignores_dash_and_removes_most_health(
     monkeypatch, tmp_path
 ):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _grant_tracks(app, shadow_dash=1)
     _enter_level(app, floor=5)
     boss = app.room_enemies[0]
     profile = boss.scaled_attack(boss.execution_profile)
@@ -2139,7 +2050,8 @@ def test_parrying_memory_sever_stuns_boss_and_breaks_defense_for_three_seconds(
     assert boss.vulnerable is True
     assert boss.defense_broken is True
     broken_damage = boss.take_damage(100, source_x=app.player.x)
-    assert boss.update(2.9, app.player.position).action == "vulnerable"
+    boss.update(0.5, app.player.position)  # 先让弹刀击退的滑行走完
+    assert boss.update(2.4, app.player.position).action == "vulnerable"
     assert boss.defense_broken is True
     boss.update(0.2, app.player.position)
     assert boss.vulnerable is False
@@ -2165,7 +2077,65 @@ def test_fifth_floor_portal_finishes_first_stage(monkeypatch, tmp_path):
     assert app._portal_choice_labels()[1] == "完成阶段并返回大厅"
     app._open_portal_choice()
     app._activate_portal_choice(1)
+    assert app.page == "result"
+    app._activate_page_button("lobby")
     assert app.page == "lobby"
+    pygame.quit()
+
+
+def test_unlocking_dash_is_required_before_it_can_be_used(monkeypatch, tmp_path):
+    """闪避属于机制谱系：没点亮之前按冲刺键不会有反应。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    _enter_level(app)
+
+    assert app.player.dash_unlocked is False
+    app._handle_key(app.keybinds["dash"])
+    assert app.player.dash_active is False
+
+    app._enter_lobby()
+    _grant_tracks(app, shadow_dash=1)
+    _start_expedition(app)
+    app._dismiss_floor_intro()
+
+    assert app.player.dash_unlocked is True
+    app._handle_key(app.keybinds["dash"])
+    assert app.player.dash_active is True
+    pygame.quit()
+
+
+def test_risk_covenant_unlocks_a_hard_mode_choice_before_the_run(
+    monkeypatch, tmp_path
+):
+    """点亮风险契约后，开局前可以选择高压远征：敌人更强、遗晶更多。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    _grant_tracks(app, risk_covenant=1)
+    app._enter_lobby()
+
+    app._activate_lobby_action(0)
+    assert app.overlay == "difficulty"
+    assert app.transition is None
+    app._draw()
+
+    app._confirm_difficulty(1)
+    _advance(app, 1.6)
+
+    assert app.page == "game"
+    assert app.transition is None
+    assert app.run_difficulty_hard is True
+    assert app.run_threat > app._floor_threat(1)
+    assert app._active_run_checkpoint()["hard_mode"] is True
+
+    # 结算时高压远征按倍率发放遗晶
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    app.wave_plan = []
+    app.wave_index = 0
+    relics = app._settle_run()
+    base = 30 + app.run_floor * 10 + min(app.run_parries * 2, 30)
+    assert relics == round(base * main.DIFFICULTY_RELIC_MULTIPLIER)
     pygame.quit()
 
 
@@ -2572,7 +2542,8 @@ def test_new_save_resets_progress_and_restarts_the_tutorial(monkeypatch, tmp_pat
     app.save_slots[0]["best_floor"] = 3
     app.save_slots[0]["echo_relics"] = 500
     app.save_slots[0]["progression"] = {
-        "unlocked_nodes": ["white_window_record"],
+        "version": 2,
+        "levels": {"vital_lattice": 3},
         "equipped_start_module": None,
     }
     app._activate_slot(0)
@@ -2590,7 +2561,7 @@ def test_new_save_resets_progress_and_restarts_the_tutorial(monkeypatch, tmp_pat
 
     assert app.tutorial_completed is False
     assert app.echo_relics == 0
-    assert app._unlocked_nodes() == set()
+    assert all(level == 0 for level in app._track_levels().values())
     assert app.profile["best_floor"] == 0
     assert app.is_tutorial_run is True
     assert app.run_floor == 1
@@ -2711,10 +2682,12 @@ def test_legacy_single_profile_save_migrates_into_the_first_slot(monkeypatch, tm
     app = StartScreen(screen)
 
     assert app.save_slots[0] is not None
-    assert app.save_slots[0]["echo_relics"] == 150
+    # 旧节点里没有对应新分支的「白窗记录」按原价 40 返还，150 + 40 = 190
+    assert app.save_slots[0]["echo_relics"] == 190
     assert app.save_slots[0]["best_floor"] == 2
-    # 旧存档没有远征起点字段：用最高层兜底，别把进度打回第一层
-    assert app.save_slots[0]["progress_floor"] == 2
+    # 旧的一次性节点被折叠成分级分支：白窗记录没有对应分支，只返还遗晶
+    assert app.save_slots[0]["progression"]["version"] == 2
+    assert app.save_slots[0]["progression"]["levels"]["vital_lattice"] == 0
     assert app.save_slots[0]["tutorial_completed"] is True
     assert all(slot is None for slot in app.save_slots[1:])
     assert app.settings["volume"] == 60

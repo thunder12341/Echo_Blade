@@ -94,6 +94,11 @@ class Player:
         self.landed_this_frame = False
         self.max_air_jumps = 0
         self._air_jumps_remaining = 0
+        # 闪避需要通过回响中枢解锁（教学关内始终可用）
+        self.dash_unlocked = False
+        # 受击闪烁：被打中后短暂泛白，提示玩家确实吃到了伤害
+        self.hurt_flash = 0.0
+        self.HURT_FLASH_TIME = 0.24
 
         self._coyote_timer = self.COYOTE_TIME
         self._jump_buffer_timer = 0.0
@@ -307,6 +312,8 @@ class Player:
         return True
 
     def dash(self) -> bool:
+        if not self.dash_unlocked:
+            return False
         if self._dash_cooldown > 0.0 or self.parry_active or self.skill_active:
             return False
         self._dash_cooldown = self.DASH_COOLDOWN
@@ -353,6 +360,8 @@ class Player:
             return 0
         actual_damage = max(0, int(round(amount)))
         self.hp = max(0, self.hp - actual_damage)
+        if actual_damage > 0:
+            self.hurt_flash = self.HURT_FLASH_TIME
         return actual_damage
 
     def heal(self, amount: int) -> int:
@@ -365,6 +374,7 @@ class Player:
 
     def _update_timers(self, dt: float) -> None:
         self._dash_cooldown = max(0.0, self._dash_cooldown - dt)
+        self.hurt_flash = max(0.0, self.hurt_flash - dt)
         self._parry_buffer = max(0.0, self._parry_buffer - dt)
         if self._dash_elapsed >= 0.0:
             self._dash_elapsed += dt

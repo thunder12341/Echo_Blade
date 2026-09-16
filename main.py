@@ -64,12 +64,10 @@ PORTAL_RETRIGGER_LOCK = 0.6
 HP_PER_LEVEL = 26
 ATTACK_PER_LEVEL = 3
 
-# -- 回响中枢节点效果 -------------------------------------------------------
-NEXUS_HP_BONUS = 40
-NEXUS_ATTACK_BONUS = 3
-EXECUTION_HEAL_RATIO = 0.08
-RESONANT_START_ENERGY = 20
-SALVAGE_CURRENCY_MULTIPLIER = 1.5
+# -- 回响中枢 ---------------------------------------------------------------
+# 每个存档的成长拓扑不会因为战斗失败而重置，只有新建/覆盖存档才会清空
+DIFFICULTY_THREAT_BONUS = 0.35
+DIFFICULTY_RELIC_MULTIPLIER = 1.5
 
 # -- 回响能量 ---------------------------------------------------------------
 # 每一层开局清零；普通攻击 < 上劈/下劈 < 击败敌人 = 完美弹刀
@@ -94,6 +92,10 @@ SKILL_WAVE_HALF_WIDTH = 22.0
 SKILL_WAVE_THICKNESS = 26.0
 SKILL_KNOCKBACK_SPEED = 430.0
 SKILL_KNOCKBACK_LIFT = 470.0
+
+# -- 战斗表现 ---------------------------------------------------------------
+# 敌人被击败后的倒地淡出时长
+DEATH_FADE_TIME = 1.1
 
 # -- 关卡难度 ---------------------------------------------------------------
 # 每往下一层，敌人的生命与伤害同步提高
@@ -172,6 +174,18 @@ class DashTrail:
 
 
 @dataclass
+class DeathFade:
+    """被击败的敌人：先倒下再慢慢淡出，而不是立刻从画面消失。"""
+
+    kind: str
+    x: float
+    y: float
+    facing: int
+    remaining: float
+    total: float
+
+
+@dataclass
 class ReflectedProjectile:
     """被弹开的子弹：飞回射击者的途中，命中后才结算伤害。"""
 
@@ -239,7 +253,22 @@ class ShopItem:
     description: str
 
 
-PROGRESSION_NODES = (
+@dataclass(frozen=True)
+class ProgressionTrack:
+    """成长拓扑里的一条小分支：逐级提升，每级都有独立消耗。"""
+
+    track_id: str
+    branch: str
+    title: str
+    effect: str
+    values: tuple[float, ...]
+    costs: tuple[int, ...]
+    unit: str = ""
+
+
+# 旧版一次性节点表：仅用于把老存档的铭刻进度迁移成新的分级分支，并在
+# 旧节点已被新拓扑移除时按原价返还回响遗晶。
+LEGACY_PROGRESSION_NODES = (
     ProgressionNode(
         "aftershock_calibration",
         "锻刃谱系",
@@ -386,12 +415,118 @@ PROGRESSION_NODES = (
     ),
 )
 
+LEGACY_NODE_COSTS = {node.node_id: node.cost for node in LEGACY_PROGRESSION_NODES}
+
+
 PROGRESSION_BRANCHES = (
-    "锻刃谱系",
-    "共鸣谱系",
-    "远征谱系",
-    "终局节点",
+    "基元谱系",
+    "机制谱系",
+    "铸币谱系",
 )
+
+# 成长拓扑：三条谱系各自包含若干分级分支，每级消耗与收益都写在分支上。
+PROGRESSION_TRACKS = (
+    # -- 基元谱系：直接提升基础数值 ---------------------------------------
+    ProgressionTrack(
+        "vital_lattice",
+        "基元谱系",
+        "生命晶格",
+        "每局生命上限提高 {value} 点。",
+        (100, 200, 300, 400, 500),
+        (20, 40, 80, 160, 320),
+        "点生命",
+    ),
+    ProgressionTrack(
+        "edge_tempering",
+        "基元谱系",
+        "锋刃淬炼",
+        "每局攻击力提高 {value} 点。",
+        (5, 10, 15, 20, 25),
+        (30, 60, 120, 240, 480),
+        "点攻击",
+    ),
+    ProgressionTrack(
+        "resonance_amplifier",
+        "基元谱系",
+        "谐振增幅",
+        "回响剑气伤害提高 {value}%。",
+        (10, 20, 30, 40, 50),
+        (30, 60, 120, 240, 480),
+        "% 剑气伤害",
+    ),
+    # -- 机制谱系：解锁动作与自动恢复 -------------------------------------
+    ProgressionTrack(
+        "shadow_dash",
+        "机制谱系",
+        "疾影闪避",
+        "解锁闪避冲刺：瞬间位移并获得短暂无敌。",
+        (1,),
+        (60,),
+    ),
+    ProgressionTrack(
+        "aerial_memory",
+        "机制谱系",
+        "凌空复写",
+        "解锁二段跳：滞空时可以再跳一次。",
+        (1,),
+        (80,),
+    ),
+    ProgressionTrack(
+        "vital_regeneration",
+        "机制谱系",
+        "生命自愈",
+        "战斗中每秒恢复 {value} 点生命。",
+        (3, 6, 9, 12, 15),
+        (50, 90, 150, 230, 340),
+        "点/秒",
+    ),
+    ProgressionTrack(
+        "resonance_reflux",
+        "机制谱系",
+        "谐振回流",
+        "战斗中每秒恢复 {value} 点回响能量。",
+        (1, 2, 3, 4, 5),
+        (60, 110, 180, 260, 360),
+        "点/秒",
+    ),
+    # -- 铸币谱系：战时铸币与难度抉择 -------------------------------------
+    ProgressionTrack(
+        "reserve_carry",
+        "铸币谱系",
+        "开局行囊",
+        "每局开局获得 {value} 枚战时铸币。",
+        (5, 10, 15, 20, 25),
+        (30, 60, 110, 180, 260),
+        "枚铸币",
+    ),
+    ProgressionTrack(
+        "salvage_protocol",
+        "铸币谱系",
+        "战利议价",
+        "击败敌人获得的战时铸币提高 {value}%。",
+        (5, 10, 15, 20, 25),
+        (30, 60, 110, 180, 260),
+        "% 铸币",
+    ),
+    ProgressionTrack(
+        "risk_covenant",
+        "铸币谱系",
+        "风险契约",
+        "开局前可选择「高压远征」：敌人更强，但回响遗晶收益更高。",
+        (1,),
+        (120,),
+    ),
+)
+
+# 旧节点 → 新分支的对应关系；不在表里的旧节点会被移除并返还遗晶。
+LEGACY_NODE_TRACKS = {
+    "vital_lattice": "vital_lattice",
+    "edge_tempering": "edge_tempering",
+    "aerial_memory": "aerial_memory",
+    "reserve_carry": "reserve_carry",
+    "salvage_protocol": "salvage_protocol",
+    "risk_covenant": "risk_covenant",
+}
 
 
 # 第一阶段前三层为三波常规战，第五层为区域首领战。
@@ -520,6 +655,9 @@ class AssetStore:
         self.panel = self._load("menu_panel.png")
         self.cursor = self._load("menu_cursor.png")
         self.spark = self._load("parry_spark.png")
+        # 大厅三个入口各用一张独立图标：中枢、城门与排行不再共用同一张图
+        self.room_gate = self._load_optional("room_gate.png")
+        self.echo_shard = self._load_optional("echo_shard.png")
         self.player_sprites = {
             name: self._load_optional(filename)
             for name, filename in {
@@ -653,11 +791,12 @@ class StartScreen:
             0,
         )
 
-        self.run_floor = self._progress_floor()
+        self.run_floor = 1
         self.run_score = 0
         self.run_combo = 0
         self.run_max_combo = 0
         self.run_parries = 0
+        self.run_kills = 0
         self.run_currency = 0
         self.run_shop_attack_bonus = 0
         self.run_shop_hp_bonus = 0
@@ -667,7 +806,9 @@ class StartScreen:
         self.player = Player(230, 566)
         self._attack_hits: set[tuple[int, int]] = set()
         self._defeated_enemies: set[int] = set()
-        self._execution_heal_used = False
+        self.death_fades: list[DeathFade] = []
+        self._death_fade_ids: set[int] = set()
+        self._flash_cache: dict[tuple[str, int], pygame.Surface] = {}
         self.room_enemies: list[Enemy] = []
         self.pending_enemy_attacks: list[PendingEnemyAttack] = []
         self.attack_impacts: list[AttackImpact] = []
@@ -695,8 +836,21 @@ class StartScreen:
         self.portal_enter_timer = 0.0
         self.portal_lock_timer = 0.0
         self.portal_choice_index = 0
+        # 进入关卡的过场动画：漩涡 → 黑屏 → 圆形展开
+        self.transition: dict | None = None
+        # 风险契约：本局是否选择了「高压远征」
+        self.run_difficulty_hard = False
+        self.difficulty_selected = 0
+        # 本局成长数值：技能树提供的开局加成与自动恢复
+        self.skill_damage_scale = 1.0
+        self.auto_heal_per_second = 0.0
+        self.auto_energy_per_second = 0.0
+        self._auto_heal_pool = 0.0
+        self._auto_energy_pool = 0.0
+        self.run_kills = 0
         self.result_score = 0
         self.result_new_record = False
+        self.result_cleared = False
         self.result_relics = 0
         self.result_relic_breakdown: list[tuple[str, int]] = []
 
@@ -745,28 +899,17 @@ class StartScreen:
             "version": 2,
             "best_score": 0,
             "best_floor": 0,
-            "progress_floor": 1,
             "scores": [],
             "tutorial_completed": False,
             "echo_relics": 0,
-            "progression": {"unlocked_nodes": [], "equipped_start_module": None},
+            "progression": {
+                "version": 2,
+                "levels": {},
+                "equipped_start_module": None,
+            },
             "lifetime_stats": {},
             "active_run": None,
-            "retry_run": None,
         }
-
-    @staticmethod
-    def _progress_floor_of(profile: dict) -> int:
-        """远征起点：下次从大厅出发时要打的层数。"""
-        raw = profile.get("progress_floor")
-        if raw is None:
-            # 旧存档没有这个字段：用历史最高层兜底，避免已有进度被打回第一层
-            raw = profile.get("best_floor")
-        try:
-            floor = int(raw or 1)
-        except (TypeError, ValueError):
-            floor = 1
-        return max(1, min(BOSS_FLOOR, floor))
 
     @staticmethod
     def _normalise_run_checkpoint(data: object) -> dict | None:
@@ -812,39 +955,7 @@ class StartScreen:
                 }
             ),
             "shop_closed": bool(data.get("shop_closed", floor != SHOP_FLOOR)),
-        }
-
-    @staticmethod
-    def _normalise_retry_run(data: object) -> dict | None:
-        """失败后留下的续战记录：重打同一层时接着用这套成长。"""
-        if not isinstance(data, dict):
-            return None
-
-        def number(name: str, default: int, lower: int, upper: int) -> int:
-            try:
-                value = int(data.get(name, default) or 0)
-            except (TypeError, ValueError):
-                value = default
-            return max(lower, min(upper, value))
-
-        purchased = data.get("shop_purchased", [])
-        valid_shop_items = {item.item_id for item in SHOP_ITEMS}
-        if not isinstance(purchased, list):
-            purchased = []
-        return {
-            "floor": number("floor", 1, 1, BOSS_FLOOR),
-            "player_level": number("player_level", 1, 1, 999),
-            "player_exp": number("player_exp", 0, 0, 999999),
-            "run_currency": number("run_currency", 0, 0, 999999),
-            "shop_attack_bonus": number("shop_attack_bonus", 0, 0, 9999),
-            "shop_hp_bonus": number("shop_hp_bonus", 0, 0, 99999),
-            "shop_purchased": sorted(
-                {
-                    item_id
-                    for item_id in purchased
-                    if isinstance(item_id, str) and item_id in valid_shop_items
-                }
-            ),
+            "hard_mode": bool(data.get("hard_mode", False)),
         }
 
     @staticmethod
@@ -863,20 +974,18 @@ class StartScreen:
         profile["echo_relics"] = max(0, echoes)
         if not isinstance(profile.get("progression"), dict):
             profile["progression"] = {
-                "unlocked_nodes": [],
+                "version": 2,
+                "levels": {},
                 "equipped_start_module": None,
             }
         if not isinstance(profile.get("lifetime_stats"), dict):
             profile["lifetime_stats"] = {}
         if not isinstance(profile.get("scores"), list):
             profile["scores"] = []
-        profile["progress_floor"] = StartScreen._progress_floor_of(profile)
         profile["active_run"] = StartScreen._normalise_run_checkpoint(
             profile.get("active_run")
         )
-        profile["retry_run"] = StartScreen._normalise_retry_run(
-            profile.get("retry_run")
-        )
+        profile["progression"] = StartScreen._migrate_progression(profile)
         return profile
 
     def _load_store(self) -> dict:
@@ -903,7 +1012,6 @@ class StartScreen:
         for key in (
             "best_score",
             "best_floor",
-            "progress_floor",
             "scores",
             "tutorial_completed",
             "echo_relics",
@@ -913,9 +1021,6 @@ class StartScreen:
         ):
             if key in self.save_store:
                 profile[key] = self.save_store[key]
-        if "progress_floor" not in self.save_store:
-            # 旧格式没有远征起点：交给 _normalise_profile 用最高层兜底
-            profile.pop("progress_floor", None)
         return self._normalise_profile(profile)
 
     def _load_slots(self) -> list[dict | None]:
@@ -947,11 +1052,75 @@ class StartScreen:
         progression = self.profile.get("progression", {})
         return progression if isinstance(progression, dict) else {}
 
-    def _unlocked_nodes(self) -> set[str]:
-        unlocked = self._progression().get("unlocked_nodes", [])
-        if not isinstance(unlocked, list):
-            return set()
-        return {node_id for node_id in unlocked if isinstance(node_id, str)}
+    @staticmethod
+    def _migrate_progression(profile: dict) -> dict:
+        """把旧版一次性节点折叠成新拓扑的分级进度。"""
+        raw = profile.get("progression")
+        progression = raw if isinstance(raw, dict) else {}
+        legacy_version = int(progression.get("version", 1) or 1)
+
+        levels: dict[str, int] = {}
+        stored = progression.get("levels")
+        for track in PROGRESSION_TRACKS:
+            value = 0
+            if isinstance(stored, dict):
+                try:
+                    value = int(stored.get(track.track_id, 0) or 0)
+                except (TypeError, ValueError):
+                    value = 0
+            levels[track.track_id] = max(0, min(len(track.values), value))
+
+        refund = 0
+        legacy_nodes = progression.get("unlocked_nodes")
+        if legacy_version < 2 and isinstance(legacy_nodes, list):
+            for node_id in legacy_nodes:
+                if not isinstance(node_id, str):
+                    continue
+                track_id = LEGACY_NODE_TRACKS.get(node_id)
+                if track_id is None:
+                    refund += LEGACY_NODE_COSTS.get(node_id, 0)
+                    continue
+                levels[track_id] = max(1, levels.get(track_id, 0))
+            if refund:
+                # 被移除的旧节点按原价返还，避免玩家的遗晶凭空消失
+                current = int(profile.get("echo_relics", 0) or 0)
+                profile["echo_relics"] = max(0, current) + refund
+
+        return {
+            "version": 2,
+            "levels": levels,
+            "equipped_start_module": progression.get("equipped_start_module"),
+            "migration_refund": refund,
+        }
+
+    def _track_levels(self) -> dict[str, int]:
+        levels = self._progression().get("levels")
+        if not isinstance(levels, dict):
+            return {}
+        result: dict[str, int] = {}
+        for track in PROGRESSION_TRACKS:
+            try:
+                result[track.track_id] = int(levels.get(track.track_id, 0) or 0)
+            except (TypeError, ValueError):
+                result[track.track_id] = 0
+        return result
+
+    def _track_level(self, track_id: str) -> int:
+        return self._track_levels().get(track_id, 0)
+
+    def _track_value(self, track_id: str, level: int | None = None) -> float:
+        """分支在当前等级下的数值；没点过就是 0。"""
+        for track in PROGRESSION_TRACKS:
+            if track.track_id != track_id:
+                continue
+            current = self._track_level(track_id) if level is None else level
+            if current <= 0:
+                return 0.0
+            return float(track.values[min(current, len(track.values)) - 1])
+        return 0.0
+
+    def _track_unlocked(self, track_id: str) -> bool:
+        return self._track_level(track_id) > 0
 
     def _stat(self, name: str) -> int:
         stats = self.profile.get("lifetime_stats", {})
@@ -961,61 +1130,6 @@ class StartScreen:
 
     def _active_run_checkpoint(self) -> dict | None:
         return self._normalise_run_checkpoint(self.profile.get("active_run"))
-
-    def _progress_floor(self) -> int:
-        """当前存档位的远征起点：下次从大厅出发时要打的层数。"""
-        return self._progress_floor_of(self.profile)
-
-    @staticmethod
-    def _live_checkpoint(profile: dict) -> dict | None:
-        """有效、且不低于远征起点的暂存进度；低于起点的旧记录视为过期。"""
-        checkpoint = StartScreen._normalise_run_checkpoint(profile.get("active_run"))
-        if checkpoint is None:
-            return None
-        if checkpoint["floor"] < StartScreen._progress_floor_of(profile):
-            return None
-        return checkpoint
-
-    def _pending_checkpoint(self) -> dict | None:
-        return self._live_checkpoint(self.profile)
-
-    def _retry_growth_matching(self, floor: int) -> dict | None:
-        """取出该层的失败续战记录；层数对不上就当过期丢掉。"""
-        growth = self._normalise_retry_run(self.profile.get("retry_run"))
-        if growth is None or growth["floor"] != floor:
-            return None
-        return growth
-
-    def _apply_retry_growth(self, growth: dict) -> None:
-        """把上一局失败时留下的等级与资源接回来，重打不用从头练。"""
-        self.player_level = growth["player_level"]
-        self.player_exp = min(growth["player_exp"], self.exp_to_next - 1)
-        self.run_currency = growth["run_currency"]
-        self.run_shop_attack_bonus = growth["shop_attack_bonus"]
-        self.run_shop_hp_bonus = growth["shop_hp_bonus"]
-        self.shop_purchased = set(growth["shop_purchased"])
-        gained_levels = max(0, self.player_level - 1)
-        self.player.max_hp += self.run_shop_hp_bonus + gained_levels * HP_PER_LEVEL
-        self.player.attack_bonus += (
-            self.run_shop_attack_bonus + gained_levels * ATTACK_PER_LEVEL
-        )
-        self.player.hp = self.player.max_hp
-
-    def _remember_retry_growth(self) -> None:
-        """失败时把本局成长写进续战记录，供下次重打同一层使用。"""
-        self.profile["retry_run"] = {
-            "floor": self.run_floor,
-            "player_level": self.player_level,
-            "player_exp": self.player_exp,
-            "run_currency": self.run_currency,
-            "shop_attack_bonus": self.run_shop_attack_bonus,
-            "shop_hp_bonus": self.run_shop_hp_bonus,
-            "shop_purchased": sorted(self.shop_purchased),
-        }
-
-    def _set_progress_floor(self, floor: int) -> None:
-        """记录远征起点；下发层只停留在第一阶段的末层，不会继续外推。"""
-        self.profile["progress_floor"] = max(1, min(BOSS_FLOOR, int(floor)))
 
     def _build_run_checkpoint(self) -> dict:
         return {
@@ -1035,6 +1149,7 @@ class StartScreen:
             "shop_hp_bonus": self.run_shop_hp_bonus,
             "shop_purchased": sorted(self.shop_purchased),
             "shop_closed": self.shop_closed,
+            "hard_mode": self.run_difficulty_hard,
         }
 
     def _save_run_checkpoint(self) -> None:
@@ -1064,6 +1179,10 @@ class StartScreen:
         self.run_shop_hp_bonus = saved["shop_hp_bonus"]
         self.shop_purchased = set(saved["shop_purchased"])
         self.shop_closed = saved["shop_closed"] if self.run_floor == SHOP_FLOOR else True
+        self.run_difficulty_hard = saved["hard_mode"]
+        self.run_threat = self._floor_threat(self.run_floor) + (
+            DIFFICULTY_THREAT_BONUS if self.run_difficulty_hard else 0.0
+        )
 
         gained_levels = max(0, self.player_level - 1)
         self.player.max_hp += self.run_shop_hp_bonus + gained_levels * HP_PER_LEVEL
@@ -1076,29 +1195,15 @@ class StartScreen:
         return True
 
     def _start_or_resume_expedition(self) -> None:
-        checkpoint = self._pending_checkpoint()
+        checkpoint = self._active_run_checkpoint()
         if checkpoint is not None and self._resume_run_checkpoint(checkpoint):
             self._notify(f"已读取暂存进度：从第 {self.run_floor} 层继续远征")
             return
-        stale = self._active_run_checkpoint() is not None
-        start_floor = self._progress_floor()
-        growth = self._retry_growth_matching(start_floor)
+        # 一局 = 从第一层打到失败或通关，所以新远征永远从第一层开始
         self._clear_run_checkpoint()
-        self._start_run(start_floor, tutorial=False)
-        if growth is not None:
-            self._apply_retry_growth(growth)
+        self._start_run(1, tutorial=False)
         self._save_run_checkpoint()
-        if growth is not None:
-            self._notify(
-                f"继续挑战第 {start_floor} 层  ·  保留 Lv.{self.player_level} "
-                f"与战时铸币 {self.run_currency}"
-            )
-        elif stale:
-            self._notify(f"旧暂存低于远征起点，改从第 {start_floor} 层重新开始")
-        elif start_floor > 1:
-            self._notify(f"未发现暂存进度：从第 {start_floor} 层重新挑战")
-        else:
-            self._notify("未发现暂存进度：从第一层第一关开始新远征")
+        self._notify("未发现暂存进度：从第一层第一关开始新远征")
 
     @staticmethod
     def _default_keybinds() -> dict[str, int]:
@@ -1131,7 +1236,6 @@ class StartScreen:
             "version": 2,
             "best_score": int(self.profile.get("best_score", 0) or 0),
             "best_floor": int(self.profile.get("best_floor", 0) or 0),
-            "progress_floor": self._progress_floor(),
             "scores": self.profile.get("scores", []),
             "tutorial_completed": bool(
                 self.profile.get("tutorial_completed", False)
@@ -1142,7 +1246,6 @@ class StartScreen:
             "active_run": self._normalise_run_checkpoint(
                 self.profile.get("active_run")
             ),
-            "retry_run": self._normalise_retry_run(self.profile.get("retry_run")),
         }
 
     def _write_store(self) -> None:
@@ -1364,7 +1467,16 @@ class StartScreen:
             elif key in (pygame.K_RIGHT, pygame.K_d):
                 self._switch_progression_branch(1)
             elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
-                self._activate_progression_node(self.progression_selected)
+                self._upgrade_track(self.progression_selected)
+            return
+
+        if self.overlay == "difficulty":
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self._close_overlay()
+            elif key in (pygame.K_LEFT, pygame.K_a, pygame.K_RIGHT, pygame.K_d):
+                self.difficulty_selected = 1 - self.difficulty_selected
+            elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
+                self._confirm_difficulty(self.difficulty_selected)
             return
 
         if self.overlay == "shop":
@@ -1430,10 +1542,13 @@ class StartScreen:
             return
 
         if self.page == "result":
-            if key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
-                self._activate_page_button("restart")
-            elif key == pygame.K_ESCAPE:
-                self.page = "menu"
+            if key in (
+                pygame.K_RETURN,
+                pygame.K_SPACE,
+                pygame.K_j,
+                pygame.K_ESCAPE,
+            ):
+                self._activate_page_button("lobby")
             return
 
         if self.page == "failure":
@@ -1490,6 +1605,12 @@ class StartScreen:
             for index, rect in self._progression_visible_node_rects().items():
                 if rect.collidepoint(logical):
                     self.progression_selected = index
+                    return
+        if self.overlay == "difficulty":
+            logical = self._to_logical(position)
+            for index, rect in enumerate(self._difficulty_rects()):
+                if rect.collidepoint(logical):
+                    self.difficulty_selected = index
                     return
         if self.overlay == "shop":
             logical = self._to_logical(position)
@@ -1565,21 +1686,17 @@ class StartScreen:
             self._open_overlay("settings")
 
     def _lobby_actions(self) -> list[tuple[str, str, pygame.Rect]]:
-        checkpoint = self._pending_checkpoint()
-        if checkpoint is not None:
-            gate_label = f"继续远征 · 第 {checkpoint['floor']} 层"
-        else:
-            start_floor = self._progress_floor()
-            gate_label = (
-                f"开启新远征 · 第 {start_floor} 层"
-                if start_floor > 1
-                else "开启新远征"
-            )
+        checkpoint = self._active_run_checkpoint()
+        gate_label = (
+            f"继续远征 · 第 {checkpoint['floor']} 层"
+            if checkpoint is not None
+            else "开启新远征"
+        )
+        # 中间是远征城门，左侧回响中枢，右侧远征排行
         return [
-            ("gate", gate_label, pygame.Rect(490, 414, 300, 72)),
-            ("nexus", "进入回响中枢", pygame.Rect(485, 196, 310, 100)),
-            ("smith", "铸刃师", pygame.Rect(78, 420, 260, 86)),
-            ("records", "查看远征记录", pygame.Rect(920, 420, 280, 86)),
+            ("gate", gate_label, pygame.Rect(500, 250, 280, 330)),
+            ("nexus", "回响中枢", pygame.Rect(150, 320, 240, 260)),
+            ("records", "远征排行", pygame.Rect(890, 320, 240, 260)),
         ]
 
     def _enter_lobby(self) -> None:
@@ -1587,6 +1704,7 @@ class StartScreen:
         self.overlay = None
         self.confirm_exit = False
         self.lobby_selected = 0
+        self.transition = None
         self.run_currency = 0
         self._notify("灰塔大厅已就绪")
 
@@ -1609,18 +1727,18 @@ class StartScreen:
     @staticmethod
     def _slot_summary(profile: dict) -> str:
         progression = profile.get("progression", {})
+        levels = progression.get("levels", {}) if isinstance(progression, dict) else {}
         unlocked = (
-            len(progression.get("unlocked_nodes", []))
-            if isinstance(progression, dict)
-            and isinstance(progression.get("unlocked_nodes"), list)
+            sum(int(value or 0) for value in levels.values())
+            if isinstance(levels, dict)
             else 0
         )
         tutorial = "已完成教学" if profile.get("tutorial_completed") else "未完成教学"
-        checkpoint = StartScreen._live_checkpoint(profile)
+        checkpoint = StartScreen._normalise_run_checkpoint(profile.get("active_run"))
         run_state = (
             f"暂存第 {checkpoint['floor']} 层"
             if checkpoint is not None
-            else f"远征起点 第 {StartScreen._progress_floor_of(profile)} 层"
+            else "无暂存远征"
         )
         return (
             f"最高层 {int(profile.get('best_floor', 0) or 0)}   "
@@ -1683,91 +1801,63 @@ class StartScreen:
             return
         action = actions[index][0]
         if action == "gate":
-            self._start_or_resume_expedition()
+            checkpoint = self._active_run_checkpoint()
+            if checkpoint is None and self._track_unlocked("risk_covenant"):
+                # 点亮风险契约后，每次新远征前都能选择是否提高难度
+                self.difficulty_selected = 0
+                self._open_overlay("difficulty", return_page="lobby")
+            else:
+                self._begin_expedition_transition()
         elif action == "nexus":
             self._open_overlay("progression", return_page="lobby")
-        elif action == "smith":
-            self._notify("铸刃师：武装谱系将在后续版本接入")
         elif action == "records":
             self._open_overlay("leaderboard", return_page="lobby")
 
-    def _node_requirement_met(self, node: ProgressionNode) -> bool:
-        if node.node_id in {"aftershock_calibration", "white_window_record"}:
-            return self.tutorial_completed
-        if node.node_id in {"edge_tempering", "vital_lattice"}:
-            return self._stat("settlements") >= 2
-        if node.node_id == "refracted_afterglow":
-            return self._stat("parries") >= 3
-        if node.node_id == "execution_resonance":
-            return self._stat("best_combo") >= 12
-        if node.node_id == "twin_blade_license":
-            return self._stat("boss_kills") >= 1
-        if node.node_id == "aerial_memory":
-            return int(self.profile.get("best_floor", 0) or 0) >= 2
-        if node.node_id == "perfect_circuit":
-            return self._stat("parries") >= 20
-        if node.node_id == "resonant_reservoir":
-            return self._stat("settlements") >= 3
-        if node.node_id == "resonance_protocol":
-            return self._stat("reflections") >= 10
-        if node.node_id == "route_cartography":
-            return int(self.profile.get("best_floor", 0) or 0) >= 2
-        if node.node_id == "reserve_carry":
-            return self._stat("shop_purchases") >= 3
-        if node.node_id == "salvage_protocol":
-            return self._stat("settlements") >= 4
-        if node.node_id == "risk_covenant":
-            return self._stat("elite_flawless") >= 1
-        if node.node_id == "city_seal":
-            unlocked = self._unlocked_nodes()
-            branches = {
-                branch: sum(
-                    1
-                    for item in PROGRESSION_NODES
-                    if item.branch == branch and item.node_id in unlocked
-                )
-                for branch in ("锻刃谱系", "共鸣谱系", "远征谱系")
-            }
-            return (
-                sum(value >= 2 for value in branches.values()) >= 2
-                and self._stat("settlements") >= 10
-                and self._stat("boss_kills") >= 2
-            )
-        return False
+    @staticmethod
+    def _format_track_value(value: float) -> str:
+        return str(int(value)) if float(value).is_integer() else f"{value:g}"
 
-    def _node_available(self, node: ProgressionNode) -> bool:
-        unlocked = self._unlocked_nodes()
-        return (
-            node.node_id not in unlocked
-            and (node.prerequisite is None or node.prerequisite in unlocked)
-            and self._node_requirement_met(node)
-        )
+    def _track_max_level(self, track: ProgressionTrack) -> int:
+        return len(track.values)
 
-    def _activate_progression_node(self, index: int) -> None:
-        if index < 0 or index >= len(PROGRESSION_NODES):
+    def _track_next_cost(self, track: ProgressionTrack) -> int | None:
+        """下一级需要的回响遗晶；已经满级时返回 None。"""
+        level = self._track_level(track.track_id)
+        if level >= self._track_max_level(track):
+            return None
+        return int(track.costs[level])
+
+    def _track_effect_text(self, track: ProgressionTrack, level: int) -> str:
+        if level <= 0:
+            return "尚未点亮。"
+        value = track.values[min(level, len(track.values)) - 1]
+        return f"Lv.{level}：{track.effect.format(value=self._format_track_value(value))}"
+
+    def _upgrade_track(self, index: int) -> None:
+        """把选中的分支提升一级，并扣除对应的回响遗晶。"""
+        if index < 0 or index >= len(PROGRESSION_TRACKS):
             return
-        node = PROGRESSION_NODES[index]
-        unlocked = self._unlocked_nodes()
-        if node.node_id in unlocked:
-            self._notify("该节点已经铭刻在回响中枢")
+        track = PROGRESSION_TRACKS[index]
+        cost = self._track_next_cost(track)
+        if cost is None:
+            self._notify(f"{track.title} 已经满级")
             return
-        if node.prerequisite and node.prerequisite not in unlocked:
-            self._notify("前置节点尚未激活")
+        if self.echo_relics < cost:
+            self._notify(f"回响遗晶不足，还需 {cost - self.echo_relics}")
             return
-        if not self._node_requirement_met(node):
-            self._notify(f"尚未满足解锁门槛：{node.requirement}")
-            return
-        if self.echo_relics < node.cost:
-            self._notify(f"回响遗晶不足，还需 {node.cost - self.echo_relics}")
-            return
-        unlocked.add(node.node_id)
+        levels = self._track_levels()
+        levels[track.track_id] = levels.get(track.track_id, 0) + 1
         progression = self._progression().copy()
-        progression["unlocked_nodes"] = sorted(unlocked)
+        progression["version"] = 2
+        progression["levels"] = levels
         progression.setdefault("equipped_start_module", None)
         self.profile["progression"] = progression
-        self.profile["echo_relics"] = self.echo_relics - node.cost
+        self.profile["echo_relics"] = self.echo_relics - cost
         self._save_profile()
-        self._notify(f"已激活：{node.title}")
+        self._notify(
+            f"{track.title} 提升至 Lv.{levels[track.track_id]}"
+            f"  ·  {self._format_track_value(track.values[levels[track.track_id] - 1])}"
+        )
 
     def _open_overlay(self, overlay: str, return_page: str | None = None) -> None:
         self.overlay = overlay
@@ -1936,7 +2026,7 @@ class StartScreen:
             if self._overlay_back_rect().collidepoint(logical):
                 self._close_overlay()
             elif self._progression_activate_rect().collidepoint(logical):
-                self._activate_progression_node(self.progression_selected)
+                self._upgrade_track(self.progression_selected)
             else:
                 for branch, branch_rect in self._progression_branch_rects().items():
                     if branch_rect.collidepoint(logical):
@@ -1948,10 +2038,22 @@ class StartScreen:
                         return
                 if not self._overlay_rect().collidepoint(logical):
                     self._close_overlay()
+        elif self.overlay == "difficulty":
+            for index, choice_rect in enumerate(self._difficulty_rects()):
+                if choice_rect.collidepoint(logical):
+                    self._confirm_difficulty(index)
+                    return
+            if not self._overlay_rect().collidepoint(logical):
+                self._close_overlay()
 
     def _update(self, dt: float) -> None:
         if self.notification_timer > 0:
             self.notification_timer = max(0.0, self.notification_timer - dt)
+
+        if self.transition is not None:
+            # 过场期间暂停世界，只推进动画本身
+            self._update_transition(dt)
+            return
 
         if self.page != "game" or self.overlay is not None or self.confirm_exit:
             return
@@ -1961,6 +2063,8 @@ class StartScreen:
         # 进入传送门时锁住操作，由动画把角色吸向门心
         move_axis = 0.0 if self.portal_enter_timer > 0.0 else self._move_axis()
         self.player.update(fixed_dt, move_axis)
+        self._update_passive_recovery(fixed_dt)
+        self._update_death_fades(fixed_dt)
         self._update_attack_impacts(fixed_dt)
         self._update_dash_trails(fixed_dt)
         self._update_enemy_spawn(fixed_dt)
@@ -1981,6 +2085,164 @@ class StartScreen:
             self._complete_tutorial_action("energy")
         if not self.is_tutorial_run or self._current_tutorial_step.action == "parry":
             self._update_enemy_attacks(fixed_dt)
+
+    VORTEX_TIME = 0.65
+    BLACK_TIME = 0.26
+    IRIS_TIME = 0.5
+
+    def _difficulty_rects(self) -> list[pygame.Rect]:
+        rect = self._overlay_rect()
+        return [
+            pygame.Rect(rect.x + 60, rect.y + 150, 300, 220),
+            pygame.Rect(rect.right - 360, rect.y + 150, 300, 220),
+        ]
+
+    def _difficulty_labels(self) -> list[tuple[str, str, str]]:
+        return [
+            ("标准远征", "按常规威胁值推进，回响遗晶收益不变。", "威胁 +0%"),
+            (
+                "高压远征",
+                "敌人生命与攻击同步提高，结束后获得更多回响遗晶。",
+                f"威胁 +{round(DIFFICULTY_THREAT_BONUS * 100)}%  ·  "
+                f"遗晶 x{DIFFICULTY_RELIC_MULTIPLIER:g}",
+            ),
+        ]
+
+    def _confirm_difficulty(self, index: int) -> None:
+        """确认本局难度，随后照常播放进城过场。"""
+        self.run_difficulty_hard = index == 1
+        self.overlay = None
+        self._notify(
+            "高压远征已确认：敌人更强，遗晶收益提高"
+            if self.run_difficulty_hard
+            else "标准远征已确认"
+        )
+        self._begin_expedition_transition()
+
+    def _draw_difficulty(self, rect: pygame.Rect) -> None:
+        note = self.small_font.render(
+            "风险契约已点亮：本局开始前可以决定是否加压。",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(note, (rect.x + 34, rect.y + 78))
+        for index, ((title, detail, tag), choice_rect) in enumerate(
+            zip(self._difficulty_labels(), self._difficulty_rects())
+        ):
+            selected = index == self.difficulty_selected
+            pygame.draw.rect(
+                self.canvas,
+                (20, 61, 66) if selected else (10, 31, 41),
+                choice_rect,
+            )
+            if selected:
+                pygame.draw.rect(self.canvas, COLORS["cyan"], choice_rect, 2)
+            color = COLORS["gold"] if index == 1 else COLORS["ice"]
+            heading = self.overlay_body_font.render(title, True, color)
+            self.canvas.blit(
+                heading,
+                heading.get_rect(center=(choice_rect.centerx, choice_rect.y + 56)),
+            )
+            for line_index, line in enumerate(
+                self._wrap_text(detail, self.small_font, choice_rect.width - 48)
+            ):
+                self.canvas.blit(
+                    self.small_font.render(line, True, COLORS["muted"]),
+                    (choice_rect.x + 24, choice_rect.y + 96 + line_index * 22),
+                )
+            tag_text = self.small_font.render(tag, True, COLORS["cyan"])
+            self.canvas.blit(
+                tag_text,
+                tag_text.get_rect(center=(choice_rect.centerx, choice_rect.bottom - 34)),
+            )
+
+    def _begin_expedition_transition(self) -> None:
+        """点下远征城门：先播漩涡过场，再真正进入关卡。"""
+        if self.transition is not None:
+            return
+        self.transition = {"phase": "vortex", "t": 0.0}
+        self.audio.play("portal_enter")
+
+    def _update_transition(self, dt: float) -> None:
+        if self.transition is None:
+            return
+        self.transition["t"] += dt
+        phase = self.transition["phase"]
+        if phase == "vortex" and self.transition["t"] >= self.VORTEX_TIME:
+            # 等画面被漩涡吞掉之后再换场景，避免看到画面突变
+            self.transition = {"phase": "black", "t": 0.0}
+            self._start_or_resume_expedition()
+        elif phase == "black" and self.transition["t"] >= self.BLACK_TIME:
+            self.transition = {"phase": "iris", "t": 0.0}
+        elif phase == "iris" and self.transition["t"] >= self.IRIS_TIME:
+            self.transition = None
+
+    def _draw_transition(self) -> None:
+        if self.transition is None:
+            return
+        phase = self.transition["phase"]
+        timer = self.transition["t"]
+        center = (LOGICAL_SIZE[0] // 2, LOGICAL_SIZE[1] // 2)
+        reach = int(math.hypot(*center)) + 40
+        layer = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+
+        if phase == "vortex":
+            progress = max(0.0, min(1.0, timer / self.VORTEX_TIME))
+            for index in range(5):
+                angle = self.elapsed * 5.5 + index * math.tau / 5.0
+                points = []
+                for step in range(26):
+                    spiral_angle = angle + step * 0.34
+                    radius = (70 + progress * 520) * (step / 25.0) ** 0.9
+                    points.append(
+                        (
+                            center[0] + math.cos(spiral_angle) * radius,
+                            center[1] + math.sin(spiral_angle) * radius * 0.72,
+                        )
+                    )
+                pygame.draw.lines(
+                    layer,
+                    (*COLORS["cyan"], int(210 * (1.0 - progress * 0.35))),
+                    False,
+                    points,
+                    3,
+                )
+            pygame.draw.circle(
+                layer,
+                (4, 10, 20, int(235 * progress)),
+                center,
+                int(reach * progress),
+            )
+            pygame.draw.circle(
+                layer,
+                (*COLORS["white"], int(200 * progress)),
+                center,
+                18 + int(70 * progress),
+                3,
+            )
+        elif phase == "black":
+            layer.fill((3, 8, 18, 255))
+        else:
+            progress = max(0.0, min(1.0, timer / self.IRIS_TIME))
+            layer.fill((3, 8, 18, 255))
+            pygame.draw.circle(layer, (0, 0, 0, 0), center, int(reach * progress))
+
+        self.canvas.blit(layer, (0, 0))
+
+    def _update_passive_recovery(self, dt: float) -> None:
+        """技能树提供的自动回血与自动回蓝：按秒累计，攒够 1 点才结算。"""
+        if self.auto_heal_per_second > 0.0:
+            self._auto_heal_pool += self.auto_heal_per_second * dt
+            whole = int(self._auto_heal_pool)
+            if whole > 0:
+                self._auto_heal_pool -= whole
+                self.player.heal(whole)
+        if self.auto_energy_per_second > 0.0:
+            self._auto_energy_pool += self.auto_energy_per_second * dt
+            whole = int(self._auto_energy_pool)
+            if whole > 0:
+                self._auto_energy_pool -= whole
+                self._gain_energy(whole)
 
     def _move_axis(self) -> float:
         left = (
@@ -2192,7 +2454,11 @@ class StartScreen:
             self._notify(f"远征已结算，凝结回响遗晶 +{relics}")
             return
         if self.run_floor >= BOSS_FLOOR:
-            self._enter_lobby()
+            # 打完第五层即通关：停在结算界面，展示这一局的成果
+            self.result_cleared = True
+            self.result_relics = relics
+            self.page = "result"
+            self.confirm_exit = False
             self._notify(f"第一阶段完成，凝结回响遗晶 +{relics}")
             return
         next_floor = self.run_floor + 1
@@ -2324,6 +2590,12 @@ class StartScreen:
             )
         else:
             enemy.take_damage(reflected_damage, source_x=self.player.x)
+            # 近战弹刀把敌人向后震开一段，形成"弹开"的手感
+            enemy.apply_knockback(
+                self.player.facing,
+                enemy.PARRY_KNOCKBACK_SPEED,
+                enemy.PARRY_KNOCKBACK_LIFT,
+            )
         self.audio.play("parry")
         self.audio.duck(0.5, 0.45)
         self.run_score += 260
@@ -2460,6 +2732,12 @@ class StartScreen:
         self.pending_enemy_attacks = unresolved
         self._remove_defeated_enemies()
 
+    def _update_death_fades(self, dt: float) -> None:
+        """倒地动画推进：时间走完就把剪影移除。"""
+        for fade in self.death_fades:
+            fade.remaining -= dt
+        self.death_fades = [fade for fade in self.death_fades if fade.remaining > 0.0]
+
     def _update_attack_impacts(self, dt: float) -> None:
         for impact in self.attack_impacts:
             impact.remaining -= dt
@@ -2541,20 +2819,13 @@ class StartScreen:
         self._defeated_enemies.add(enemy_id)
         self.run_score += enemy.bounty_score
         currency_gain = max(4, enemy.bounty_score // 20)
-        unlocked = self._unlocked_nodes()
-        if "salvage_protocol" in unlocked:
-            currency_gain = math.ceil(currency_gain * SALVAGE_CURRENCY_MULTIPLIER)
+        salvage_rate = self._track_value("salvage_protocol")
+        if salvage_rate > 0:
+            currency_gain = math.ceil(currency_gain * (1.0 + salvage_rate / 100.0))
         self.run_currency += currency_gain
-        healed = 0
-        if "execution_resonance" in unlocked and not self._execution_heal_used:
-            self._execution_heal_used = True
-            healed = self.player.heal(
-                max(1, round(self.player.max_hp * EXECUTION_HEAL_RATIO))
-            )
+        self.run_kills += 1
         self.audio.play("defeat")
         message = f"击败 {enemy.display_name}  铸币 +{currency_gain}"
-        if healed:
-            message += f"  回流生命 +{healed}"
         self._notify(message)
         self._gain_energy(ENERGY_GAIN_DEFEAT)
         self._gain_exp(self._enemy_exp(enemy))
@@ -2567,6 +2838,21 @@ class StartScreen:
             self.profile["lifetime_stats"] = lifetime_stats
 
     def _remove_defeated_enemies(self) -> None:
+        for enemy in self.room_enemies:
+            if not enemy.defeated or id(enemy) in self._death_fade_ids:
+                continue
+            # 倒地动画：先记下倒下的剪影，再把它从战斗序列里移除
+            self._death_fade_ids.add(id(enemy))
+            self.death_fades.append(
+                DeathFade(
+                    kind=enemy.kind,
+                    x=enemy.x,
+                    y=enemy.y,
+                    facing=enemy.facing,
+                    remaining=DEATH_FADE_TIME,
+                    total=DEATH_FADE_TIME,
+                )
+            )
         self.room_enemies = [enemy for enemy in self.room_enemies if not enemy.defeated]
         self.pending_enemy_attacks = [
             pending
@@ -2650,7 +2936,9 @@ class StartScreen:
                 x=player.x + player.facing * 46.0,
                 y=player.y - player.BODY_HEIGHT / 2,
                 facing=player.facing,
-                damage=round(player.attack_damage * SKILL_DAMAGE_MULTIPLIER),
+                damage=round(
+                    player.attack_damage * SKILL_DAMAGE_MULTIPLIER * self.skill_damage_scale
+                ),
                 posture_damage=player.posture_damage * 2,
                 remaining=SKILL_WAVE_LIFE,
                 total=SKILL_WAVE_LIFE,
@@ -2800,6 +3088,8 @@ class StartScreen:
             self._draw_overlay()
         if self.confirm_exit:
             self._draw_exit_confirmation()
+        if self.transition is not None:
+            self._draw_transition()
 
         self.screen.fill(COLORS["ink"])
         width, height = self.screen.get_size()
@@ -2863,13 +3153,13 @@ class StartScreen:
             COLORS["muted"],
         )
         self.canvas.blit(stats, (930, 78))
-        checkpoint = self._pending_checkpoint()
+        checkpoint = self._active_run_checkpoint()
         if checkpoint is not None:
             run_state = (
                 f"暂存远征  第 {checkpoint['floor']} 层  ·  Lv.{checkpoint['player_level']}"
             )
         else:
-            run_state = f"远征起点  第 {self._progress_floor()} 层"
+            run_state = "本局从第一层开始"
         suspended = self.small_font.render(run_state, True, COLORS["cyan"])
         self.canvas.blit(suspended, (930, 104))
         if self.result_relics:
@@ -2880,76 +3170,66 @@ class StartScreen:
             )
             self.canvas.blit(settlement, (930, 128))
 
-        # Central gate: the primary interaction in the room.
-        pygame.draw.rect(self.canvas, (7, 17, 28), (480, 286, 320, 254))
-        pygame.draw.rect(self.canvas, (38, 104, 105), (480, 286, 320, 254), 2)
-        pygame.draw.rect(self.canvas, (15, 48, 56), (545, 330, 190, 210))
-        pygame.draw.rect(self.canvas, COLORS["cyan"], (545, 330, 190, 210), 2)
-        gate = pygame.transform.scale(self.assets.logo, (92, 92))
-        gate.set_alpha(190 + int(45 * math.sin(self.elapsed * 2.0)))
-        self.canvas.blit(gate, gate.get_rect(center=(640, 394)))
-        gate_label = self.overlay_body_font.render("远征城门", True, COLORS["ice"])
-        self.canvas.blit(gate_label, gate_label.get_rect(center=(640, 565)))
-
-        # Echo nexus above the gate.
-        pygame.draw.circle(self.canvas, (13, 47, 57), (640, 238), 66)
-        pygame.draw.circle(self.canvas, COLORS["cyan"], (640, 238), 66, 2)
-        nexus = pygame.transform.scale(self.assets.logo, (78, 78))
-        nexus.set_alpha(220)
-        self.canvas.blit(nexus, nexus.get_rect(center=(640, 238)))
-        self.canvas.blit(
-            self.small_font.render("回响中枢", True, COLORS["ice"]),
-            (587, 304),
-        )
-
-        # Left smith and right archive are NPC/building interaction points.
-        self._draw_lobby_smith()
-        self._draw_lobby_archive()
-        for index, (_, label, rect) in enumerate(self._lobby_actions()):
+        # 三个入口：左侧回响中枢、中间远征城门、右侧远征排行
+        mouse = self._to_logical(pygame.mouse.get_pos())
+        actions = self._lobby_actions()
+        for index, (action, label, rect) in enumerate(actions):
             selected = index == self.lobby_selected
-            if selected:
-                pygame.draw.rect(self.canvas, (27, 78, 79), rect, 2)
-                marker = self.assets.cursor.get_rect(midright=(rect.left - 12, rect.centery))
-                self.canvas.blit(pygame.transform.scale(self.assets.cursor, (24, 24)), marker)
-            if index == 0:
-                text_rect = pygame.Rect(rect.x, rect.bottom + 4, rect.width, 32)
+            hovered = rect.collidepoint(mouse)
+            if hovered and not selected:
+                # 鼠标悬停：把选中的入口切过去，图标稍后放大
+                self.lobby_selected = index
+                selected = True
+            scale = 1.14 if (hovered or selected) else 1.0
+            icon = self._lobby_icon(action)
+            if icon is not None:
+                base = 190 if action == "gate" else 140
+                size = round(base * scale)
+                image = pygame.transform.smoothscale(icon, (size, size))
+                if selected:
+                    image = image.copy()
+                    image.set_alpha(255)
+                else:
+                    image = image.copy()
+                    image.set_alpha(215)
                 self.canvas.blit(
-                    self.small_font.render(label, True, COLORS["gold"] if selected else COLORS["muted"]),
-                    self.small_font.render(label, True, COLORS["gold"] if selected else COLORS["muted"]).get_rect(center=text_rect.center),
+                    image,
+                    image.get_rect(center=(rect.centerx, rect.centery - 26)),
                 )
+            if selected:
+                glow = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
+                pygame.draw.circle(
+                    glow,
+                    (*COLORS["cyan"], 60),
+                    (rect.centerx, rect.centery - 26),
+                    round(78 * scale),
+                    3,
+                )
+                self.canvas.blit(glow, (0, 0))
+            name = self.overlay_body_font.render(
+                label, True, COLORS["gold"] if selected else COLORS["ice"]
+            )
+            self.canvas.blit(name, name.get_rect(center=(rect.centerx, rect.bottom - 34)))
+
+        gate_hint = self.small_font.render(
+            actions[0][1], True, COLORS["muted"]
+        )
+        self.canvas.blit(gate_hint, gate_hint.get_rect(center=(actions[0][2].centerx, actions[0][2].bottom + 4)))
 
         hint = self.small_font.render(
-            "方向键 / WASD 选择交互点    Enter 进入    Esc 返回主菜单",
+            "方向键 / WASD 或鼠标选择交互点    Enter 进入    Esc 返回主菜单",
             True,
             COLORS["muted"],
         )
         self.canvas.blit(hint, hint.get_rect(center=(640, 688)))
         self._draw_notification()
 
-    def _draw_lobby_smith(self) -> None:
-        pygame.draw.rect(self.canvas, (20, 35, 42), (88, 342, 240, 82))
-        pygame.draw.rect(self.canvas, (72, 119, 113), (88, 342, 240, 82), 2)
-        pygame.draw.rect(self.canvas, (122, 71, 54), (142, 388, 42, 46))
-        pygame.draw.rect(self.canvas, COLORS["gold"], (151, 365, 24, 24))
-        text = self.small_font.render("铸刃师 · 武装谱系", True, COLORS["ice"])
-        self.canvas.blit(text, (202, 365))
-        self.canvas.blit(
-            self.small_font.render("锻造与武器解锁", True, COLORS["muted"]),
-            (202, 390),
-        )
-
-    def _draw_lobby_archive(self) -> None:
-        pygame.draw.rect(self.canvas, (20, 35, 42), (920, 342, 280, 82))
-        pygame.draw.rect(self.canvas, (72, 119, 113), (920, 342, 280, 82), 2)
-        pygame.draw.rect(self.canvas, (44, 92, 98), (952, 366, 42, 36))
-        pygame.draw.line(self.canvas, COLORS["cyan"], (958, 374), (988, 374), 2)
-        pygame.draw.line(self.canvas, COLORS["cyan"], (958, 382), (988, 382), 2)
-        text = self.small_font.render("远征档案 · 排行记录", True, COLORS["ice"])
-        self.canvas.blit(text, (1020, 365))
-        self.canvas.blit(
-            self.small_font.render("查看历史战绩", True, COLORS["muted"]),
-            (1020, 390),
-        )
+    def _lobby_icon(self, action: str) -> pygame.Surface | None:
+        if action == "gate":
+            return self.assets.room_gate or self.assets.logo
+        if action == "nexus":
+            return self.assets.logo
+        return self.assets.echo_shard
 
     def _menu_rect(self, index: int) -> pygame.Rect:
         return pygame.Rect(440, 315 + index * 68, 400, 58)
@@ -3023,20 +3303,20 @@ class StartScreen:
         left_width = 520
 
         for branch in PROGRESSION_BRANCHES:
-            branch_rects[branch] = pygame.Rect(left_x, cursor_y, left_width, 32)
-            cursor_y += 36
+            branch_rects[branch] = pygame.Rect(left_x, cursor_y, left_width, 34)
+            cursor_y += 40
             if self.progression_collapsed.get(branch, False):
                 continue
-            for index, node in enumerate(PROGRESSION_NODES):
-                if node.branch != branch:
+            for index, track in enumerate(PROGRESSION_TRACKS):
+                if track.branch != branch:
                     continue
                 node_rects[index] = pygame.Rect(
                     left_x + 18,
                     cursor_y,
                     left_width - 18,
-                    30,
+                    34,
                 )
-                cursor_y += 33
+                cursor_y += 40
 
         return branch_rects, node_rects
 
@@ -3047,7 +3327,7 @@ class StartScreen:
         return self._progression_layout()[1]
 
     def _progression_node_rects(self) -> list[pygame.Rect]:
-        """Compatibility helper returning currently visible node rows."""
+        """兼容旧接口：返回当前可见的分支行。"""
         return list(self._progression_visible_node_rects().values())
 
     def _visible_progression_indices(self) -> list[int]:
@@ -3073,14 +3353,14 @@ class StartScreen:
             self.progression_collapsed[branch] = False
             self.progression_selected = next(
                 index
-                for index, node in enumerate(PROGRESSION_NODES)
-                if node.branch == branch
+                for index, track in enumerate(PROGRESSION_TRACKS)
+                if track.branch == branch
             )
         else:
             self.progression_collapsed[branch] = True
 
     def _switch_progression_branch(self, direction: int) -> None:
-        current = PROGRESSION_NODES[self.progression_selected].branch
+        current = PROGRESSION_TRACKS[self.progression_selected].branch
         branch_index = PROGRESSION_BRANCHES.index(current)
         branch = PROGRESSION_BRANCHES[
             (branch_index + direction) % len(PROGRESSION_BRANCHES)
@@ -3089,8 +3369,8 @@ class StartScreen:
             self.progression_collapsed[name] = name != branch
         self.progression_selected = next(
             index
-            for index, node in enumerate(PROGRESSION_NODES)
-            if node.branch == branch
+            for index, track in enumerate(PROGRESSION_TRACKS)
+            if track.branch == branch
         )
 
     def _progression_activate_rect(self) -> pygame.Rect:
@@ -3179,12 +3459,16 @@ class StartScreen:
             self._draw_floor_briefing(rect)
         elif self.overlay == "slots":
             self._draw_slot_select(rect)
+        elif self.overlay == "difficulty":
+            self._draw_difficulty(rect)
         else:
             self._draw_settings(rect)
 
         hint_text = (
             "Enter / 空格 / 点击 开始战斗"
             if self.overlay == "floor_intro"
+            else "←→ 选择难度    Enter 确认出征    Esc 返回"
+            if self.overlay == "difficulty"
             else "↑↓ 选择货品    Enter 购买    Esc 结束整备"
             if self.overlay == "shop"
             else "↑↓ 选择    Enter 确认    Esc 返回"
@@ -3415,20 +3699,22 @@ class StartScreen:
             self.canvas.blit(text, text.get_rect(center=choice_rect.center))
 
     def _draw_progression(self, rect: pygame.Rect) -> None:
-        unlocked = self._unlocked_nodes()
-        branch_rects, node_rects = self._progression_layout()
+        levels = self._track_levels()
+        branch_rects, track_rects = self._progression_layout()
         branch_colors = {
-            "锻刃谱系": COLORS["gold"],
-            "共鸣谱系": COLORS["cyan"],
-            "远征谱系": (166, 205, 184),
-            "终局节点": COLORS["red"],
+            "基元谱系": COLORS["gold"],
+            "机制谱系": COLORS["cyan"],
+            "铸币谱系": (166, 205, 184),
         }
 
         for branch, branch_rect in branch_rects.items():
             branch_color = branch_colors[branch]
             collapsed = self.progression_collapsed.get(branch, False)
-            branch_nodes = [node for node in PROGRESSION_NODES if node.branch == branch]
-            unlocked_count = sum(node.node_id in unlocked for node in branch_nodes)
+            branch_tracks = [
+                track for track in PROGRESSION_TRACKS if track.branch == branch
+            ]
+            point_count = sum(levels.get(track.track_id, 0) for track in branch_tracks)
+            point_total = sum(len(track.values) for track in branch_tracks)
             pygame.draw.rect(self.canvas, (10, 31, 41), branch_rect)
             pygame.draw.rect(self.canvas, branch_color, branch_rect, 1)
             pygame.draw.rect(
@@ -3453,136 +3739,241 @@ class StartScreen:
             )
             pygame.draw.polygon(self.canvas, branch_color, arrow)
             label = self.lobby_node_font.render(branch, True, COLORS["ice"])
-            self.canvas.blit(label, (branch_rect.x + 38, branch_rect.y + 6))
+            self.canvas.blit(label, (branch_rect.x + 38, branch_rect.y + 7))
             count = self.small_font.render(
-                f"{unlocked_count}/{len(branch_nodes)}",
+                f"已点亮 {point_count}/{point_total}",
                 True,
                 branch_color,
             )
             self.canvas.blit(
                 count,
-                (branch_rect.right - count.get_width() - 14, branch_rect.y + 7),
+                (branch_rect.right - count.get_width() - 14, branch_rect.y + 8),
             )
 
-        for index, node_rect in node_rects.items():
-            node = PROGRESSION_NODES[index]
-            is_unlocked = node.node_id in unlocked
+        for index, track_rect in track_rects.items():
+            track = PROGRESSION_TRACKS[index]
+            level = levels.get(track.track_id, 0)
+            max_level = len(track.values)
             is_selected = index == self.progression_selected
-            available = self._node_available(node)
+            branch_color = branch_colors[track.branch]
             if is_selected:
-                pygame.draw.rect(self.canvas, (20, 61, 66), node_rect)
-                pygame.draw.rect(self.canvas, COLORS["cyan"], node_rect, 2)
-            elif is_unlocked:
-                pygame.draw.rect(self.canvas, (15, 46, 49), node_rect)
-            branch_color = branch_colors[node.branch]
+                pygame.draw.rect(self.canvas, (20, 61, 66), track_rect)
+                pygame.draw.rect(self.canvas, COLORS["cyan"], track_rect, 2)
+            elif level:
+                pygame.draw.rect(self.canvas, (15, 46, 49), track_rect)
             pygame.draw.line(
                 self.canvas,
                 branch_color,
-                (node_rect.x + 10, node_rect.y),
-                (node_rect.x + 10, node_rect.bottom),
+                (track_rect.x + 10, track_rect.y),
+                (track_rect.x + 10, track_rect.bottom),
                 2,
             )
             pygame.draw.circle(
                 self.canvas,
                 branch_color,
-                (node_rect.x + 10, node_rect.centery),
+                (track_rect.x + 10, track_rect.centery),
                 4,
             )
-            state = "已铭刻" if is_unlocked else "可激活" if available else "未解锁"
-            state_color = COLORS["cyan"] if is_unlocked else COLORS["gold"] if available else COLORS["muted"]
             label = self.lobby_node_font.render(
-                node.title,
+                track.title,
                 True,
                 COLORS["ice"] if is_selected else COLORS["muted"],
             )
-            self.canvas.blit(label, (node_rect.x + 25, node_rect.y + 5))
-            state_text = self.small_font.render(state, True, state_color)
-            self.canvas.blit(state_text, (node_rect.right - state_text.get_width() - 14, node_rect.y + 6))
+            self.canvas.blit(label, (track_rect.x + 25, track_rect.y + 7))
 
-        node = PROGRESSION_NODES[self.progression_selected]
+            # 等级圆点：已点亮的格子按谱系配色，未点亮留空
+            pip_x = track_rect.x + 150
+            for pip in range(max_level):
+                color = branch_color if pip < level else (32, 62, 70)
+                pygame.draw.circle(
+                    self.canvas,
+                    color,
+                    (pip_x + pip * 15, track_rect.centery),
+                    5,
+                )
+
+            cost = self._track_next_cost(track)
+            if cost is None:
+                state, state_color = "已满级", COLORS["gold"]
+            elif self.echo_relics >= cost:
+                state, state_color = f"升级 {cost} 遗晶", COLORS["cyan"]
+            else:
+                state, state_color = f"{cost} 遗晶", COLORS["muted"]
+            state_text = self.small_font.render(state, True, state_color)
+            self.canvas.blit(
+                state_text,
+                (
+                    track_rect.right - state_text.get_width() - 14,
+                    track_rect.y + 8,
+                ),
+            )
+
+        track = PROGRESSION_TRACKS[self.progression_selected]
+        level = levels.get(track.track_id, 0)
+        max_level = len(track.values)
+        cost = self._track_next_cost(track)
+        branch_color = branch_colors[track.branch]
         detail = pygame.Rect(rect.x + 584, rect.y + 86, 514, 430)
         pygame.draw.rect(self.canvas, (8, 25, 35), detail)
         pygame.draw.rect(self.canvas, (42, 105, 106), detail, 2)
-        heading = self.overlay_body_font.render(node.title, True, COLORS["ice"])
+        heading = self.overlay_body_font.render(track.title, True, COLORS["ice"])
         self.canvas.blit(heading, (detail.x + 28, detail.y + 28))
-        branch = self.small_font.render(node.branch, True, COLORS["cyan"])
-        self.canvas.blit(branch, (detail.x + 30, detail.y + 64))
+        level_text = self.lobby_node_font.render(
+            f"{track.branch}   Lv.{level} / {max_level}",
+            True,
+            branch_color,
+        )
+        self.canvas.blit(level_text, (detail.x + 30, detail.y + 64))
+
         lines = [
-            f"消耗：{node.cost} 回响遗晶",
-            f"前置：{self._node_title(node.prerequisite)}",
-            f"门槛：{node.requirement}",
-            f"功能：{node.effect}",
+            (
+                f"下一级消耗：{cost} 回响遗晶" if cost is not None else "该分支已经满级",
+                COLORS["gold"],
+            ),
+            (f"当前效果：{self._track_effect_text(track, level)}", COLORS["muted"]),
+            (
+                "升级效果："
+                + (
+                    self._track_effect_text(track, level + 1)
+                    if cost is not None
+                    else "无"
+                ),
+                COLORS["cyan"],
+            ),
         ]
-        for index, line in enumerate(lines):
-            color = COLORS["gold"] if index == 0 else COLORS["muted"]
-            for line_index, wrapped in enumerate(self._wrap_text(line, self.small_font, detail.width - 56)):
-                y = detail.y + 112 + index * 60 + line_index * 21
-                self.canvas.blit(self.small_font.render(wrapped, True, color), (detail.x + 28, y))
+        cursor = detail.y + 108
+        for text, color in lines:
+            for wrapped in self._wrap_text(text, self.small_font, detail.width - 56):
+                self.canvas.blit(
+                    self.small_font.render(wrapped, True, color),
+                    (detail.x + 28, cursor),
+                )
+                cursor += 22
+            cursor += 14
+
+        balance = self.small_font.render(
+            f"回响遗晶余额  {self.echo_relics}",
+            True,
+            COLORS["gold"],
+        )
+        self.canvas.blit(balance, (detail.x + 28, detail.bottom - 40))
+        if cost is None:
+            button_label = "已满级"
+        elif self.echo_relics >= cost:
+            button_label = f"升级  -{cost}"
+        else:
+            button_label = f"遗晶不足  -{cost}"
         self._draw_ui_button(
             self._progression_activate_rect(),
-            "已完成铭刻" if node.node_id in unlocked else "激活节点",
+            button_label,
             selected=True,
-            enabled=self._node_available(node) and self.echo_relics >= node.cost,
+            enabled=cost is not None and self.echo_relics >= cost,
         )
         self._draw_ui_button(self._overlay_back_rect(), "离开中枢")
 
-    @staticmethod
-    def _node_title(node_id: str | None) -> str:
-        if node_id is None:
-            return "无"
-        for node in PROGRESSION_NODES:
-            if node.node_id == node_id:
-                return node.title
-        return "未知节点"
-
     def _draw_leaderboard(self, rect: pygame.Rect) -> None:
-        rows: list[tuple[str, str, str]] = []
-        scores = self.profile.get("scores", [])
-        if isinstance(scores, list):
-            for score in scores[:5]:
-                if isinstance(score, dict):
-                    rows.append(
-                        (
-                            f"{int(score.get('score', 0)):05d}",
-                            f"第 {int(score.get('floor', 1))} 层",
-                            f"弹刀 {int(score.get('parries', 0))} 次",
-                        )
-                    )
-        rows.extend(
-            [
-                ("--", "暂无成绩", "完成第一局后记录"),
-                ("--", "暂无成绩", "挑战灰塔，留下你的分数"),
-                ("--", "暂无成绩", "完美弹刀会带来更高倍率"),
-            ]
+        """排行记录：按本局闯到的最高层数排序。"""
+        entries = self._leaderboard_entries()
+        summary = self.small_font.render(
+            f"用时最深的远征前 {len(entries)} 名  ·  按抵达层数排序",
+            True,
+            COLORS["muted"],
         )
-        for index, (score, name, detail) in enumerate(rows):
-            y = rect.y + 110 + index * 64
-            if y > rect.bottom - 105:
+        self.canvas.blit(summary, (rect.x + 34, rect.y + 76))
+
+        header_y = rect.y + 108
+        for text, x in (
+            ("名次", rect.x + 42),
+            ("抵达关卡", rect.x + 112),
+            ("击败", rect.x + 330),
+            ("弹刀", rect.x + 430),
+            ("分数", rect.right - 160),
+        ):
+            self.canvas.blit(
+                self.small_font.render(text, True, COLORS["cyan"]),
+                (x, header_y),
+            )
+
+        if not entries:
+            empty = self.small_font.render(
+                "还没有远征记录：完成一局之后就会出现在这里。",
+                True,
+                COLORS["muted"],
+            )
+            self.canvas.blit(empty, (rect.x + 42, header_y + 46))
+
+        for index, entry in enumerate(entries):
+            y = header_y + 40 + index * 46
+            if y > rect.bottom - 110:
                 break
             pygame.draw.line(
                 self.canvas,
                 (30, 77, 84),
-                (rect.x + 30, y + 42),
-                (rect.right - 30, y + 42),
+                (rect.x + 30, y + 36),
+                (rect.right - 30, y + 36),
                 1,
             )
             rank_text = self.overlay_body_font.render(
                 str(index + 1).zfill(2),
                 True,
-                COLORS["cyan"],
+                COLORS["gold"] if index == 0 else COLORS["cyan"],
             )
             self.canvas.blit(rank_text, (rect.x + 42, y))
-            name_text = self.overlay_body_font.render(name, True, COLORS["ice"])
-            self.canvas.blit(name_text, (rect.x + 112, y))
-            score_text = self.overlay_body_font.render(score, True, COLORS["ice"])
-            self.canvas.blit(score_text, (rect.right - score_text.get_width() - 42, y))
-            detail_text = self.small_font.render(detail, True, COLORS["muted"])
-            self.canvas.blit(detail_text, (rect.x + 112, y + 27))
+            floor_text = self.overlay_body_font.render(
+                f"第 {entry['floor']} 层",
+                True,
+                COLORS["ice"],
+            )
+            self.canvas.blit(floor_text, (rect.x + 112, y))
+            detail = self.small_font.render(
+                ("通关" if entry.get("cleared") else "失败")
+                + f"  ·  连击 x{entry['max_combo']}",
+                True,
+                COLORS["muted"],
+            )
+            self.canvas.blit(detail, (rect.x + 112, y + 22))
+            kills = self.small_font.render(str(entry["kills"]), True, COLORS["muted"])
+            self.canvas.blit(kills, (rect.x + 330, y + 6))
+            parries = self.small_font.render(
+                str(entry["parries"]), True, COLORS["muted"]
+            )
+            self.canvas.blit(parries, (rect.x + 430, y + 6))
+            score_text = self.overlay_body_font.render(
+                entry["score"], True, COLORS["ice"]
+            )
+            self.canvas.blit(
+                score_text, (rect.right - score_text.get_width() - 42, y)
+            )
         self._draw_ui_button(
             self._overlay_back_rect(),
             "返回大厅" if self.return_page == "lobby" else "返回主菜单",
             self.overlay_selected == 0,
         )
+
+    def _leaderboard_entries(self, limit: int = 10) -> list[dict]:
+        """把存档里的战绩整理成排行条目：层数优先，其次分数。"""
+        scores = self.profile.get("scores", [])
+        if not isinstance(scores, list):
+            return []
+        rows = [score for score in scores if isinstance(score, dict)]
+        rows.sort(
+            key=lambda score: (
+                int(score.get("floor", 0) or 0),
+                int(score.get("score", 0) or 0),
+            ),
+            reverse=True,
+        )
+        return [
+            {
+                "floor": max(1, int(row.get("floor", 1) or 1)),
+                "score": f"{int(row.get('score', 0) or 0):05d}",
+                "kills": int(row.get("kills", 0) or 0),
+                "parries": int(row.get("parries", 0) or 0),
+                "max_combo": int(row.get("max_combo", 0) or 0),
+                "cleared": row.get("outcome") == "clear",
+            }
+            for row in rows[:limit]
+        ]
 
     def _draw_settings(self, rect: pygame.Rect) -> None:
         labels = [
@@ -3829,33 +4220,43 @@ class StartScreen:
         self.confirm_exit = False
         self.is_tutorial_run = tutorial
         self.run_floor = max(1, floor)
-        self.run_threat = self._floor_threat(self.run_floor)
+        self.run_threat = self._floor_threat(self.run_floor) + (
+            DIFFICULTY_THREAT_BONUS if self.run_difficulty_hard else 0.0
+        )
         self.run_score = 0
         self.run_combo = 0
         self.run_max_combo = 0
         self.run_parries = 0
-        unlocked = self._unlocked_nodes()
         if not keep_progress:
             self.run_shop_attack_bonus = 0
             self.run_shop_hp_bonus = 0
             self.shop_purchased.clear()
+        carry_currency = int(self._track_value("reserve_carry"))
         self.run_currency = (
-            carried_currency
-            if carried_currency is not None
-            else 20 if "reserve_carry" in unlocked else 0
+            carried_currency if carried_currency is not None else carry_currency
         )
         self.result_relic_breakdown = []
         self.player = Player(230, 566)
-        if "vital_lattice" in unlocked:
-            self.player.max_hp += NEXUS_HP_BONUS
-            self.player.hp = self.player.max_hp
-        if "edge_tempering" in unlocked:
-            self.player.attack_bonus += NEXUS_ATTACK_BONUS
+        nexus_hp = int(self._track_value("vital_lattice"))
+        nexus_attack = int(self._track_value("edge_tempering"))
+        if nexus_hp:
+            self.player.max_hp += nexus_hp
+        if nexus_attack:
+            self.player.attack_bonus += nexus_attack
         self.player.max_hp += self.run_shop_hp_bonus
         self.player.attack_bonus += self.run_shop_attack_bonus
         self.player.hp = self.player.max_hp
-        if "aerial_memory" in unlocked:
+        if self._track_unlocked("aerial_memory"):
             self.player.unlock_air_jump()
+        self.player.dash_unlocked = (
+            tutorial or self._track_unlocked("shadow_dash")
+        )
+        self.skill_damage_scale = 1.0 + self._track_value("resonance_amplifier") / 100.0
+        self.auto_heal_per_second = self._track_value("vital_regeneration")
+        self.auto_energy_per_second = self._track_value("resonance_reflux")
+        self._auto_heal_pool = 0.0
+        self._auto_energy_pool = 0.0
+        self.run_kills = 0
         if keep_progress:
             # 进入下一层时保留等级收益：把累计加成重新套用到新角色上
             gained_levels = max(0, self.player_level - 1)
@@ -3866,14 +4267,11 @@ class StartScreen:
             self.player_level = 1
             self.player_exp = 0
         # 每一层开局回响能量都从 0 开始
-        self.echo_energy = (
-            RESONANT_START_ENERGY if "resonant_reservoir" in unlocked else 0
-        )
+        self.echo_energy = 0
         self.skill_waves.clear()
         self._skill_wave_spawned = False
         self._attack_hits.clear()
         self._defeated_enemies.clear()
-        self._execution_heal_used = False
         self.room_enemies = []
         self.wave_index = 0
         self.pending_spawn = []
@@ -3917,12 +4315,9 @@ class StartScreen:
 
     def _page_buttons(self) -> dict[str, pygame.Rect]:
         if self.page == "result":
-            return {
-                "restart": pygame.Rect(430, 500, 200, 58),
-                "menu": pygame.Rect(650, 500, 200, 58),
-            }
+            return {"lobby": pygame.Rect(490, 566, 300, 58)}
         if self.page == "failure":
-            return {"lobby": pygame.Rect(490, 525, 300, 58)}
+            return {"lobby": pygame.Rect(490, 566, 300, 58)}
         return {}
 
     def _page_button_at(self, position: tuple[int, int]) -> str | None:
@@ -3938,12 +4333,14 @@ class StartScreen:
                 self._notify(f"先完成教学：{self._current_tutorial_step.title}")
                 return
             self._finish_run()
-        elif button == "restart" and self.page == "result":
-            self._start_run(1)
         elif button == "lobby" and self.page == "failure":
             relics = self.result_relics
             self._enter_lobby()
             self._notify(f"失败勘定完成，凝结回响遗晶 +{relics}")
+        elif button == "lobby" and self.page == "result":
+            relics = self.result_relics
+            self._enter_lobby()
+            self._notify(f"第一阶段通关，凝结回响遗晶 +{relics}")
         elif button == "menu":
             self.page = "menu"
             self.confirm_exit = False
@@ -3994,10 +4391,6 @@ class StartScreen:
             int(self.profile.get("best_floor", 0) or 0),
             self.run_floor,
         )
-        if not self.is_tutorial_run:
-            # 这一层已经打通：远征起点顺延到下一层，末层则留在原地
-            self._set_progress_floor(self.run_floor + 1)
-        self.profile["retry_run"] = None
         scores = self.profile.get("scores", [])
         if not isinstance(scores, list):
             scores = []
@@ -4006,16 +4399,25 @@ class StartScreen:
                 "score": self.result_score,
                 "floor": self.run_floor,
                 "parries": self.run_parries,
+                "kills": self.run_kills,
+                "max_combo": self.run_max_combo,
+                "outcome": "clear",
             }
         )
         self.profile["scores"] = sorted(
             [score for score in scores if isinstance(score, dict)],
-            key=lambda score: int(score.get("score", 0) or 0),
+            key=lambda score: (
+                int(score.get("floor", 0) or 0),
+                int(score.get("score", 0) or 0),
+            ),
             reverse=True,
         )[:20]
         self.result_relics = 40 if self.is_tutorial_run else 30 + self.run_floor * 10 + min(
             self.run_parries * 2, 30
         )
+        if self.run_difficulty_hard and not self.is_tutorial_run:
+            # 高压远征：结算时按倍率发放额外回响遗晶
+            self.result_relics = round(self.result_relics * DIFFICULTY_RELIC_MULTIPLIER)
         self.profile["echo_relics"] = self.echo_relics + self.result_relics
         self.profile["tutorial_completed"] = (
             True if self.is_tutorial_run else self.tutorial_completed
@@ -4073,13 +4475,16 @@ class StartScreen:
             int(self.profile.get("best_floor", 0) or 0),
             self.run_floor,
         )
-        if not self.is_tutorial_run:
-            # 这一层没打过：起点停在这一层，并留住本局成长，下次接着打
-            self._set_progress_floor(max(self._progress_floor(), self.run_floor))
-            self._remember_retry_growth()
         self.result_relic_breakdown, self.result_relics = (
             self._calculate_failure_relics()
         )
+        if self.run_difficulty_hard:
+            # 高压远征：死亡勘定同样按倍率结算
+            boosted = round(self.result_relics * DIFFICULTY_RELIC_MULTIPLIER)
+            self.result_relic_breakdown = self.result_relic_breakdown + [
+                ("高压远征", boosted - self.result_relics)
+            ]
+            self.result_relics = boosted
         scores = self.profile.get("scores", [])
         if not isinstance(scores, list):
             scores = []
@@ -4088,6 +4493,7 @@ class StartScreen:
                 "score": self.result_score,
                 "floor": self.run_floor,
                 "parries": self.run_parries,
+                "kills": self.run_kills,
                 "max_combo": self.run_max_combo,
                 "relics": self.result_relics,
                 "outcome": "failure",
@@ -4095,7 +4501,10 @@ class StartScreen:
         )
         self.profile["scores"] = sorted(
             [score for score in scores if isinstance(score, dict)],
-            key=lambda score: int(score.get("score", 0) or 0),
+            key=lambda score: (
+                int(score.get("floor", 0) or 0),
+                int(score.get("score", 0) or 0),
+            ),
             reverse=True,
         )[:20]
         self.profile["echo_relics"] = self.echo_relics + self.result_relics
@@ -4164,15 +4573,15 @@ class StartScreen:
         self._draw_run_currency_ui()
         self._draw_boss_hud()
 
-        # 战斗区横跨整块画面，角色与敌人都可以在左右边界之间自由移动
-        pygame.draw.rect(self.canvas, (12, 37, 48), (48, 424, 1184, 142), 2)
         pygame.draw.line(self.canvas, (37, 103, 103), (60, 566), (1220, 566), 2)
         gate = pygame.transform.scale(self.assets.logo, (96, 96))
         gate.set_alpha(100)
         self.canvas.blit(gate, (592, 330))
         self._draw_portal()
-        self._draw_player()
+        self._draw_death_fades()
         self._draw_enemies()
+        # 角色永远画在最上层：不会被敌人或特效盖住
+        self._draw_player()
         self._draw_skill_waves()
         if self.is_tutorial_run:
             self._draw_tutorial_panel()
@@ -4258,7 +4667,6 @@ class StartScreen:
         hovered = rect.collidepoint(self._to_logical(pygame.mouse.get_pos()))
         color = COLORS["cyan"] if hovered else COLORS["muted"]
         pygame.draw.rect(self.canvas, (6, 16, 28), rect)
-        pygame.draw.rect(self.canvas, color, rect, 1)
         center = rect.center
         for index in range(8):
             angle = math.tau * index / 8.0 + math.pi / 8.0
@@ -4362,7 +4770,6 @@ class StartScreen:
         shade = pygame.Surface(panel.size, pygame.SRCALPHA)
         shade.fill((6, 16, 28, 220))
         self.canvas.blit(shade, panel)
-        pygame.draw.rect(self.canvas, (100, 82, 48), panel, 1)
 
         coin_center = (panel.x + 24, panel.centery)
         pygame.draw.circle(self.canvas, (91, 68, 37), coin_center, 12)
@@ -4401,12 +4808,6 @@ class StartScreen:
             COLORS["red"],
             (bar.x, bar.y, round(bar.width * boss.hp / max(1, boss.max_hp)), bar.height),
         )
-        pygame.draw.rect(
-            self.canvas,
-            COLORS["gold"] if phase == 2 else COLORS["ice"],
-            bar,
-            2,
-        )
         title = self.small_font.render(
             f"区域执政者 · {boss.display_name}    阶段 {phase}/2",
             True,
@@ -4423,7 +4824,6 @@ class StartScreen:
         shade = pygame.Surface(rect.size, pygame.SRCALPHA)
         shade.fill((6, 16, 28, 226))
         self.canvas.blit(shade, rect)
-        pygame.draw.rect(self.canvas, COLORS["cyan"], rect, 2)
         pygame.draw.line(
             self.canvas,
             COLORS["ice"],
@@ -4543,6 +4943,19 @@ class StartScreen:
             )
             self.canvas.blit(aura, (0, 0))
         self.canvas.blit(player_image, (draw_x, draw_y))
+        if self.player.hurt_flash > 0.0:
+            # 受击闪烁：角色整体泛白，明确反馈“这一下确实吃到了”
+            step = 1 + int(
+                3.0 * min(1.0, self.player.hurt_flash / self.player.HURT_FLASH_TIME)
+            )
+            self.canvas.blit(
+                self._flash_overlay(
+                    f"player:{sprite_name}:{self.player.facing}",
+                    player_image,
+                    step,
+                ),
+                (draw_x, draw_y),
+            )
         if self.player.parry_active:
             spark = pygame.transform.scale(self.assets.spark, (112, 112))
             spark.set_alpha(230 if self.player.perfect_parry_active else 120)
@@ -4694,6 +5107,53 @@ class StartScreen:
         pygame.draw.circle(layer, (*COLORS["white"], round(220 * fade)), tip, 5)
         pygame.draw.circle(layer, (*COLORS["white"], round(120 * fade)), tip, 13, 2)
 
+    def _flash_overlay(
+        self,
+        name: str,
+        image: pygame.Surface,
+        step: int,
+    ) -> pygame.Surface:
+        """生成/复用精灵的白色剪影，用于受击与弹刀闪烁。"""
+        cache_key = (name, step)
+        cached = self._flash_cache.get(cache_key)
+        if cached is None:
+            alpha = 60 + step * 40
+            mask = pygame.mask.from_surface(image)
+            cached = mask.to_surface(
+                setcolor=(255, 255, 255, min(255, alpha)),
+                unsetcolor=(0, 0, 0, 0),
+            )
+            self._flash_cache[cache_key] = cached
+        return cached
+
+    def _draw_death_fades(self) -> None:
+        """倒地淡出：敌人先向一侧倒下，再逐渐变透明消失。"""
+        for fade in self.death_fades:
+            ratio = max(0.0, min(1.0, fade.remaining / max(0.01, fade.total)))
+            sprite = self.assets.enemy_sprites.get(fade.kind)
+            fall = 1.0 - ratio
+            angle = -min(78.0, 92.0 * fall) * fade.facing
+            if sprite is None:
+                size = (56, 56)
+                body = pygame.Surface(size, pygame.SRCALPHA)
+                pygame.draw.rect(body, (60, 74, 82), body.get_rect(), 3)
+                image = body
+            else:
+                image = pygame.transform.scale(sprite, (96, 120))
+                if fade.facing < 0:
+                    image = pygame.transform.flip(image, True, False)
+            rotated = pygame.transform.rotate(image, angle)
+            if fall > 0.35:
+                # 后半段贴在“地面”上，看起来是倒下而不是悬空旋转
+                rotated = pygame.transform.smoothscale(
+                    rotated, (rotated.get_width(), max(8, rotated.get_height() // 2))
+                )
+            rotated.set_alpha(round(255 * (ratio**1.4)))
+            self.canvas.blit(
+                rotated,
+                rotated.get_rect(midbottom=(round(fade.x), round(fade.y))),
+            )
+
     def _draw_enemies(self) -> None:
         colors = {
             "chaser": COLORS["red"],
@@ -4711,6 +5171,14 @@ class StartScreen:
             if sprite is not None:
                 draw_rect = sprite.get_rect(midbottom=(x, y))
                 self.canvas.blit(sprite, draw_rect)
+                if enemy.hurt_flash > 0.0:
+                    step = 1 + int(
+                        3.0 * min(1.0, enemy.hurt_flash / enemy.HURT_FLASH_TIME)
+                    )
+                    self.canvas.blit(
+                        self._flash_overlay(f"enemy:{enemy.kind}", sprite, step),
+                        draw_rect,
+                    )
                 hp_ratio = enemy.hp / enemy.max_hp if enemy.max_hp else 0
                 hp_back = pygame.Rect(x - 26, y - 104, 52, 5)
                 pygame.draw.rect(self.canvas, (24, 57, 65), hp_back)
@@ -4734,7 +5202,11 @@ class StartScreen:
                 round(enemy.body_width),
                 round(enemy.body_height),
             )
-            color = colors.get(enemy.kind, COLORS["muted"])
+            color = (
+                COLORS["white"]
+                if enemy.hurt_flash > 0.0
+                else colors.get(enemy.kind, COLORS["muted"])
+            )
             pygame.draw.rect(self.canvas, (9, 25, 35), body)
             pygame.draw.rect(self.canvas, color, body, 3 if enemy.kind == "rust_crown_knight" else 2)
             if enemy.kind == "rust_crown_knight":
@@ -5053,12 +5525,6 @@ class StartScreen:
             glow = pygame.Surface(bar.size, pygame.SRCALPHA)
             glow.fill((*COLORS["white"], 40))
             self.canvas.blit(glow, bar)
-        pygame.draw.rect(
-            self.canvas,
-            COLORS["white"] if highlight else COLORS["ice"],
-            bar,
-            2 if highlight else 1,
-        )
         if text and height >= 14:
             value = self.small_font.render(text, True, COLORS["white"])
             self.canvas.blit(value, value.get_rect(center=bar.center))
@@ -5116,50 +5582,56 @@ class StartScreen:
         )
 
     def _draw_result(self) -> None:
+        """通关结算：一局结束后的成果清单。"""
         shade = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
-        shade.fill((3, 8, 18, 110))
+        shade.fill((3, 8, 18, 170))
         self.canvas.blit(shade, (0, 0))
-        title = self.title_font.render("试炼完成", True, COLORS["ice"])
-        self.canvas.blit(title, title.get_rect(center=(640, 170)))
+        title = self.title_font.render("第一阶段 · 通关", True, COLORS["ice"])
+        self.canvas.blit(title, title.get_rect(center=(640, 150)))
         subtitle = self.subtitle_font.render(
-            "新纪录" if self.result_new_record else "记录已更新",
+            "灰塔五层已贯通  /  记忆重构完成",
             True,
-            COLORS["gold"] if self.result_new_record else COLORS["cyan"],
+            COLORS["gold"],
         )
-        self.canvas.blit(subtitle, subtitle.get_rect(center=(640, 220)))
+        self.canvas.blit(subtitle, subtitle.get_rect(center=(640, 196)))
 
-        panel = pygame.Rect(390, 266, 500, 204)
+        panel = pygame.Rect(330, 236, 620, 300)
         pygame.draw.rect(self.canvas, (6, 16, 28), panel)
-        pygame.draw.rect(self.canvas, COLORS["cyan"], panel, 2)
-        rows = [
-            ("本局分数", f"{self.result_score:05d}"),
-            ("抵达层数", str(self.run_floor)),
-            ("完美弹刀", str(self.run_parries)),
-            ("最终等级", f"Lv.{self.player_level}"),
-        ]
-        for index, (label, value) in enumerate(rows):
-            y = panel.y + 28 + index * 42
+        pygame.draw.rect(self.canvas, (42, 105, 106), panel, 2)
+        heading = self.small_font.render("本局结算", True, COLORS["cyan"])
+        self.canvas.blit(heading, (panel.x + 30, panel.y + 18))
+        for index, (label, value) in enumerate(self._settlement_rows()):
+            y = panel.y + 58 + index * 38
             self.canvas.blit(
-                self.small_font.render(label, True, COLORS["muted"]),
-                (panel.x + 44, y),
+                self.overlay_body_font.render(label, True, COLORS["muted"]),
+                (panel.x + 40, y),
             )
-            value_text = self.overlay_body_font.render(value, True, COLORS["ice"])
+            value_color = COLORS["gold"] if label == "获得技能点" else COLORS["ice"]
+            value_text = self.overlay_body_font.render(value, True, value_color)
             self.canvas.blit(
                 value_text,
-                (panel.right - value_text.get_width() - 44, y - 5),
+                (panel.right - value_text.get_width() - 40, y),
             )
-        for name, rect in self._page_buttons().items():
-            self._draw_ui_button(
-                rect,
-                "再来一局" if name == "restart" else "返回主菜单",
-            )
+
+        self._draw_ui_button(self._page_buttons()["lobby"], "返回灰塔大厅")
         hint = self.small_font.render(
-            "Enter 再来一局    Esc 返回主菜单",
+            "Enter / Space 返回大厅  ·  下一局从第一层重新开始",
             True,
             COLORS["muted"],
         )
-        self.canvas.blit(hint, hint.get_rect(center=(640, 610)))
+        self.canvas.blit(hint, hint.get_rect(center=(640, 656)))
         self._draw_notification()
+
+    def _settlement_rows(self) -> list[tuple[str, str]]:
+        """结算清单：本局走到哪、拿到多少、打得怎么样。"""
+        return [
+            ("抵达关卡", f"第 {self.run_floor} 层"),
+            ("获得技能点", f"+{self.result_relics} 回响遗晶"),
+            ("击败敌人", f"{self.run_kills}"),
+            ("完美弹刀", f"{self.run_parries}"),
+            ("最高连击", f"x{self.run_max_combo}"),
+            ("本局分数", f"{self.result_score:05d}"),
+        ]
 
     def _draw_failure(self) -> None:
         shade = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
@@ -5211,7 +5683,7 @@ class StartScreen:
             ("抵达层数", str(self.run_floor)),
             ("最高连击", f"x{self.run_max_combo}"),
             ("完美弹刀", str(self.run_parries)),
-            ("战时铸币", f"{self.run_currency}  已消散"),
+            ("击败敌人", str(self.run_kills)),
         ]
         for index, (label, value) in enumerate(performance_rows):
             y = panel.y + 52 + index * 31
@@ -5219,7 +5691,7 @@ class StartScreen:
                 self.small_font.render(label, True, COLORS["muted"]),
                 (panel.x + 30, y),
             )
-            value_color = COLORS["red"] if index == 4 else COLORS["ice"]
+            value_color = COLORS["ice"]
             value_text = self.overlay_body_font.render(value, True, value_color)
             self.canvas.blit(
                 value_text,
@@ -5282,13 +5754,6 @@ class StartScreen:
         layer = pygame.Surface(panel.size, pygame.SRCALPHA)
         layer.fill((6, 16, 28, 208))
         pulse = 0.5 + 0.5 * math.sin(self.elapsed * 7.0)
-        border_alpha = 150 + round(80 * pulse)
-        pygame.draw.rect(
-            layer,
-            (*COLORS["gold"], border_alpha),
-            layer.get_rect(),
-            2,
-        )
 
         title = self.small_font.render(
             self.spawn_countdown_label, True, COLORS["gold"]
@@ -5311,7 +5776,6 @@ class StartScreen:
             COLORS["gold"],
             (bar.x, bar.y, round(bar.width * ratio), bar.height),
         )
-        pygame.draw.rect(layer, (*COLORS["muted"], 120), bar, 1)
         self.canvas.blit(layer, panel.topleft)
 
     def _draw_notification(self) -> None:
@@ -5323,12 +5787,6 @@ class StartScreen:
             self.canvas,
             (6, 16, 28, 225),
             toast_rect.inflate(34, 16),
-        )
-        pygame.draw.rect(
-            self.canvas,
-            COLORS["cyan"],
-            toast_rect.inflate(34, 16),
-            1,
         )
         self.canvas.blit(toast, toast_rect)
 
