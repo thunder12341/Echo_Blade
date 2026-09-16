@@ -74,6 +74,8 @@ def _enter_level(app, floor: int = 1, *, tutorial: bool = False):
 def _start_expedition(app, seconds: float = 2.0):
     """从大厅点城门出发，并把漩涡过场动画走完。"""
     app._activate_lobby_action(0)
+    if app.overlay == "expedition_choice":
+        app._activate_expedition_choice(0)
     _advance(app, seconds)
     return app
 
@@ -769,8 +771,6 @@ def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
 
     pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d))
     app._handle_events()
-    for _ in range(30):
-        app._update(1.0 / 60.0)
     assert app._current_tutorial_step.action == "jump"
 
     pygame.event.post(pygame.event.Event(pygame.KEYUP, key=pygame.K_d))
@@ -791,52 +791,27 @@ def test_initial_room_tutorial_progresses_in_order(monkeypatch, tmp_path):
     app.player.update(0.4, 0)
     app.pressed_keys.discard(pygame.K_w)
     app.pressed_keys.add(pygame.K_s)
-    app.player.x = app.room_enemies[0].x
-    app.player.y = 500
-    app.player.grounded = False
     app._handle_key(app.keybinds["attack"])
-    for _ in range(20):
-        app._update(1.0 / 60.0)
-        if app._current_tutorial_step.action == "parry":
-            break
     assert app._current_tutorial_step.action == "parry"
 
-    for _ in range(30):
-        app._update(1.0 / 60.0)
-        if (
-            app.pending_enemy_attacks
-            and app.pending_enemy_attacks[0].remaining
-            <= app.player.PERFECT_PARRY_WINDOW * 0.75
-        ):
-            break
-    assert app.pending_enemy_attacks
-
+    app.player.update(app.player.ATTACK_DURATION, 0)
     app._handle_key(app.keybinds["parry"])
-    for _ in range(10):
-        app._update(1.0 / 60.0)
-        if app._current_tutorial_step.action == "energy":
-            break
     assert app._current_tutorial_step.action == "energy"
 
-    # 回响能量步骤：教学关把能量推到只差一次行动，攒满才能进入剑气步骤
-    assert app.echo_energy == main.ECHO_ENERGY_MAX - main.ENERGY_GAIN_PARRY
-    target = app.room_enemies[0]
-    app.player.start_parry()
-    app.player.update(app.player.PERFECT_PARRY_WINDOW * 0.75, 1)
-    app._resolve_enemy_attack(
-        PendingEnemyAttack(target, target.scaled_attack(), 0.0)
-    )
-    assert app.echo_energy == main.ECHO_ENERGY_MAX
-    for _ in range(10):
-        app._update(1.0 / 60.0)
-        if app._current_tutorial_step.action == "skill":
-            break
-    assert app._current_tutorial_step.action == "skill"
-
-    # 回响剑气步骤：能量满时按下技能键即可斩出剑气（弹刀收招后才能出招）
+    # 能量教学只要求按提示再挥砍一次，随后直接提供剑气演示所需能量。
     app.player.update(app.player.PARRY_DURATION, 0)
+    app.pressed_keys.discard(pygame.K_s)
+    app._handle_key(app.keybinds["attack"])
+    assert app._current_tutorial_step.action == "skill"
+    assert app.echo_energy == main.ECHO_ENERGY_MAX
+
+    # 回响剑气步骤：能量满时按下技能键即可斩出剑气。
+    app.player.update(app.player.ATTACK_DURATION, 0)
     app._handle_key(app.keybinds["skill"])
     assert app._current_tutorial_step.action == "finish"
+    assert app.room_enemies == []
+    assert app.pending_enemy_attacks == []
+    assert app._room_cleared() is True
 
     app._activate_page_button("finish")
     assert app.page == "lobby"
@@ -931,8 +906,8 @@ def test_failure_sends_the_next_expedition_back_to_the_first_floor(
     pygame.quit()
 
 
-def test_clearing_the_final_floor_opens_the_clear_settlement(monkeypatch, tmp_path):
-    """闯过第五层算通关：一局结束并弹出结算界面，下一局再从第一层开始。"""
+def test_clearing_first_stage_boss_enters_second_stage(monkeypatch, tmp_path):
+    """第一阶段首领击破后继续进入第二阶段第一关。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app.profile = app._new_profile()
     app.profile["tutorial_completed"] = True
@@ -948,19 +923,11 @@ def test_clearing_the_final_floor_opens_the_clear_settlement(monkeypatch, tmp_pa
     app._open_portal_choice()
     app._activate_portal_choice(1)
 
-    assert app.page == "result"
-    assert app.result_cleared is True
-    assert app._active_run_checkpoint() is None
-    rows = dict(app._settlement_rows())
-    assert rows["抵达关卡"] == "第 5 层"
-    assert rows["击败敌人"] == "1"
-    app._draw()
-
-    app._handle_key(pygame.K_RETURN)
-    assert app.page == "lobby"
-
-    _start_expedition(app)
+    assert app.page == "game"
+    assert app.run_stage == 2
     assert app.run_floor == 1
+    assert app.room_type == main.ROOM_COMBAT
+    assert app._active_run_checkpoint()["stage"] == 2
     pygame.quit()
 
 
@@ -979,6 +946,7 @@ def test_lobby_resumes_persisted_expedition_checkpoint_after_restart(
     app.run_combo = 6
     app.run_max_combo = 11
     app.run_parries = 4
+    app.run_kills = 9
     app.run_currency = 77
     app.player_level = 4
     app.player_exp = 20
@@ -992,7 +960,10 @@ def test_lobby_resumes_persisted_expedition_checkpoint_after_restart(
     again._load_slot(0)
     assert again.page == "lobby"
     assert "继续远征" in again._lobby_actions()[0][1]
-    _start_expedition(again)
+    again._activate_lobby_action(0)
+    assert again.overlay == "expedition_choice"
+    again._activate_expedition_choice(0)
+    _advance(again, 2.0)
 
     assert again.page == "game"
     assert again.run_floor == 3
@@ -1000,6 +971,7 @@ def test_lobby_resumes_persisted_expedition_checkpoint_after_restart(
     assert again.run_combo == 6
     assert again.run_max_combo == 11
     assert again.run_parries == 4
+    assert again.run_kills == 9
     assert again.run_currency == 77
     assert again.player_level == 4
     assert again.player_exp == 20
@@ -1007,7 +979,107 @@ def test_lobby_resumes_persisted_expedition_checkpoint_after_restart(
     assert again.echo_energy == 60
     assert again.player.max_hp == 320 + 45 + 3 * main.HP_PER_LEVEL
     assert again.player.attack_damage == 18 + 4 + 3 * main.ATTACK_PER_LEVEL
-    assert "第 3 层" in again.notification
+    assert "第 1 阶段第 3 关" in again.notification
+    pygame.quit()
+
+
+def test_settings_can_suspend_an_expedition_to_lobby(monkeypatch, tmp_path):
+    """暂返大厅会保存完整局内状态，但不会触发死亡或通关结算。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app._start_run(
+        3,
+        tutorial=False,
+        stage=2,
+        route_seed=24680,
+        room_type=main.ROOM_COMBAT,
+    )
+    app._dismiss_floor_intro()
+    app.run_score = 4321
+    app.run_kills = 19
+    app.run_currency = 88
+    app.player_level = 5
+    app.player_exp = 27
+    app.player.hp = 203
+    app.echo_energy = 74
+    app.run_shop_attack_bonus = 6
+    app.run_shop_hp_bonus = 35
+    app.shop_purchased = {"edge_plating"}
+
+    app._handle_key(pygame.K_ESCAPE)
+    app._activate_setting(4)
+
+    assert app.page == "lobby"
+    assert app.overlay is None
+    checkpoint = app._active_run_checkpoint()
+    assert checkpoint is not None
+    assert checkpoint["stage"] == 2
+    assert checkpoint["floor"] == 3
+    assert checkpoint["route_seed"] == 24680
+    assert checkpoint["room_type"] == main.ROOM_COMBAT
+    assert checkpoint["run_score"] == 4321
+    assert checkpoint["run_kills"] == 19
+    assert checkpoint["run_currency"] == 88
+    assert checkpoint["player_level"] == 5
+    assert checkpoint["player_exp"] == 27
+    assert checkpoint["player_hp"] == 203
+    assert checkpoint["echo_energy"] == 74
+    assert checkpoint["shop_attack_bonus"] == 6
+    assert checkpoint["shop_hp_bonus"] == 35
+    assert checkpoint["shop_purchased"] == ["edge_plating"]
+    assert "继续或重新开始" in app.notification
+    pygame.quit()
+
+
+def test_expedition_choice_escape_preserves_checkpoint(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app._start_run(2, tutorial=False)
+    app.player.hp = 177
+    app._save_run_checkpoint()
+    app._enter_lobby()
+    before = app._active_run_checkpoint().copy()
+
+    app._activate_lobby_action(0)
+    assert app.overlay == "expedition_choice"
+    app._handle_key(pygame.K_ESCAPE)
+
+    assert app.page == "lobby"
+    assert app.overlay is None
+    assert app._active_run_checkpoint() == before
+    assert app.transition is None
+    pygame.quit()
+
+
+def test_restarting_suspended_expedition_keeps_permanent_progress(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app.profile["echo_relics"] = 135
+    app.profile["progression"]["levels"]["vital_lattice"] = 2
+    app._start_run(4, tutorial=False)
+    app.run_difficulty_hard = True
+    app.run_currency = 90
+    app._save_run_checkpoint()
+    app._enter_lobby()
+
+    app._activate_lobby_action(0)
+    assert app.overlay == "expedition_choice"
+    app._activate_expedition_choice(1)
+
+    assert app._active_run_checkpoint() is None
+    assert app.echo_relics == 135
+    assert app._track_level("vital_lattice") == 2
+    _advance(app, 2.0)
+    assert app.page == "game"
+    assert app.run_stage == 1
+    assert app.run_floor == 1
+    assert app.run_currency != 90
+    assert app.run_difficulty_hard is False
+    assert app.echo_relics == 135
+    assert app._track_level("vital_lattice") == 2
     pygame.quit()
 
 
@@ -1168,13 +1240,16 @@ def test_new_nexus_tracks_apply_attributes_and_mechanics(monkeypatch, tmp_path):
     assert app.run_currency == 17
     assert app.run_kills == 1
 
-    # 自动回复：每秒 6 点生命与 1 点回响能量
+    # 生命每 10 秒结算一次；回响能量仍按秒积累。
     app._dismiss_floor_intro()
+    _clear_room(app)
     app.player.hp = 100
     app.echo_energy = 0
-    _advance(app, 1.02)
+    _advance(app, 9.9)
+    assert app.player.hp == 100
+    _advance(app, 0.2)
     assert app.player.hp == 106
-    assert app.echo_energy == 1
+    assert app.echo_energy >= 10
     pygame.quit()
 
 
@@ -1213,7 +1288,7 @@ def test_tutorial_hints_follow_custom_keybinds(monkeypatch, tmp_path):
     jump_step = next(step for step in app.tutorial_steps if step.action == "jump")
     parry_step = next(step for step in app.tutorial_steps if step.action == "parry")
     assert jump_step.objective == "按 SPACE 跳起"
-    assert parry_step.objective == "按 K 进行一次完美弹刀演示"
+    assert parry_step.objective == "按 K 进入一次弹刀架势"
 
     # 先把弹刀从 K 挪到 P，腾出 K 再绑定给跳跃，模拟玩家在设置里换键。
     app.overlay = "keybinds"
@@ -1229,7 +1304,7 @@ def test_tutorial_hints_follow_custom_keybinds(monkeypatch, tmp_path):
     parry_step = next(step for step in app.tutorial_steps if step.action == "parry")
     attack_step = next(step for step in app.tutorial_steps if step.action == "up_attack")
     assert jump_step.objective == "按 K 跳起"
-    assert parry_step.objective == "按 P 进行一次完美弹刀演示"
+    assert parry_step.objective == "按 P 进入一次弹刀架势"
     assert attack_step.objective == "按住 W/↑ 再按 J 使用上劈"
 
     # 重新开一局也要保留玩家自定义的键位提示。
@@ -1415,7 +1490,7 @@ def test_settings_can_return_to_menu_from_level(monkeypatch, tmp_path):
     app._start_run(1, tutorial=False)
     app._handle_key(pygame.K_ESCAPE)
 
-    app._activate_setting(4)
+    app._activate_setting(5)
     assert app.overlay is None
     assert app.confirm_exit is True
 
@@ -1429,25 +1504,25 @@ def test_settings_from_main_menu_closes_without_confirmation(monkeypatch, tmp_pa
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._open_overlay("settings")
 
-    app._activate_setting(4)
+    app._activate_setting(5)
     assert app.overlay is None
     assert app.confirm_exit is False
     assert app.page == "menu"
     pygame.quit()
 
 
-def test_settings_overlay_has_six_rows(monkeypatch, tmp_path):
+def test_settings_overlay_has_seven_rows(monkeypatch, tmp_path):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app._open_overlay("settings")
-    assert len(app._setting_rects()) == 6
+    assert len(app._setting_rects()) == 7
 
     app._handle_key(pygame.K_DOWN)
     assert app.overlay_selected == 1
-    for _ in range(5):
+    for _ in range(6):
         app._handle_key(pygame.K_DOWN)
-    assert app.overlay_selected == 0  # 6 项循环
+    assert app.overlay_selected == 0  # 7 项循环
 
-    app._activate_setting(5)
+    app._activate_setting(6)
     assert app.overlay is None
     pygame.quit()
 
@@ -1500,7 +1575,7 @@ def test_portal_choice_next_level_and_menu(monkeypatch, tmp_path):
     app.portal_enter_timer = 0.0
     app._open_portal_choice()
 
-    assert app._portal_choice_labels()[1] == "进入第 4 层"
+    assert app._portal_choice_labels()[1] == "进入第 1 阶段 · 第 4 关"
     app._activate_portal_choice(1)
     assert app.page == "game"
     assert app.run_floor == 4
@@ -1978,10 +2053,12 @@ def test_fourth_floor_shop_requires_interaction_and_carries_upgrades_to_boss(
     app.run_currency = 100
     base_damage = app.player.attack_damage
     base_hp = app.player.max_hp
+    app.player.hp = 100
     assert app._purchase_shop_item(1) is True
     assert app._purchase_shop_item(2) is True
     assert app.player.attack_damage == base_damage + 4
     assert app.player.max_hp == base_hp + 45
+    assert app.player.hp == 100
     assert app.run_currency == 38
     assert app._stat("shop_purchases") == 2
 
@@ -1991,6 +2068,147 @@ def test_fourth_floor_shop_requires_interaction_and_carries_upgrades_to_boss(
     assert app.player.attack_damage == base_damage + 4
     assert app.player.max_hp == base_hp + 45
     assert app.run_currency == 38
+    assert app.player.hp == 100
+    pygame.quit()
+
+
+def test_second_stage_has_seven_rooms_with_random_second_room_and_fixed_finale(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    seed = 24680
+    expected_types = {
+        1: main.ROOM_COMBAT,
+        3: main.ROOM_COMBAT,
+        4: main.ROOM_ELITE,
+        5: main.ROOM_EVENT,
+        6: main.ROOM_SHOP,
+        7: main.ROOM_BOSS,
+    }
+
+    for room, expected_type in expected_types.items():
+        app._start_run(room, tutorial=False, stage=2, route_seed=seed)
+        assert app.run_stage == 2
+        assert app.run_floor == room
+        assert app.room_type == expected_type
+
+    app._start_run(2, tutorial=False, stage=2, route_seed=seed)
+    selected_type = app.room_type
+    assert selected_type in main.RANDOM_ROOM_TYPES
+    app._save_run_checkpoint()
+
+    saved = app._active_run_checkpoint()
+    assert saved["stage"] == 2
+    assert saved["floor"] == 2
+    assert saved["room_type"] == selected_type
+    assert main.StartScreen._room_type_for(2, 2, seed) == selected_type
+    pygame.quit()
+
+
+def test_second_stage_combat_rooms_spawn_larger_enemy_groups(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+
+    app._start_run(1, tutorial=False, stage=2, route_seed=3)
+    assert [len(wave) for wave in app.wave_plan] == [4, 5, 5]
+
+    app._start_run(3, tutorial=False, stage=2, route_seed=3)
+    assert [len(wave) for wave in app.wave_plan] == [4, 5, 5]
+
+    app._start_run(
+        2,
+        tutorial=False,
+        stage=2,
+        room_type=main.ROOM_RIFT,
+        route_seed=3,
+    )
+    assert [len(wave) for wave in app.wave_plan] == [4, 5, 5]
+    pygame.quit()
+
+
+def test_second_stage_event_choice_is_applied_once_and_opens_exit(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(
+        5,
+        tutorial=False,
+        stage=2,
+        room_type=main.ROOM_EVENT,
+        route_seed=7,
+    )
+    app._dismiss_floor_intro()
+
+    assert app.overlay == "room_event"
+    before = app.run_currency
+    assert app._resolve_room_event(0) is True
+    assert app.run_currency == before + 24
+    assert app.room_resolved is True
+    assert app._room_cleared() is True
+    assert app._resolve_room_event(0) is False
+    assert app.run_currency == before + 24
+    assert app._active_run_checkpoint()["room_resolved"] is True
+    pygame.quit()
+
+
+def test_shop_and_event_rooms_never_restore_current_health(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _grant_tracks(app, vital_regeneration=5)
+
+    app._start_run(6, tutorial=False, stage=2, route_seed=7)
+    app.player.hp = 80
+    app._update_passive_recovery(main.HEAL_TICK_INTERVAL * 2)
+    assert app.player.hp == 80
+    app.run_currency = 100
+    assert app._purchase_shop_item(0) is True
+    assert app._purchase_shop_item(2) is True
+    assert app.player.hp == 80
+
+    app._start_run(
+        5,
+        tutorial=False,
+        stage=2,
+        room_type=main.ROOM_REWARD,
+        route_seed=7,
+    )
+    app.player.hp = 80
+    assert app._resolve_room_event(1) is True
+    assert app.player.hp == 80
+    app._update_passive_recovery(main.HEAL_TICK_INTERVAL * 2)
+    assert app.player.hp == 80
+    pygame.quit()
+
+
+def test_next_room_preserves_health_and_echo_energy(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False, stage=2, route_seed=17)
+    app.player.hp = 137
+    app.echo_energy = 73
+
+    app._start_run(2, tutorial=False, stage=2, keep_progress=True, route_seed=17)
+
+    assert app.player.hp == 137
+    assert app.echo_energy == 73
+    pygame.quit()
+
+
+def test_second_stage_sixth_room_is_shop_and_seventh_room_is_boss(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(6, tutorial=False, stage=2, route_seed=11)
+    assert app.room_type == main.ROOM_SHOP
+    assert app.wave_plan == []
+    app._dismiss_floor_intro()
+    assert app.overlay == "shop"
+
+    app._leave_shop()
+    assert app._room_cleared() is True
+
+    app._start_run(7, tutorial=False, stage=2, keep_progress=True, route_seed=11)
+    assert app.room_type == main.ROOM_BOSS
+    assert [[enemy.kind for enemy in wave] for wave in app.wave_plan] == [
+        ["rust_crown_knight"]
+    ]
     pygame.quit()
 
 
@@ -2011,6 +2229,8 @@ def test_first_stage_boss_enters_phase_two_and_casts_memory_sever_at_medium_rate
     assert special is not None
     assert special.parryable is True
     assert special.telegraph_time >= 1.0
+    assert boss.x > 1100
+    assert abs(boss.x - 230) > 800
 
 
 def test_unparried_memory_sever_ignores_dash_and_removes_most_health(
@@ -2061,9 +2281,12 @@ def test_parrying_memory_sever_stuns_boss_and_breaks_defense_for_three_seconds(
     pygame.quit()
 
 
-def test_fifth_floor_portal_finishes_first_stage(monkeypatch, tmp_path):
+def test_second_stage_seventh_room_portal_finishes_expedition(monkeypatch, tmp_path):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
-    _enter_level(app, floor=5)
+    app._start_run(7, tutorial=False, stage=2, route_seed=123)
+    app._dismiss_floor_intro()
+    app.enemy_spawn_timer = 0.0
+    app._update_enemy_spawn(0.0)
     boss = app.room_enemies[0]
     boss.hp = 0
     app._award_enemy_defeat(boss)
@@ -2074,10 +2297,11 @@ def test_fifth_floor_portal_finishes_first_stage(monkeypatch, tmp_path):
     app.wave_index = 0
 
     assert app._room_cleared() is True
-    assert app._portal_choice_labels()[1] == "完成阶段并返回大厅"
+    assert app._portal_choice_labels()[1] == "完成第二阶段并返回大厅"
     app._open_portal_choice()
     app._activate_portal_choice(1)
     assert app.page == "result"
+    assert dict(app._settlement_rows())["抵达关卡"] == "第 2 阶段 · 第 7 关"
     app._activate_page_button("lobby")
     assert app.page == "lobby"
     pygame.quit()
@@ -2231,12 +2455,14 @@ def test_defeating_enemies_grants_exp_and_level_ups_raise_stats(monkeypatch, tmp
 
     assert app.player_exp == app._enemy_exp(enemy) > 0
 
+    app.player.hp = 90
     app._gain_exp(app.exp_to_next - app.player_exp)
 
     assert app.player_level == 2
     assert app.player_exp == 0
     assert app.player.max_hp == base_max_hp + main.HP_PER_LEVEL
     assert app.player.attack_damage == base_damage + main.ATTACK_PER_LEVEL
+    assert app.player.hp == 90
     pygame.quit()
 
 
@@ -2291,14 +2517,14 @@ def test_echo_energy_gains_match_design_and_cap_at_max(monkeypatch, tmp_path):
     pygame.quit()
 
 
-def test_energy_resets_at_the_start_of_every_floor(monkeypatch, tmp_path):
+def test_energy_is_preserved_when_entering_the_next_floor(monkeypatch, tmp_path):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     _enter_level(app)
     app.echo_energy = main.ECHO_ENERGY_MAX
 
     app._start_run(2, tutorial=False, keep_progress=True)
 
-    assert app.echo_energy == 0
+    assert app.echo_energy == main.ECHO_ENERGY_MAX
     pygame.quit()
 
 

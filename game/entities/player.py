@@ -347,13 +347,11 @@ class Player:
         return True
 
     def gain_level(self, hp_gain: int, attack_gain: int) -> int:
-        """升级：提高生命上限与攻击力，并按上限比例回复生命，返回回复量。"""
+        """升级只提高生命上限与攻击力，不立即恢复当前生命。"""
         hp_gain = max(0, int(hp_gain))
         self.max_hp += hp_gain
         self.attack_bonus += max(0, int(attack_gain))
-        healed = max(0, min(self.max_hp - self.hp, hp_gain + round(self.max_hp * 0.3)))
-        self.hp += healed
-        return healed
+        return 0
 
     def take_damage(self, amount: int, *, ignore_invulnerability: bool = False) -> int:
         if self.invulnerable and not ignore_invulnerability:

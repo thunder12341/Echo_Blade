@@ -559,10 +559,20 @@ class RustCrownKnight(Enemy):
         distance = self.distance_to(player_position)
         if self.phase == 2 and self._special_cooldown <= 0.0 and self.attack_ready:
             self._special_cooldown = self.SPECIAL_INTERVAL
+            left_anchor = self.bounds_left + self.body_width / 2
+            right_anchor = self.bounds_right - self.body_width / 2
+            self.x = max(
+                (left_anchor, right_anchor),
+                key=lambda anchor: abs(anchor - float(player_position[0])),
+            )
+            self.velocity_x = 0.0
+            self.velocity_y = 0.0
+            self.y = self.ground_y
+            self.facing = self.direction_to(player_position)
             return EnemyIntent(
                 "memory_sever",
                 attack=self.scaled_attack(self.execution_profile),
-                note="断忆敕令：必须完美弹刀",
+                note="远距瞬移 · 断忆敕令：必须完美弹刀",
             )
         if distance <= self.attack_profile.reach and self.attack_ready:
             return EnemyIntent(

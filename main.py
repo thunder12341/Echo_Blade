@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,6 +64,7 @@ PORTAL_RETRIGGER_LOCK = 0.6
 # 每升一级提升的生命上限与攻击力
 HP_PER_LEVEL = 26
 ATTACK_PER_LEVEL = 3
+HEAL_TICK_INTERVAL = 10.0
 
 # -- 回响中枢 ---------------------------------------------------------------
 # 每个存档的成长拓扑不会因为战斗失败而重置，只有新建/覆盖存档才会清空
@@ -70,7 +72,7 @@ DIFFICULTY_THREAT_BONUS = 0.35
 DIFFICULTY_RELIC_MULTIPLIER = 1.5
 
 # -- 回响能量 ---------------------------------------------------------------
-# 每一层开局清零；普通攻击 < 上劈/下劈 < 击败敌人 = 完美弹刀
+# 新远征开局清零，换关保留；普通攻击 < 上劈/下劈 < 击败敌人 = 完美弹刀
 ECHO_ENERGY_MAX = 100
 ENERGY_GAIN_ATTACK = 4
 ENERGY_GAIN_HEAVY_ATTACK = 7
@@ -123,7 +125,26 @@ FAILURE_PARRY_RELIC_CAP = 30
 # -- 第一阶段商店与首领 -----------------------------------------------------
 SHOP_FLOOR = 4
 BOSS_FLOOR = 5
+SECOND_STAGE_ROOM_COUNT = 7
+SECOND_STAGE_SHOP_ROOM = 6
+SECOND_STAGE_BOSS_ROOM = 7
 BOSS_MEMORY_SEVER_DAMAGE_RATIO = 0.8
+
+ROOM_COMBAT = "combat"
+ROOM_ELITE = "elite"
+ROOM_EVENT = "event"
+ROOM_REWARD = "reward"
+ROOM_SANCTUARY = "sanctuary"
+ROOM_RIFT = "rift"
+ROOM_SHOP = "shop"
+ROOM_BOSS = "boss"
+RANDOM_ROOM_TYPES = (
+    ROOM_EVENT,
+    ROOM_REWARD,
+    ROOM_SANCTUARY,
+    ROOM_ELITE,
+    ROOM_RIFT,
+)
 
 
 @dataclass(frozen=True)
@@ -303,7 +324,7 @@ LEGACY_PROGRESSION_NODES = (
         "refracted_afterglow",
         "任意一局最高连击达到 12",
         100,
-        "每层首次击破敌人时恢复 8% 最大生命。",
+        "战斗房内每 10 秒恢复 8% 最大生命。",
     ),
     ProgressionNode(
         "twin_blade_license",
@@ -475,10 +496,10 @@ PROGRESSION_TRACKS = (
         "vital_regeneration",
         "机制谱系",
         "生命自愈",
-        "战斗中每秒恢复 {value} 点生命。",
+        "战斗房内每 10 秒恢复 {value} 点生命。",
         (3, 6, 9, 12, 15),
         (50, 90, 150, 230, 340),
-        "点/秒",
+        "点/10秒",
     ),
     ProgressionTrack(
         "resonance_reflux",
@@ -555,10 +576,30 @@ FLOOR_WAVE_PLANS: dict[int, tuple[tuple[str, ...], ...]] = {
     5: (("rust_crown_knight",),),
 }
 
+# 第二阶段共七关；第二关的实际类型由路线种子决定，六、七关固定为商店和首领。
+SECOND_STAGE_WAVE_PLANS: dict[int, tuple[tuple[str, ...], ...]] = {
+    1: (
+        ("shield_guard", "rift_worm", "spear_thrower", "chaser"),
+        ("chaser", "resonance_mage", "rift_worm", "spear_thrower", "chaser"),
+        ("shield_guard", "rift_worm", "resonance_mage", "chaser", "spear_thrower"),
+    ),
+    3: (
+        ("shield_guard", "shield_guard", "resonance_mage", "spear_thrower"),
+        ("rift_worm", "chaser", "chaser", "spear_thrower", "resonance_mage"),
+        ("shield_guard", "rift_worm", "resonance_mage", "chaser", "spear_thrower"),
+    ),
+    4: (
+        ("shield_guard", "resonance_mage", "resonance_mage", "spear_thrower"),
+        ("rift_worm", "rift_worm", "shield_guard", "chaser", "resonance_mage"),
+        ("shield_guard", "rift_worm", "resonance_mage", "chaser", "spear_thrower"),
+    ),
+    7: (("rust_crown_knight",),),
+}
+
 SHOP_ITEMS = (
-    ShopItem("repair_infusion", "缝合注剂", 16, "恢复 35% 最大生命值。"),
+    ShopItem("repair_infusion", "晶格护层", 16, "本次远征最大生命提高 25，不恢复生命。"),
     ShopItem("edge_plating", "锋刃镀层", 28, "本次远征攻击力永久提高 4 点。"),
-    ShopItem("vital_expansion", "晶格扩容", 34, "本次远征最大生命提高 45，并恢复 45 点生命。"),
+    ShopItem("vital_expansion", "晶格扩容", 34, "本次远征最大生命提高 45，不恢复生命。"),
     ShopItem("resonance_cell", "谐振电池", 20, "立即补充 45 点回响能量。"),
 )
 
@@ -639,9 +680,68 @@ FLOOR_BRIEFINGS: dict[int, FloorBriefing] = {
             ),
             (
                 "第二阶段 · 熔锈誓约",
-                "骑士约每 7 秒发动一次断忆敕令。金红色敕令覆盖全场且不能靠冲刺规避；"
+                "骑士约每 7 秒瞬移至远端并发动断忆敕令。金红色敕令覆盖全场且不能靠冲刺规避；"
                 "未完美弹刀会失去 80% 最大生命，成功则令其眩晕并防御崩解 3 秒。",
             ),
+        ),
+    ),
+}
+
+ROOM_TYPE_BRIEFINGS: dict[str, FloorBriefing] = {
+    ROOM_ELITE: FloorBriefing(
+        "赤印精英庭",
+        "高威胁敌群获得额外生命与攻击修正，击破后可取得更多战时铸币。",
+        (
+            ("精英契印", "敌群威胁额外提高 20%，编成会混合前后排与不可弹反攻击。"),
+            ("讨伐酬赏", "清空全部波次后额外获得 24 枚战时铸币。"),
+        ),
+    ),
+    ROOM_EVENT: FloorBriefing(
+        "失真记忆事件",
+        "本关没有强制战斗；读取残留记忆，并在三项不可撤销的结果中选择其一。",
+        (
+            ("记忆抉择", "选择铸币、回响能量或以生命换取本局攻击强化。"),
+            ("一次勘定", "结果确认后立即写入暂存，重新进入关卡不能重复领取。"),
+        ),
+    ),
+    ROOM_REWARD: FloorBriefing(
+        "遗珍回廊",
+        "稳定的回响遗珍悬浮于回廊中，可从三种本局强化中选择一种。",
+        (
+            ("锋刃遗珍", "本次远征攻击力提高 3 点。"),
+            ("生命遗珍", "最大生命提高 35 点，但不恢复当前生命。"),
+        ),
+    ),
+    ROOM_SANCTUARY: FloorBriefing(
+        "静滞庇护所",
+        "安全区室允许进行一次整备，不会生成敌人。",
+        (
+            ("静滞扩容", "最大生命提高 25 点，但不恢复当前生命。"),
+            ("谐振整备", "补满回响能量，或放弃整备换取战时铸币。"),
+        ),
+    ),
+    ROOM_RIFT: FloorBriefing(
+        "紊乱裂隙",
+        "裂隙会随机拼接高压敌群，威胁更高，但清理后获得额外铸币。",
+        (
+            ("未知编成", "敌群从第二阶段战斗池中重组，威胁额外提高 30%。"),
+            ("裂隙溢价", "清空房间后额外获得 32 枚战时铸币。"),
+        ),
+    ),
+    ROOM_SHOP: FloorBriefing(
+        "余烬行商驿站",
+        "第二阶段第六关固定为整备商店，可为最终首领战补充资源。",
+        (
+            ("区域行商", "生命上限、攻击与能量货品每件限购一次，商店不提供治疗。"),
+            ("最终整备", "不消费也可离开；离店后直接开启第七关入口。"),
+        ),
+    ),
+    ROOM_BOSS: FloorBriefing(
+        "深层锈冠王庭",
+        "第二阶段第七关：强化后的锈冠骑士仍具有两个阶段与断忆敕令。",
+        (
+            ("深层冠甲", "更高威胁强化生命与伤害，第一阶段维持可学习的近战组合。"),
+            ("断忆敕令", "骑士先瞬移到远离玩家的一侧；必须以完美弹刀破解，否则会损失绝大部分生命。"),
         ),
     ),
 }
@@ -741,6 +841,7 @@ class StartScreen:
         self.overlay: str | None = None
         self.return_page = "menu"
         self.overlay_selected = 0
+        self.expedition_choice_selected = 0
         self.keybind_selected = 0
         self.rebinding_action: str | None = None
         self.confirm_exit = False
@@ -749,8 +850,6 @@ class StartScreen:
         self.pressed_keys: set[int] = set()
         self.tutorial_steps: list[TutorialStep] = []
         self.tutorial_index = 0
-        self.tutorial_start_x = 0.0
-        self.tutorial_move_distance = 0.0
         self.lobby_selected = 0
         self.progression_selected = 0
         self.progression_collapsed = {
@@ -792,6 +891,11 @@ class StartScreen:
         )
 
         self.run_floor = 1
+        self.run_stage = 1
+        self.run_route_seed = 0
+        self.room_type = ROOM_COMBAT
+        self.room_resolved = False
+        self.room_choice_selected = 0
         self.run_score = 0
         self.run_combo = 0
         self.run_max_combo = 0
@@ -898,6 +1002,7 @@ class StartScreen:
         return {
             "version": 2,
             "best_score": 0,
+            "best_stage": 0,
             "best_floor": 0,
             "scores": [],
             "tutorial_completed": False,
@@ -924,7 +1029,16 @@ class StartScreen:
                 value = default
             return max(lower, min(upper, value))
 
-        floor = number("floor", 1, 1, BOSS_FLOOR)
+        stage = number("stage", 1, 1, 99)
+        max_room = BOSS_FLOOR if stage == 1 else SECOND_STAGE_ROOM_COUNT
+        floor = number("floor", 1, 1, max_room)
+        route_seed = number("route_seed", 0, 0, 2147483647)
+        room_type = StartScreen._room_type_for(
+            stage,
+            floor,
+            route_seed,
+            data.get("room_type"),
+        )
         player_hp = number("player_hp", 1, 0, 999999)
         if player_hp <= 0:
             return None
@@ -933,13 +1047,18 @@ class StartScreen:
         if not isinstance(purchased, list):
             purchased = []
         return {
-            "version": 1,
+            "version": 2,
             "status": "active",
+            "stage": stage,
             "floor": floor,
+            "route_seed": route_seed,
+            "room_type": room_type,
+            "room_resolved": bool(data.get("room_resolved", False)),
             "run_score": number("run_score", 0, 0, 999999999),
             "run_combo": number("run_combo", 0, 0, 999999),
             "run_max_combo": number("run_max_combo", 0, 0, 999999),
             "run_parries": number("run_parries", 0, 0, 999999),
+            "run_kills": number("run_kills", 0, 0, 999999),
             "run_currency": number("run_currency", 0, 0, 999999),
             "player_level": number("player_level", 1, 1, 999),
             "player_exp": number("player_exp", 0, 0, 999999),
@@ -954,7 +1073,12 @@ class StartScreen:
                     if isinstance(item_id, str) and item_id in valid_shop_items
                 }
             ),
-            "shop_closed": bool(data.get("shop_closed", floor != SHOP_FLOOR)),
+            "shop_closed": bool(
+                data.get(
+                    "shop_closed",
+                    room_type != ROOM_SHOP,
+                )
+            ),
             "hard_mode": bool(data.get("hard_mode", False)),
         }
 
@@ -982,6 +1106,12 @@ class StartScreen:
             profile["lifetime_stats"] = {}
         if not isinstance(profile.get("scores"), list):
             profile["scores"] = []
+        try:
+            profile["best_stage"] = max(0, int(profile.get("best_stage", 0) or 0))
+        except (TypeError, ValueError):
+            profile["best_stage"] = 0
+        if profile["best_stage"] == 0 and int(profile.get("best_floor", 0) or 0) > 0:
+            profile["best_stage"] = 1
         profile["active_run"] = StartScreen._normalise_run_checkpoint(
             profile.get("active_run")
         )
@@ -1001,6 +1131,7 @@ class StartScreen:
         """把旧版单档案格式迁移到 1 号槽，避免玩家进度凭空消失。"""
         legacy_keys = (
             "best_score",
+            "best_stage",
             "best_floor",
             "tutorial_completed",
             "echo_relics",
@@ -1011,6 +1142,7 @@ class StartScreen:
         profile = self._new_profile()
         for key in (
             "best_score",
+            "best_stage",
             "best_floor",
             "scores",
             "tutorial_completed",
@@ -1133,13 +1265,18 @@ class StartScreen:
 
     def _build_run_checkpoint(self) -> dict:
         return {
-            "version": 1,
+            "version": 2,
             "status": "active",
+            "stage": self.run_stage,
             "floor": self.run_floor,
+            "route_seed": self.run_route_seed,
+            "room_type": self.room_type,
+            "room_resolved": self.room_resolved,
             "run_score": self.run_score,
             "run_combo": self.run_combo,
             "run_max_combo": self.run_max_combo,
             "run_parries": self.run_parries,
+            "run_kills": self.run_kills,
             "run_currency": self.run_currency,
             "player_level": self.player_level,
             "player_exp": self.player_exp,
@@ -1167,22 +1304,34 @@ class StartScreen:
         if saved is None:
             return False
 
-        self._start_run(saved["floor"], tutorial=False)
+        self._start_run(
+            saved["floor"],
+            tutorial=False,
+            stage=saved["stage"],
+            room_type=saved["room_type"],
+            route_seed=saved["route_seed"],
+        )
         self.run_score = saved["run_score"]
         self.run_combo = saved["run_combo"]
         self.run_max_combo = max(saved["run_max_combo"], self.run_combo)
         self.run_parries = saved["run_parries"]
+        self.run_kills = saved["run_kills"]
         self.run_currency = saved["run_currency"]
         self.player_level = saved["player_level"]
         self.player_exp = min(saved["player_exp"], self.exp_to_next - 1)
         self.run_shop_attack_bonus = saved["shop_attack_bonus"]
         self.run_shop_hp_bonus = saved["shop_hp_bonus"]
         self.shop_purchased = set(saved["shop_purchased"])
-        self.shop_closed = saved["shop_closed"] if self.run_floor == SHOP_FLOOR else True
+        self.shop_closed = saved["shop_closed"] if self._is_shop_room() else True
+        self.room_resolved = saved["room_resolved"]
         self.run_difficulty_hard = saved["hard_mode"]
-        self.run_threat = self._floor_threat(self.run_floor) + (
+        self.run_threat = self._floor_threat(self.run_floor, self.run_stage) + (
             DIFFICULTY_THREAT_BONUS if self.run_difficulty_hard else 0.0
         )
+        if self.room_type == ROOM_ELITE:
+            self.run_threat += 0.2
+        elif self.room_type == ROOM_RIFT:
+            self.run_threat += 0.3
 
         gained_levels = max(0, self.player_level - 1)
         self.player.max_hp += self.run_shop_hp_bonus + gained_levels * HP_PER_LEVEL
@@ -1197,7 +1346,10 @@ class StartScreen:
     def _start_or_resume_expedition(self) -> None:
         checkpoint = self._active_run_checkpoint()
         if checkpoint is not None and self._resume_run_checkpoint(checkpoint):
-            self._notify(f"已读取暂存进度：从第 {self.run_floor} 层继续远征")
+            self._notify(
+                f"已读取暂存进度：从第 {self.run_stage} 阶段"
+                f"第 {self.run_floor} 关继续远征"
+            )
             return
         # 一局 = 从第一层打到失败或通关，所以新远征永远从第一层开始
         self._clear_run_checkpoint()
@@ -1235,6 +1387,7 @@ class StartScreen:
         return {
             "version": 2,
             "best_score": int(self.profile.get("best_score", 0) or 0),
+            "best_stage": int(self.profile.get("best_stage", 0) or 0),
             "best_floor": int(self.profile.get("best_floor", 0) or 0),
             "scores": self.profile.get("scores", []),
             "tutorial_completed": bool(
@@ -1427,9 +1580,9 @@ class StartScreen:
             if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
                 self._close_overlay()
             elif key in (pygame.K_UP, pygame.K_w):
-                self.overlay_selected = (self.overlay_selected - 1) % 6
+                self.overlay_selected = (self.overlay_selected - 1) % 7
             elif key in (pygame.K_DOWN, pygame.K_s):
-                self.overlay_selected = (self.overlay_selected + 1) % 6
+                self.overlay_selected = (self.overlay_selected + 1) % 7
             elif key in (pygame.K_LEFT, pygame.K_RIGHT):
                 self._change_setting(
                     self.overlay_selected,
@@ -1439,6 +1592,24 @@ class StartScreen:
                 self._activate_setting(1)
             elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
                 self._activate_setting(self.overlay_selected)
+            return
+
+        if self.overlay == "expedition_choice":
+            if key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self._close_overlay()
+            elif key in (
+                pygame.K_LEFT,
+                pygame.K_a,
+                pygame.K_UP,
+                pygame.K_w,
+                pygame.K_RIGHT,
+                pygame.K_d,
+                pygame.K_DOWN,
+                pygame.K_s,
+            ):
+                self.expedition_choice_selected = 1 - self.expedition_choice_selected
+            elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
+                self._activate_expedition_choice(self.expedition_choice_selected)
             return
 
         if self.overlay == "leaderboard":
@@ -1477,6 +1648,16 @@ class StartScreen:
                 self.difficulty_selected = 1 - self.difficulty_selected
             elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
                 self._confirm_difficulty(self.difficulty_selected)
+            return
+
+        if self.overlay == "room_event":
+            choice_count = len(self._room_event_choices())
+            if key in (pygame.K_UP, pygame.K_w):
+                self.room_choice_selected = (self.room_choice_selected - 1) % choice_count
+            elif key in (pygame.K_DOWN, pygame.K_s):
+                self.room_choice_selected = (self.room_choice_selected + 1) % choice_count
+            elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
+                self._resolve_room_event(self.room_choice_selected)
             return
 
         if self.overlay == "shop":
@@ -1519,6 +1700,15 @@ class StartScreen:
             return
 
         if self.page == "game":
+            if key in (
+                pygame.K_LEFT,
+                pygame.K_a,
+                self.keybinds["left"],
+                pygame.K_RIGHT,
+                pygame.K_d,
+                self.keybinds["right"],
+            ):
+                self._complete_tutorial_action("move")
             if key == self.keybinds["attack"]:
                 self._start_player_attack(self._attack_direction_from_input())
             elif key == self.keybinds["parry"]:
@@ -1526,6 +1716,7 @@ class StartScreen:
                     self.audio.play("parry_ready")
                     self._try_projectile_parry()
                     self._notify("弹刀架势")
+                    self._complete_tutorial_action("parry")
             elif key == self.keybinds["skill"]:
                 self._try_cast_skill()
             elif key in (pygame.K_LSHIFT, self.keybinds["dash"]):
@@ -1537,6 +1728,7 @@ class StartScreen:
                 if self.player.request_jump():
                     self.audio.play("jump")
                     self._notify("跳跃")
+                    self._complete_tutorial_action("jump")
             elif key == pygame.K_ESCAPE:
                 self._open_overlay("settings", return_page="game")
             return
@@ -1600,6 +1792,12 @@ class StartScreen:
                 if rect.collidepoint(logical):
                     self.overlay_selected = index
                     return
+        if self.overlay == "expedition_choice":
+            logical = self._to_logical(position)
+            for index, rect in enumerate(self._expedition_choice_rects()):
+                if rect.collidepoint(logical):
+                    self.expedition_choice_selected = index
+                    return
         if self.overlay == "progression":
             logical = self._to_logical(position)
             for index, rect in self._progression_visible_node_rects().items():
@@ -1611,6 +1809,12 @@ class StartScreen:
             for index, rect in enumerate(self._difficulty_rects()):
                 if rect.collidepoint(logical):
                     self.difficulty_selected = index
+                    return
+        if self.overlay == "room_event":
+            logical = self._to_logical(position)
+            for index, row in enumerate(self._room_event_rects()):
+                if row.collidepoint(logical):
+                    self.room_choice_selected = index
                     return
         if self.overlay == "shop":
             logical = self._to_logical(position)
@@ -1688,7 +1892,7 @@ class StartScreen:
     def _lobby_actions(self) -> list[tuple[str, str, pygame.Rect]]:
         checkpoint = self._active_run_checkpoint()
         gate_label = (
-            f"继续远征 · 第 {checkpoint['floor']} 层"
+            f"继续远征 · {checkpoint['stage']}-{checkpoint['floor']}"
             if checkpoint is not None
             else "开启新远征"
         )
@@ -1736,12 +1940,13 @@ class StartScreen:
         tutorial = "已完成教学" if profile.get("tutorial_completed") else "未完成教学"
         checkpoint = StartScreen._normalise_run_checkpoint(profile.get("active_run"))
         run_state = (
-            f"暂存第 {checkpoint['floor']} 层"
+            f"暂存阶段 {checkpoint['stage']}-{checkpoint['floor']}"
             if checkpoint is not None
             else "无暂存远征"
         )
         return (
-            f"最高层 {int(profile.get('best_floor', 0) or 0)}   "
+            f"最高进度 {int(profile.get('best_stage', 1) or 1)}-"
+            f"{int(profile.get('best_floor', 0) or 0)}   "
             f"最高分 {int(profile.get('best_score', 0) or 0):05d}   "
             f"遗晶 {max(0, int(profile.get('echo_relics', 0) or 0))}   "
             f"共鸣节点 {unlocked}   {run_state}   {tutorial}"
@@ -1802,16 +2007,46 @@ class StartScreen:
         action = actions[index][0]
         if action == "gate":
             checkpoint = self._active_run_checkpoint()
-            if checkpoint is None and self._track_unlocked("risk_covenant"):
-                # 点亮风险契约后，每次新远征前都能选择是否提高难度
-                self.difficulty_selected = 0
-                self._open_overlay("difficulty", return_page="lobby")
+            if checkpoint is not None:
+                self.expedition_choice_selected = 0
+                self._open_overlay("expedition_choice", return_page="lobby")
             else:
-                self._begin_expedition_transition()
+                self._start_new_expedition_flow()
         elif action == "nexus":
             self._open_overlay("progression", return_page="lobby")
         elif action == "records":
             self._open_overlay("leaderboard", return_page="lobby")
+
+    def _start_new_expedition_flow(self) -> None:
+        """Start a fresh run, including the optional risk-contract choice."""
+        self.run_difficulty_hard = False
+        if self._track_unlocked("risk_covenant"):
+            self.difficulty_selected = 0
+            self._open_overlay("difficulty", return_page="lobby")
+        else:
+            self._begin_expedition_transition()
+
+    def _activate_expedition_choice(self, index: int) -> None:
+        """Continue the checkpoint or discard only that run and start anew."""
+        if self.overlay != "expedition_choice" or index not in (0, 1):
+            return
+        if index == 0:
+            if self._active_run_checkpoint() is None:
+                self._close_overlay()
+                self._notify("暂存进度已失效，将开始新远征")
+                self._start_new_expedition_flow()
+                return
+            self.overlay = None
+            self.page = "lobby"
+            self._begin_expedition_transition()
+            return
+
+        self._clear_run_checkpoint()
+        self._save_profile()
+        self.overlay = None
+        self.page = "lobby"
+        self._notify("已放弃暂存远征；永久成长与回响遗晶不受影响")
+        self._start_new_expedition_flow()
 
     @staticmethod
     def _format_track_value(value: float) -> str:
@@ -1871,7 +2106,57 @@ class StartScreen:
         self.page = self.return_page
 
     @staticmethod
-    def _floor_briefing(floor: int) -> FloorBriefing:
+    def _room_type_for(
+        stage: int,
+        floor: int,
+        route_seed: int,
+        requested: object = None,
+    ) -> str:
+        """Resolve a room type without rerolling an already persisted route."""
+        valid = {
+            ROOM_COMBAT,
+            ROOM_ELITE,
+            ROOM_EVENT,
+            ROOM_REWARD,
+            ROOM_SANCTUARY,
+            ROOM_RIFT,
+            ROOM_SHOP,
+            ROOM_BOSS,
+        }
+        if isinstance(requested, str) and requested in valid:
+            return requested
+        if stage == 1:
+            if floor == SHOP_FLOOR:
+                return ROOM_SHOP
+            if floor == BOSS_FLOOR:
+                return ROOM_BOSS
+            return ROOM_COMBAT
+        if floor == SECOND_STAGE_SHOP_ROOM:
+            return ROOM_SHOP
+        if floor == SECOND_STAGE_BOSS_ROOM:
+            return ROOM_BOSS
+        if floor == 2:
+            index = (route_seed + stage * 97 + floor * 31) % len(RANDOM_ROOM_TYPES)
+            return RANDOM_ROOM_TYPES[index]
+        return {
+            1: ROOM_COMBAT,
+            3: ROOM_COMBAT,
+            4: ROOM_ELITE,
+            5: ROOM_EVENT,
+        }.get(floor, ROOM_COMBAT)
+
+    def _is_shop_room(self) -> bool:
+        return self.room_type == ROOM_SHOP
+
+    def _is_boss_room(self) -> bool:
+        return self.room_type == ROOM_BOSS
+
+    def _floor_briefing(self, floor: int) -> FloorBriefing:
+        if self.run_stage >= 2:
+            return ROOM_TYPE_BRIEFINGS.get(
+                self.room_type,
+                FLOOR_BRIEFINGS[3],
+            )
         return FLOOR_BRIEFINGS.get(floor, FLOOR_BRIEFINGS[3])
 
     def _open_floor_briefing(self) -> None:
@@ -1881,13 +2166,85 @@ class StartScreen:
     def _dismiss_floor_intro(self) -> None:
         if self.overlay == "floor_intro":
             self._close_overlay()
-            if self.run_floor == SHOP_FLOOR and not self.shop_closed:
+            if self._is_shop_room() and not self.shop_closed:
                 self._open_shop()
+            elif self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}:
+                if not self.room_resolved:
+                    self._open_room_event()
 
     def _open_shop(self) -> None:
         self.shop_selected = 0
         self._open_overlay("shop", return_page="game")
         self._notify("灰烬行商已展开战前整备目录")
+
+    def _open_room_event(self) -> None:
+        self.room_choice_selected = 0
+        self._open_overlay("room_event", return_page="game")
+        self._notify("选择一项结果；确认后将立即写入暂存")
+
+    def _room_event_choices(self) -> tuple[tuple[str, str], ...]:
+        if self.room_type == ROOM_REWARD:
+            return (
+                ("锋刃遗珍", "攻击力 +3"),
+                ("生命遗珍", "最大生命 +35，不恢复当前生命"),
+                ("谐振遗珍", "回响能量 +60"),
+            )
+        if self.room_type == ROOM_SANCTUARY:
+            return (
+                ("静滞扩容", "最大生命 +25，不恢复当前生命"),
+                ("谐振整备", "回响能量补满"),
+                ("拆解装置", "获得 18 枚战时铸币"),
+            )
+        return (
+            ("回收记忆", "获得 24 枚战时铸币"),
+            ("汲取谐振", "回响能量 +40"),
+            ("承受烙印", "失去 15% 当前生命，攻击力 +4"),
+        )
+
+    def _room_event_rects(self) -> list[pygame.Rect]:
+        rect = self._overlay_rect()
+        return [
+            pygame.Rect(rect.x + 42, rect.y + 112 + index * 108, rect.width - 84, 82)
+            for index in range(len(self._room_event_choices()))
+        ]
+
+    def _resolve_room_event(self, index: int) -> bool:
+        if self.room_resolved or index < 0 or index >= len(self._room_event_choices()):
+            return False
+        title = self._room_event_choices()[index][0]
+        if self.room_type == ROOM_REWARD:
+            if index == 0:
+                self.run_shop_attack_bonus += 3
+                self.player.attack_bonus += 3
+            elif index == 1:
+                self.run_shop_hp_bonus += 35
+                self.player.max_hp += 35
+            else:
+                self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + 60)
+        elif self.room_type == ROOM_SANCTUARY:
+            if index == 0:
+                self.run_shop_hp_bonus += 25
+                self.player.max_hp += 25
+            elif index == 1:
+                self.echo_energy = ECHO_ENERGY_MAX
+            else:
+                self.run_currency += 18
+        else:
+            if index == 0:
+                self.run_currency += 24
+            elif index == 1:
+                self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + 40)
+            else:
+                self.player.hp = max(1, self.player.hp - max(1, round(self.player.hp * 0.15)))
+                self.run_shop_attack_bonus += 4
+                self.player.attack_bonus += 4
+        self.room_resolved = True
+        self.overlay = None
+        self.page = "game"
+        self._save_run_checkpoint()
+        self.audio.play("hit", 0.45)
+        self._notify(f"{title} 已完成，回响之门正在开启")
+        return True
 
     def _leave_shop(self) -> None:
         if self.overlay != "shop":
@@ -1917,20 +2274,16 @@ class StartScreen:
         if self.run_currency < item.cost:
             self._notify(f"战时铸币不足，还需 {item.cost - self.run_currency}")
             return False
-        if item.item_id == "repair_infusion" and self.player.hp >= self.player.max_hp:
-            self._notify("生命状态完整，无需使用缝合注剂")
-            return False
-
         self.run_currency -= item.cost
         if item.item_id == "repair_infusion":
-            self.player.heal(max(1, round(self.player.max_hp * 0.35)))
+            self.run_shop_hp_bonus += 25
+            self.player.max_hp += 25
         elif item.item_id == "edge_plating":
             self.run_shop_attack_bonus += 4
             self.player.attack_bonus += 4
         elif item.item_id == "vital_expansion":
             self.run_shop_hp_bonus += 45
             self.player.max_hp += 45
-            self.player.heal(45)
         elif item.item_id == "resonance_cell":
             self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + 45)
         self.shop_purchased.add(item.item_id)
@@ -1951,6 +2304,13 @@ class StartScreen:
             self._dismiss_floor_intro()
             return
         logical = self._to_logical(position)
+        if self.overlay == "room_event":
+            for index, row in enumerate(self._room_event_rects()):
+                if row.collidepoint(logical):
+                    self.room_choice_selected = index
+                    self._resolve_room_event(index)
+                    return
+            return
         if self.overlay == "shop":
             for index, row in enumerate(self._shop_item_rects()):
                 if row.collidepoint(logical):
@@ -1998,14 +2358,19 @@ class StartScreen:
                     else:
                         self._activate_setting(index)
                     return
-            if rects[4].collidepoint(logical):
-                self.overlay_selected = 4
-                self._activate_setting(4)
-                return
-            if rects[5].collidepoint(logical):
-                self.overlay_selected = 5
+            for index, rect in enumerate(rects[4:], start=4):
+                if rect.collidepoint(logical):
+                    self.overlay_selected = index
+                    self._activate_setting(index)
+                    return
+            if not self._overlay_rect().collidepoint(logical):
                 self._close_overlay()
-                return
+        elif self.overlay == "expedition_choice":
+            for index, choice_rect in enumerate(self._expedition_choice_rects()):
+                if choice_rect.collidepoint(logical):
+                    self.expedition_choice_selected = index
+                    self._activate_expedition_choice(index)
+                    return
             if not self._overlay_rect().collidepoint(logical):
                 self._close_overlay()
         elif self.overlay == "leaderboard":
@@ -2059,7 +2424,6 @@ class StartScreen:
             return
 
         fixed_dt = min(max(0.0, dt), 1.0 / 30.0)
-        previous_x = self.player.x
         # 进入传送门时锁住操作，由动画把角色吸向门心
         move_axis = 0.0 if self.portal_enter_timer > 0.0 else self._move_axis()
         self.player.update(fixed_dt, move_axis)
@@ -2072,17 +2436,7 @@ class StartScreen:
         self._update_reflected_projectiles(fixed_dt)
         self._update_portal(fixed_dt)
         self._update_movement_audio(fixed_dt)
-        self.tutorial_move_distance += abs(self.player.x - previous_x)
-        if abs(self.player.x - self.tutorial_start_x) >= 80 or (
-            self._current_tutorial_step.action == "move"
-            and self.tutorial_move_distance >= 48
-        ):
-            self._complete_tutorial_action("move")
-        if not self.player.grounded:
-            self._complete_tutorial_action("jump")
         self._resolve_player_attack()
-        if self.energy_ready:
-            self._complete_tutorial_action("energy")
         if not self.is_tutorial_run or self._current_tutorial_step.action == "parry":
             self._update_enemy_attacks(fixed_dt)
 
@@ -2230,13 +2584,19 @@ class StartScreen:
         self.canvas.blit(layer, (0, 0))
 
     def _update_passive_recovery(self, dt: float) -> None:
-        """技能树提供的自动回血与自动回蓝：按秒累计，攒够 1 点才结算。"""
-        if self.auto_heal_per_second > 0.0:
-            self._auto_heal_pool += self.auto_heal_per_second * dt
-            whole = int(self._auto_heal_pool)
-            if whole > 0:
-                self._auto_heal_pool -= whole
-                self.player.heal(whole)
+        """生命恢复每十秒结算一次；商店和事件类房间禁用恢复。"""
+        healing_blocked = self.room_type in {
+            ROOM_SHOP,
+            ROOM_EVENT,
+            ROOM_REWARD,
+            ROOM_SANCTUARY,
+        }
+        if self.auto_heal_per_second > 0.0 and not healing_blocked:
+            self._auto_heal_pool += dt
+            ticks = int(self._auto_heal_pool / HEAL_TICK_INTERVAL)
+            if ticks > 0:
+                self._auto_heal_pool -= ticks * HEAL_TICK_INTERVAL
+                self.player.heal(round(self.auto_heal_per_second) * ticks)
         if self.auto_energy_per_second > 0.0:
             self._auto_energy_pool += self.auto_energy_per_second * dt
             whole = int(self._auto_energy_pool)
@@ -2354,7 +2714,9 @@ class StartScreen:
 
     def _room_cleared(self) -> bool:
         """本层所有波次都清空（教学关还要等教学步骤走完）才算房间胜利。"""
-        if self.run_floor == SHOP_FLOOR and not self.shop_closed:
+        if self._is_shop_room() and not self.shop_closed:
+            return False
+        if self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY} and not self.room_resolved:
             return False
         if self.pending_spawn or self.room_enemies:
             return False
@@ -2389,6 +2751,12 @@ class StartScreen:
 
         if not self.portal_open:
             if self._room_cleared():
+                if self.room_type in {ROOM_ELITE, ROOM_RIFT} and not self.room_resolved:
+                    bonus = 24 if self.room_type == ROOM_ELITE else 32
+                    self.run_currency += bonus
+                    self.room_resolved = True
+                    self._save_run_checkpoint()
+                    self._notify(f"额外勘定完成  战时铸币 +{bonus}")
                 self.portal_open = True
                 self.portal_appear = 0.0
                 self.audio.play("portal_open")
@@ -2435,9 +2803,14 @@ class StartScreen:
     def _portal_choice_labels(self) -> tuple[str, str]:
         if self.is_tutorial_run:
             return ("返回主菜单", "进入灰塔大厅")
-        if self.run_floor >= BOSS_FLOOR:
-            return ("返回主菜单", "完成阶段并返回大厅")
-        return ("返回主菜单", f"进入第 {self.run_floor + 1} 层")
+        if self.run_stage >= 2 and self.run_floor >= SECOND_STAGE_BOSS_ROOM:
+            return ("返回主菜单", "完成第二阶段并返回大厅")
+        if self.run_stage == 1 and self.run_floor >= BOSS_FLOOR:
+            return ("返回主菜单", "进入第二阶段 · 第 1 关")
+        return (
+            "返回主菜单",
+            f"进入第 {self.run_stage} 阶段 · 第 {self.run_floor + 1} 关",
+        )
 
     def _activate_portal_choice(self, index: int) -> None:
         if index < 0 or index > 1:
@@ -2453,18 +2826,28 @@ class StartScreen:
             self._enter_lobby()
             self._notify(f"远征已结算，凝结回响遗晶 +{relics}")
             return
-        if self.run_floor >= BOSS_FLOOR:
-            # 打完第五层即通关：停在结算界面，展示这一局的成果
+        if self.run_stage >= 2 and self.run_floor >= SECOND_STAGE_BOSS_ROOM:
             self.result_cleared = True
             self.result_relics = relics
             self.page = "result"
             self.confirm_exit = False
-            self._notify(f"第一阶段完成，凝结回响遗晶 +{relics}")
+            self._notify(f"第二阶段完成，凝结回响遗晶 +{relics}")
             return
-        next_floor = self.run_floor + 1
-        self._start_run(next_floor, tutorial=False, keep_progress=True)
+        if self.run_stage == 1 and self.run_floor >= BOSS_FLOOR:
+            next_stage, next_floor = 2, 1
+        else:
+            next_stage, next_floor = self.run_stage, self.run_floor + 1
+        self._start_run(
+            next_floor,
+            tutorial=False,
+            keep_progress=True,
+            stage=next_stage,
+            route_seed=self.run_route_seed,
+        )
         self._save_run_checkpoint()
-        self._notify(f"进入第 {next_floor} 层  遗晶 +{relics}")
+        self._notify(
+            f"进入第 {next_stage} 阶段 · 第 {next_floor} 关  遗晶 +{relics}"
+        )
 
     def _update_enemy_spawn(self, dt: float) -> None:
         """按波次刷怪：每波之间留出倒计时间隔，清空后自动排下一波。"""
@@ -2643,10 +3026,14 @@ class StartScreen:
                 "down": "下劈",
             }[direction]
             self._notify(f"折光长刃：{direction_name}")
-            if direction == "side":
+            if self._current_tutorial_step.action == "energy":
+                self._complete_tutorial_action("energy")
+            elif direction == "side":
                 self._complete_tutorial_action("attack")
             elif direction == "up":
                 self._complete_tutorial_action("up_attack")
+            elif direction == "down":
+                self._complete_tutorial_action("down_attack")
 
     def _resolve_player_attack(self) -> None:
         attack_hitbox = self.player.attack_hitbox
@@ -2678,7 +3065,6 @@ class StartScreen:
             self.audio.duck(0.22, 0.18)
             if self.player.attack_direction == "down":
                 self.player.bounce_from_down_attack()
-                self._complete_tutorial_action("down_attack")
             self.run_score += 120
             self.run_combo += 1
             self.run_max_combo = max(self.run_max_combo, self.run_combo)
@@ -2888,11 +3274,11 @@ class StartScreen:
 
     def _level_up(self) -> None:
         self.player_level += 1
-        healed = self.player.gain_level(HP_PER_LEVEL, ATTACK_PER_LEVEL)
+        self.player.gain_level(HP_PER_LEVEL, ATTACK_PER_LEVEL)
         self.audio.play("parry_ready")
         self._notify(
             f"等级提升 Lv.{self.player_level}  "
-            f"生命上限 +{HP_PER_LEVEL}  攻击 +{ATTACK_PER_LEVEL}  回复 {healed}"
+            f"生命上限 +{HP_PER_LEVEL}  攻击 +{ATTACK_PER_LEVEL}"
         )
 
     # -- 回响能量与回响剑气 -----------------------------------------------
@@ -3040,12 +3426,7 @@ class StartScreen:
         if next_action == "parry":
             self._prepare_tutorial_parry_target()
         elif next_action == "energy":
-            # 教学关不要求慢慢攒：直接把能量推到只差一次行动
-            self.echo_energy = max(
-                self.echo_energy,
-                ECHO_ENERGY_MAX - ENERGY_GAIN_PARRY,
-            )
-            self._notify("回响能量已注入：用攻击或弹刀把它攒满")
+            self._notify("再挥砍一次，观察回响能量的积蓄")
             return
         elif next_action == "skill":
             self.echo_energy = ECHO_ENERGY_MAX
@@ -3054,6 +3435,9 @@ class StartScreen:
             )
             return
         if next_action == "finish":
+            # 训练目标只用于动作展示，不应成为完成教学后的额外清敌门槛。
+            self.room_enemies.clear()
+            self.pending_enemy_attacks.clear()
             self._notify("教学完成，回响之门已开启")
         else:
             self._notify(f"下一步：{self._current_tutorial_step.title}")
@@ -3156,7 +3540,8 @@ class StartScreen:
         checkpoint = self._active_run_checkpoint()
         if checkpoint is not None:
             run_state = (
-                f"暂存远征  第 {checkpoint['floor']} 层  ·  Lv.{checkpoint['player_level']}"
+                f"暂存远征  阶段 {checkpoint['stage']}-{checkpoint['floor']}  ·  "
+                f"Lv.{checkpoint['player_level']}"
             )
         else:
             run_state = "本局从第一层开始"
@@ -3379,14 +3764,34 @@ class StartScreen:
 
     def _setting_rects(self) -> list[pygame.Rect]:
         rect = self._overlay_rect()
-        back = self._overlay_back_rect()
+        button_y = rect.bottom - 76
+        button_width = 230
+        button_gap = 12
         return [
             pygame.Rect(rect.x + 34, rect.y + 104, rect.width - 68, 70),
             pygame.Rect(rect.x + 34, rect.y + 184, rect.width - 68, 70),
             pygame.Rect(rect.x + 34, rect.y + 264, rect.width - 68, 70),
             pygame.Rect(rect.x + 34, rect.y + 344, rect.width - 68, 70),
-            pygame.Rect(back.right + 16, back.y, 220, back.height),  # 返回主菜单
-            back,  # 关闭设置
+            pygame.Rect(rect.x + 30, button_y, button_width, 44),  # 暂返大厅
+            pygame.Rect(
+                rect.x + 30 + button_width + button_gap,
+                button_y,
+                button_width,
+                44,
+            ),  # 返回主菜单
+            pygame.Rect(
+                rect.x + 30 + (button_width + button_gap) * 2,
+                button_y,
+                button_width,
+                44,
+            ),  # 关闭设置
+        ]
+
+    def _expedition_choice_rects(self) -> list[pygame.Rect]:
+        rect = self._overlay_rect()
+        return [
+            pygame.Rect(rect.x + 50, rect.y + 210, 316, 170),
+            pygame.Rect(rect.right - 366, rect.y + 210, 316, 170),
         ]
 
     @staticmethod
@@ -3427,7 +3832,10 @@ class StartScreen:
 
         if self.overlay == "floor_intro":
             briefing = self._floor_briefing(self.run_floor)
-            title_text = f"第 {self.run_floor} 层 · {briefing.title}"
+            title_text = (
+                f"第 {self.run_stage} 阶段 · 第 {self.run_floor} 关 · "
+                f"{briefing.title}"
+            )
         elif self.overlay == "slots":
             title_text = (
                 "开始游戏 · 选择存档位"
@@ -3440,7 +3848,9 @@ class StartScreen:
                 "keybinds": "键位设置",
                 "progression": "回响中枢 · 成长拓扑",
                 "portal": "回响之门",
+                "expedition_choice": "远征城门 · 暂存进度",
                 "shop": "余烬行商 · 战前整备",
+                "room_event": self._floor_briefing(self.run_floor).title,
             }.get(self.overlay, "设置")
         title = self.overlay_title_font.render(title_text, True, COLORS["ice"])
         self.canvas.blit(title, (rect.x + 30, rect.y + 24))
@@ -3455,12 +3865,16 @@ class StartScreen:
             self._draw_portal_choice(rect)
         elif self.overlay == "shop":
             self._draw_shop(rect)
+        elif self.overlay == "room_event":
+            self._draw_room_event(rect)
         elif self.overlay == "floor_intro":
             self._draw_floor_briefing(rect)
         elif self.overlay == "slots":
             self._draw_slot_select(rect)
         elif self.overlay == "difficulty":
             self._draw_difficulty(rect)
+        elif self.overlay == "expedition_choice":
+            self._draw_expedition_choice(rect)
         else:
             self._draw_settings(rect)
 
@@ -3469,8 +3883,12 @@ class StartScreen:
             if self.overlay == "floor_intro"
             else "←→ 选择难度    Enter 确认出征    Esc 返回"
             if self.overlay == "difficulty"
+            else "←→ 选择    Enter 确认    Esc 返回大厅"
+            if self.overlay == "expedition_choice"
             else "↑↓ 选择货品    Enter 购买    Esc 结束整备"
             if self.overlay == "shop"
+            else "↑↓ 选择结果    Enter 确认"
+            if self.overlay == "room_event"
             else "↑↓ 选择    Enter 确认    Esc 返回"
             if self.overlay == "slots"
             else "↑↓ 选择    Enter 设置    Esc 返回"
@@ -3484,6 +3902,11 @@ class StartScreen:
         hint = self.small_font.render(hint_text, True, COLORS["muted"])
         if self.overlay == "progression":
             self.canvas.blit(hint, (rect.x + 584, rect.bottom - 96))
+        elif self.overlay == "settings":
+            self.canvas.blit(
+                hint,
+                (rect.right - hint.get_width() - 28, rect.bottom - 104),
+            )
         else:
             self.canvas.blit(
                 hint,
@@ -3575,15 +3998,17 @@ class StartScreen:
         )
         self.canvas.blit(summary, (rect.x + 34, rect.y + 76))
 
-        if self.run_floor == SHOP_FLOOR:
+        if self._is_shop_room():
             room_status = "非战斗层    使用战时铸币整备    可不消费直接离开"
-        elif self.run_floor == BOSS_FLOOR:
+        elif self._is_boss_room():
             room_status = (
                 f"区域执政者    两个阶段    威胁 {round(self.run_threat * 100)}%"
             )
+        elif self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}:
+            room_status = "非战斗关    三选一结果    确认后立即暂存"
         else:
             room_status = (
-                f"本层共 {len(self._floor_wave_plan(self.run_floor))} 波敌人    "
+                f"本关共 {len(self._floor_wave_plan(self.run_floor, self.run_stage, self.room_type))} 波敌人    "
                 f"威胁 {round(self.run_threat * 100)}%    敌人生命与伤害同步提升"
             )
         wave_text = self.small_font.render(
@@ -3612,7 +4037,9 @@ class StartScreen:
 
         hint_text = (
             "按 Enter / 空格 / 鼠标左键 进入交易"
-            if self.run_floor == SHOP_FLOOR
+            if self._is_shop_room()
+            else "按 Enter / 空格 / 鼠标左键 查看选项"
+            if self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}
             else "按 Enter / 空格 / 鼠标左键 开始战斗"
         )
         hint = self.small_font.render(
@@ -3621,6 +4048,37 @@ class StartScreen:
             COLORS["cyan"],
         )
         self.canvas.blit(hint, (rect.x + 34, rect.bottom - 70))
+
+    def _draw_room_event(self, rect: pygame.Rect) -> None:
+        intro = self.small_font.render(
+            "选择一项结果；本关只能勘定一次，并会立即写入当前远征暂存。",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(intro, (rect.x + 42, rect.y + 80))
+        for index, ((title, description), row) in enumerate(
+            zip(self._room_event_choices(), self._room_event_rects())
+        ):
+            selected = index == self.room_choice_selected
+            pygame.draw.rect(
+                self.canvas,
+                (18, 48, 50) if selected else (8, 25, 35),
+                row,
+            )
+            pygame.draw.rect(
+                self.canvas,
+                COLORS["gold"] if selected else (42, 105, 106),
+                row,
+                2 if selected else 1,
+            )
+            self.canvas.blit(
+                self.overlay_body_font.render(title, True, COLORS["ice"]),
+                (row.x + 22, row.y + 12),
+            )
+            self.canvas.blit(
+                self.small_font.render(description, True, COLORS["muted"]),
+                (row.x + 22, row.y + 48),
+            )
 
     def _draw_shop(self, rect: pygame.Rect) -> None:
         intro = self.small_font.render(
@@ -3670,7 +4128,7 @@ class StartScreen:
         labels = self._portal_choice_labels()
         info = self.overlay_body_font.render(
             f"本局分数 {self.run_score:05d}    完美弹刀 {self.run_parries}    "
-            f"第 {self.run_floor} 层",
+            f"第 {self.run_stage} 阶段 · 第 {self.run_floor} 关",
             True,
             COLORS["muted"],
         )
@@ -3920,7 +4378,7 @@ class StartScreen:
             )
             self.canvas.blit(rank_text, (rect.x + 42, y))
             floor_text = self.overlay_body_font.render(
-                f"第 {entry['floor']} 层",
+                f"阶段 {entry['stage']}-{entry['floor']}",
                 True,
                 COLORS["ice"],
             )
@@ -3958,6 +4416,7 @@ class StartScreen:
         rows = [score for score in scores if isinstance(score, dict)]
         rows.sort(
             key=lambda score: (
+                int(score.get("stage", 1) or 1),
                 int(score.get("floor", 0) or 0),
                 int(score.get("score", 0) or 0),
             ),
@@ -3965,6 +4424,7 @@ class StartScreen:
         )
         return [
             {
+                "stage": max(1, int(row.get("stage", 1) or 1)),
                 "floor": max(1, int(row.get("floor", 1) or 1)),
                 "score": f"{int(row.get('score', 0) or 0):05d}",
                 "kills": int(row.get("kills", 0) or 0),
@@ -4006,14 +4466,71 @@ class StartScreen:
                 pygame.draw.rect(self.canvas, COLORS["ice"], bar, 1)
         self._draw_ui_button(
             setting_rects[4],
-            "返回主菜单",
+            "暂返大厅",
             self.overlay_selected == 4,
+            enabled=self.return_page == "game" and not self.is_tutorial_run,
         )
         self._draw_ui_button(
             setting_rects[5],
-            "关闭设置",
+            "返回主菜单",
             self.overlay_selected == 5,
         )
+        self._draw_ui_button(
+            setting_rects[6],
+            "关闭设置",
+            self.overlay_selected == 6,
+        )
+
+    def _draw_expedition_choice(self, rect: pygame.Rect) -> None:
+        checkpoint = self._active_run_checkpoint()
+        if checkpoint is None:
+            summary = "暂存进度已失效，请返回大厅重新进入城门。"
+        else:
+            summary = (
+                f"阶段 {checkpoint['stage']}-{checkpoint['floor']}  ·  "
+                f"Lv.{checkpoint['player_level']}  ·  "
+                f"生命 {checkpoint['player_hp']}  ·  "
+                f"回响能量 {checkpoint['echo_energy']}"
+            )
+        note = self.small_font.render(summary, True, COLORS["cyan"])
+        self.canvas.blit(note, note.get_rect(center=(rect.centerx, rect.y + 108)))
+        warning = self.small_font.render(
+            "重新开始会删除当前远征暂存，但不会影响回响遗晶、成长节点与历史战绩。",
+            True,
+            COLORS["muted"],
+        )
+        self.canvas.blit(warning, warning.get_rect(center=(rect.centerx, rect.y + 142)))
+
+        labels = (
+            ("继续当前远征", "恢复已保存的关卡、生命与局内资源"),
+            ("放弃暂存并重新开始", "从第一阶段第一关建立一局新远征"),
+        )
+        for index, ((title, detail), choice_rect) in enumerate(
+            zip(labels, self._expedition_choice_rects())
+        ):
+            selected = index == self.expedition_choice_selected
+            pygame.draw.rect(
+                self.canvas,
+                (20, 61, 66) if selected else (10, 31, 41),
+                choice_rect,
+            )
+            pygame.draw.rect(
+                self.canvas,
+                COLORS["cyan"] if selected else (30, 72, 78),
+                choice_rect,
+                2 if selected else 1,
+            )
+            color = COLORS["gold"] if index == 1 else COLORS["ice"]
+            heading = self.overlay_body_font.render(title, True, color)
+            self.canvas.blit(
+                heading,
+                heading.get_rect(center=(choice_rect.centerx, choice_rect.y + 56)),
+            )
+            detail_text = self.small_font.render(detail, True, COLORS["muted"])
+            self.canvas.blit(
+                detail_text,
+                detail_text.get_rect(center=(choice_rect.centerx, choice_rect.y + 108)),
+            )
 
     def _draw_keybinds(self, rect: pygame.Rect) -> None:
         for index, (action, label) in enumerate(self._keybind_actions()):
@@ -4078,9 +4595,20 @@ class StartScreen:
         elif index == 3:
             self._open_overlay("keybinds")
         elif index == 4:
-            self._return_to_menu_from_settings()
+            self._suspend_run_to_lobby()
         elif index == 5:
+            self._return_to_menu_from_settings()
+        elif index == 6:
             self._close_overlay()
+
+    def _suspend_run_to_lobby(self) -> None:
+        """Checkpoint a live expedition and return to the lobby without settling it."""
+        if self.return_page != "game" or self.page != "game" or self.is_tutorial_run:
+            self._notify("只有正式远征中可以暂返大厅")
+            return
+        self._save_run_checkpoint()
+        self._enter_lobby()
+        self._notify("远征已暂存，可从城门继续或重新开始")
 
     def _return_to_menu_from_settings(self) -> None:
         """设置里的「返回主菜单」：在主菜单直接关闭，在关卡/大厅先确认。"""
@@ -4109,7 +4637,7 @@ class StartScreen:
         return [
             TutorialStep(
                 "移动训练",
-                f"按 {keys['left']}/{keys['right']} 或方向键左右移动一段距离",
+                f"按 {keys['left']}/{keys['right']} 或方向键进行一次左右移动",
                 "先感受加速和停下，门会在完成教学后打开。",
                 "move",
             ),
@@ -4121,7 +4649,7 @@ class StartScreen:
             ),
             TutorialStep(
                 "基础攻击",
-                f"靠近训练目标，按 {keys['attack']} 或鼠标左键挥砍",
+                f"按 {keys['attack']} 或鼠标左键挥砍一次",
                 "横向攻击会跟随角色朝向，命中后增加分数与连击。",
                 "attack",
             ),
@@ -4133,19 +4661,19 @@ class StartScreen:
             ),
             TutorialStep(
                 "下劈训练",
-                f"跳到目标上方，按住 S/↓ 再按 {keys['attack']} 下劈命中",
+                f"按住 S/↓ 再按 {keys['attack']} 使用一次下劈",
                 "下劈命中会把你向上弹起，连续命中可以保持滞空。",
                 "down_attack",
             ),
             TutorialStep(
                 "弹刀训练",
-                f"按 {keys['parry']} 进行一次完美弹刀演示",
+                f"按 {keys['parry']} 进入一次弹刀架势",
                 "正式战斗里要等金色闪光亮起再按，远程子弹靠近时也能弹开。",
                 "parry",
             ),
             TutorialStep(
                 "回响能量",
-                "用普通攻击或弹刀把回响能量攒满",
+                f"再按一次 {keys['attack']}，为回响能量充能",
                 "普通攻击 +4、上劈下劈 +7、击败敌人与完美弹刀各 +20；"
                 "跳跃、冲刺与移动不产生能量。",
                 "energy",
@@ -4177,16 +4705,35 @@ class StartScreen:
         ]
 
     @staticmethod
-    def _floor_threat(floor: int) -> float:
+    def _floor_threat(floor: int, stage: int = 1) -> float:
         """层数越深，敌人生命与伤害同步提高。"""
-        return FLOOR_THREAT_BASE + FLOOR_THREAT_STEP * (max(1, floor) - 1)
+        stage_bonus = max(0, stage - 1) * 0.45
+        return FLOOR_THREAT_BASE + stage_bonus + FLOOR_THREAT_STEP * (max(1, floor) - 1)
+
+    def _progress_depth(self) -> int:
+        return self.run_floor if self.run_stage <= 1 else BOSS_FLOOR + self.run_floor
 
     @staticmethod
-    def _floor_wave_plan(floor: int) -> tuple[tuple[str, ...], ...]:
-        """Return the encounter plan; the fourth floor is a non-combat shop."""
-        if floor == SHOP_FLOOR:
+    def _floor_wave_plan(
+        floor: int,
+        stage: int = 1,
+        room_type: str | None = None,
+    ) -> tuple[tuple[str, ...], ...]:
+        """Return the combat plan for a stage room; non-combat rooms are empty."""
+        resolved_type = room_type or StartScreen._room_type_for(stage, floor, 0)
+        if resolved_type in {ROOM_SHOP, ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}:
             return ()
-        return FLOOR_WAVE_PLANS.get(floor, FLOOR_WAVE_PLANS[3])
+        if stage == 1:
+            return FLOOR_WAVE_PLANS.get(floor, FLOOR_WAVE_PLANS[3])
+        if resolved_type == ROOM_RIFT:
+            return (
+                ("rift_worm", "resonance_mage", "spear_thrower", "chaser"),
+                ("shield_guard", "chaser", "rift_worm", "resonance_mage", "spear_thrower"),
+                ("rift_worm", "rift_worm", "shield_guard", "chaser", "resonance_mage"),
+            )
+        if resolved_type == ROOM_ELITE and floor != 4:
+            return SECOND_STAGE_WAVE_PLANS[4]
+        return SECOND_STAGE_WAVE_PLANS.get(floor, SECOND_STAGE_WAVE_PLANS[3])
 
     @staticmethod
     def _wave_positions(count: int) -> list[float]:
@@ -4212,17 +4759,41 @@ class StartScreen:
         *,
         tutorial: bool = True,
         keep_progress: bool = False,
+        stage: int = 1,
+        room_type: str | None = None,
+        route_seed: int | None = None,
     ) -> None:
         carried_currency = self.run_currency if keep_progress else None
+        carried_hp = self.player.hp if keep_progress else None
+        carried_energy = self.echo_energy if keep_progress else None
+        entering_new_stage = keep_progress and max(1, int(stage)) != self.run_stage
         self.pressed_keys.clear()
         self.page = "game"
         self.overlay = None
         self.confirm_exit = False
         self.is_tutorial_run = tutorial
-        self.run_floor = max(1, floor)
-        self.run_threat = self._floor_threat(self.run_floor) + (
+        self.run_stage = max(1, int(stage))
+        max_room = BOSS_FLOOR if self.run_stage == 1 else SECOND_STAGE_ROOM_COUNT
+        self.run_floor = max(1, min(max_room, int(floor)))
+        if route_seed is not None:
+            self.run_route_seed = max(0, int(route_seed))
+        elif not keep_progress or self.run_route_seed <= 0:
+            self.run_route_seed = random.SystemRandom().randrange(1, 2147483647)
+        self.room_type = self._room_type_for(
+            self.run_stage,
+            self.run_floor,
+            self.run_route_seed,
+            room_type,
+        )
+        self.room_resolved = False
+        self.room_choice_selected = 0
+        self.run_threat = self._floor_threat(self.run_floor, self.run_stage) + (
             DIFFICULTY_THREAT_BONUS if self.run_difficulty_hard else 0.0
         )
+        if self.room_type == ROOM_ELITE:
+            self.run_threat += 0.2
+        elif self.room_type == ROOM_RIFT:
+            self.run_threat += 0.3
         self.run_score = 0
         self.run_combo = 0
         self.run_max_combo = 0
@@ -4230,6 +4801,9 @@ class StartScreen:
         if not keep_progress:
             self.run_shop_attack_bonus = 0
             self.run_shop_hp_bonus = 0
+            self.shop_purchased.clear()
+        elif entering_new_stage:
+            # 每个阶段的行商库存独立，跨阶段保留强化但允许再次购买。
             self.shop_purchased.clear()
         carry_currency = int(self._track_value("reserve_carry"))
         self.run_currency = (
@@ -4258,16 +4832,23 @@ class StartScreen:
         self._auto_energy_pool = 0.0
         self.run_kills = 0
         if keep_progress:
-            # 进入下一层时保留等级收益：把累计加成重新套用到新角色上
+            # 换关保留当前生命与等级收益，不再借由场景重建自动补满生命。
             gained_levels = max(0, self.player_level - 1)
             self.player.max_hp += gained_levels * HP_PER_LEVEL
             self.player.attack_bonus += gained_levels * ATTACK_PER_LEVEL
-            self.player.hp = self.player.max_hp
+            self.player.hp = min(
+                self.player.max_hp,
+                max(1, int(carried_hp if carried_hp is not None else 1)),
+            )
         else:
             self.player_level = 1
             self.player_exp = 0
-        # 每一层开局回响能量都从 0 开始
-        self.echo_energy = 0
+        # 同一局换关保留回响能量；只有新远征开局才归零。
+        self.echo_energy = (
+            min(ECHO_ENERGY_MAX, max(0, int(carried_energy)))
+            if carried_energy is not None
+            else 0
+        )
         self.skill_waves.clear()
         self._skill_wave_spawned = False
         self._attack_hits.clear()
@@ -4279,13 +4860,17 @@ class StartScreen:
         self.spawn_countdown_total = ENEMY_SPAWN_DELAY
         self.spawn_countdown_label = "敌影接近"
         self.shop_selected = 0
-        self.shop_closed = self.run_floor != SHOP_FLOOR
+        self.shop_closed = not self._is_shop_room()
         if tutorial:
             self.wave_plan = []
         else:
             self.wave_plan = [
                 self._build_wave(kinds, self.run_threat)
-                for kinds in self._floor_wave_plan(self.run_floor)
+                for kinds in self._floor_wave_plan(
+                    self.run_floor,
+                    self.run_stage,
+                    self.room_type,
+                )
             ]
             # 进入关卡后敌人延迟登场，避免开门瞬间贴脸
             self._queue_next_wave()
@@ -4301,12 +4886,10 @@ class StartScreen:
         self.portal_choice_index = 0
         self._refresh_tutorial_hints()
         self.tutorial_index = 0 if tutorial else len(self.tutorial_steps) - 1
-        self.tutorial_start_x = self.player.x
-        self.tutorial_move_distance = 0.0
         self._step_timer = 0.0
         if self.pending_spawn:
             self._notify("敌影正在接近…")
-        elif self.run_floor == SHOP_FLOOR:
+        elif self._is_shop_room():
             self._notify("余烬行商驿站已接入")
         else:
             self._notify("试炼房间已开启")
@@ -4340,7 +4923,7 @@ class StartScreen:
         elif button == "lobby" and self.page == "result":
             relics = self.result_relics
             self._enter_lobby()
-            self._notify(f"第一阶段通关，凝结回响遗晶 +{relics}")
+            self._notify(f"第二阶段通关，凝结回响遗晶 +{relics}")
         elif button == "menu":
             self.page = "menu"
             self.confirm_exit = False
@@ -4383,20 +4966,23 @@ class StartScreen:
 
     def _settle_run(self) -> int:
         """结算本局：分数、遗晶、存档与统计，返回获得的回响遗晶。"""
-        self.result_score = self.run_score + self.run_floor * 500 + self.run_parries * 100
+        depth = self._progress_depth()
+        self.result_score = self.run_score + depth * 500 + self.run_parries * 100
         previous_best = int(self.profile.get("best_score", 0) or 0)
         self.result_new_record = self.result_score > previous_best
         self.profile["best_score"] = max(previous_best, self.result_score)
-        self.profile["best_floor"] = max(
-            int(self.profile.get("best_floor", 0) or 0),
-            self.run_floor,
-        )
+        best_stage = int(self.profile.get("best_stage", 0) or 0)
+        best_floor = int(self.profile.get("best_floor", 0) or 0)
+        if (self.run_stage, self.run_floor) > (best_stage, best_floor):
+            self.profile["best_stage"] = self.run_stage
+            self.profile["best_floor"] = self.run_floor
         scores = self.profile.get("scores", [])
         if not isinstance(scores, list):
             scores = []
         scores.append(
             {
                 "score": self.result_score,
+                "stage": self.run_stage,
                 "floor": self.run_floor,
                 "parries": self.run_parries,
                 "kills": self.run_kills,
@@ -4407,12 +4993,13 @@ class StartScreen:
         self.profile["scores"] = sorted(
             [score for score in scores if isinstance(score, dict)],
             key=lambda score: (
+                int(score.get("stage", 1) or 1),
                 int(score.get("floor", 0) or 0),
                 int(score.get("score", 0) or 0),
             ),
             reverse=True,
         )[:20]
-        self.result_relics = 40 if self.is_tutorial_run else 30 + self.run_floor * 10 + min(
+        self.result_relics = 40 if self.is_tutorial_run else 30 + depth * 10 + min(
             self.run_parries * 2, 30
         )
         if self.run_difficulty_hard and not self.is_tutorial_run:
@@ -4450,7 +5037,7 @@ class StartScreen:
             ),
             (
                 "层级进度",
-                min(FAILURE_FLOOR_RELIC_CAP, max(1, self.run_floor) * 5),
+                min(FAILURE_FLOOR_RELIC_CAP, max(1, self._progress_depth()) * 5),
             ),
             (
                 "连击技艺",
@@ -4471,10 +5058,11 @@ class StartScreen:
         previous_best = int(self.profile.get("best_score", 0) or 0)
         self.result_new_record = self.result_score > previous_best
         self.profile["best_score"] = max(previous_best, self.result_score)
-        self.profile["best_floor"] = max(
-            int(self.profile.get("best_floor", 0) or 0),
-            self.run_floor,
-        )
+        best_stage = int(self.profile.get("best_stage", 0) or 0)
+        best_floor = int(self.profile.get("best_floor", 0) or 0)
+        if (self.run_stage, self.run_floor) > (best_stage, best_floor):
+            self.profile["best_stage"] = self.run_stage
+            self.profile["best_floor"] = self.run_floor
         self.result_relic_breakdown, self.result_relics = (
             self._calculate_failure_relics()
         )
@@ -4491,6 +5079,7 @@ class StartScreen:
         scores.append(
             {
                 "score": self.result_score,
+                "stage": self.run_stage,
                 "floor": self.run_floor,
                 "parries": self.run_parries,
                 "kills": self.run_kills,
@@ -4502,6 +5091,7 @@ class StartScreen:
         self.profile["scores"] = sorted(
             [score for score in scores if isinstance(score, dict)],
             key=lambda score: (
+                int(score.get("stage", 1) or 1),
                 int(score.get("floor", 0) or 0),
                 int(score.get("score", 0) or 0),
             ),
@@ -4540,7 +5130,9 @@ class StartScreen:
 
         briefing = self._floor_briefing(self.run_floor)
         title = self.overlay_title_font.render(
-            "灰塔 · 序章试炼" if self.is_tutorial_run else f"灰塔 · 第 {self.run_floor} 层",
+            "灰塔 · 序章试炼"
+            if self.is_tutorial_run
+            else f"灰塔 · 第 {self.run_stage} 阶段 · 第 {self.run_floor} 关",
             True,
             COLORS["ice"],
         )
@@ -4548,7 +5140,7 @@ class StartScreen:
         subtitle = self.small_font.render(
             "ROOM 01  /  回响训练场"
             if self.is_tutorial_run
-            else f"ROOM {self.run_floor:02d}  /  {briefing.title}",
+            else f"STAGE {self.run_stage:02d} · ROOM {self.run_floor:02d}  /  {briefing.title}",
             True,
             COLORS["cyan"],
         )
@@ -4564,7 +5156,8 @@ class StartScreen:
             COLORS["ice"],
         )
         floor = self.small_font.render(
-            f"第 {self.run_floor} 层  ·  威胁 {round(self.run_threat * 100)}%",
+            f"第 {self.run_stage} 阶段 · 第 {self.run_floor} 关  ·  "
+            f"威胁 {round(self.run_threat * 100)}%",
             True,
             COLORS["muted"],
         )
@@ -4589,7 +5182,7 @@ class StartScreen:
         room_title = self.overlay_body_font.render(
             "试炼房间已开启"
             if self.is_tutorial_run
-            else f"{briefing.title}  ·  第 {self.run_floor} 层",
+            else f"{briefing.title}  ·  第 {self.run_stage} 阶段第 {self.run_floor} 关",
             True,
             COLORS["ice"],
         )
@@ -4601,20 +5194,26 @@ class StartScreen:
                 COLORS["muted"],
             )
             self.canvas.blit(room_hint, room_hint.get_rect(center=(640, 325)))
-        elif self.run_floor == SHOP_FLOOR:
+        elif self._is_shop_room():
             room_hint = self.small_font.render(
-                "整备已经完成  ·  进入右侧回响之门前往锈冠王庭",
+                "整备已经完成  ·  进入右侧回响之门继续远征",
                 True,
                 COLORS["muted"],
             )
-        elif self.run_floor == BOSS_FLOOR:
+        elif self._is_boss_room():
             boss = next(
                 (enemy for enemy in self.room_enemies if enemy.kind == "rust_crown_knight"),
                 None,
             )
             phase = getattr(boss, "phase", 1)
             room_hint = self.small_font.render(
-                f"首领阶段 {phase} / 2  ·  击破区域执政者后结束第一阶段",
+                f"首领阶段 {phase} / 2  ·  击破区域执政者后完成当前阶段",
+                True,
+                COLORS["muted"],
+            )
+        elif self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}:
+            room_hint = self.small_font.render(
+                "本关勘定完成  ·  进入右侧回响之门继续远征",
                 True,
                 COLORS["muted"],
             )
@@ -5586,10 +6185,10 @@ class StartScreen:
         shade = pygame.Surface(LOGICAL_SIZE, pygame.SRCALPHA)
         shade.fill((3, 8, 18, 170))
         self.canvas.blit(shade, (0, 0))
-        title = self.title_font.render("第一阶段 · 通关", True, COLORS["ice"])
+        title = self.title_font.render("第二阶段 · 通关", True, COLORS["ice"])
         self.canvas.blit(title, title.get_rect(center=(640, 150)))
         subtitle = self.subtitle_font.render(
-            "灰塔五层已贯通  /  记忆重构完成",
+            "灰塔第二阶段七关已贯通  /  记忆重构完成",
             True,
             COLORS["gold"],
         )
@@ -5625,7 +6224,7 @@ class StartScreen:
     def _settlement_rows(self) -> list[tuple[str, str]]:
         """结算清单：本局走到哪、拿到多少、打得怎么样。"""
         return [
-            ("抵达关卡", f"第 {self.run_floor} 层"),
+            ("抵达关卡", f"第 {self.run_stage} 阶段 · 第 {self.run_floor} 关"),
             ("获得技能点", f"+{self.result_relics} 回响遗晶"),
             ("击败敌人", f"{self.run_kills}"),
             ("完美弹刀", f"{self.run_parries}"),
