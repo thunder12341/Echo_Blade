@@ -2,6 +2,8 @@
 
 一个使用 Python 3.12+ 和 Pygame 2 开发的 2D 像素动作 Roguelike 原型。
 
+世界背景、超常现象、角色能力与剧情主线详见 [世界观设定集](worldbuilding.md)。
+
 ## 启动
 
 PowerShell:
