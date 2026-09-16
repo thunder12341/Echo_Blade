@@ -37,6 +37,8 @@ PROJECTILE_PARRY_RANGE = 170.0
 REFLECTED_PROJECTILE_SPEED = 900.0
 # 进入关卡后敌人登场延迟（秒）
 ENEMY_SPAWN_DELAY = 3.0
+# 敌人登场后到第一次出手之间的缓冲（秒）：留出反应时间，避免一刷出来就挨打
+ENEMY_SPAWN_ATTACK_GRACE = 1.0
 # 同一层里两波敌人之间的等待时间（秒）
 WAVE_SPAWN_DELAY = 2.6
 # 一波敌人的横向落点范围：均匀铺开，避免叠在同一点
@@ -651,7 +653,7 @@ class StartScreen:
             0,
         )
 
-        self.run_floor = max(1, int(self.profile.get("best_floor", 1) or 1))
+        self.run_floor = self._progress_floor()
         self.run_score = 0
         self.run_combo = 0
         self.run_max_combo = 0
@@ -743,13 +745,28 @@ class StartScreen:
             "version": 2,
             "best_score": 0,
             "best_floor": 0,
+            "progress_floor": 1,
             "scores": [],
             "tutorial_completed": False,
             "echo_relics": 0,
             "progression": {"unlocked_nodes": [], "equipped_start_module": None},
             "lifetime_stats": {},
             "active_run": None,
+            "retry_run": None,
         }
+
+    @staticmethod
+    def _progress_floor_of(profile: dict) -> int:
+        """远征起点：下次从大厅出发时要打的层数。"""
+        raw = profile.get("progress_floor")
+        if raw is None:
+            # 旧存档没有这个字段：用历史最高层兜底，避免已有进度被打回第一层
+            raw = profile.get("best_floor")
+        try:
+            floor = int(raw or 1)
+        except (TypeError, ValueError):
+            floor = 1
+        return max(1, min(BOSS_FLOOR, floor))
 
     @staticmethod
     def _normalise_run_checkpoint(data: object) -> dict | None:
@@ -798,6 +815,39 @@ class StartScreen:
         }
 
     @staticmethod
+    def _normalise_retry_run(data: object) -> dict | None:
+        """失败后留下的续战记录：重打同一层时接着用这套成长。"""
+        if not isinstance(data, dict):
+            return None
+
+        def number(name: str, default: int, lower: int, upper: int) -> int:
+            try:
+                value = int(data.get(name, default) or 0)
+            except (TypeError, ValueError):
+                value = default
+            return max(lower, min(upper, value))
+
+        purchased = data.get("shop_purchased", [])
+        valid_shop_items = {item.item_id for item in SHOP_ITEMS}
+        if not isinstance(purchased, list):
+            purchased = []
+        return {
+            "floor": number("floor", 1, 1, BOSS_FLOOR),
+            "player_level": number("player_level", 1, 1, 999),
+            "player_exp": number("player_exp", 0, 0, 999999),
+            "run_currency": number("run_currency", 0, 0, 999999),
+            "shop_attack_bonus": number("shop_attack_bonus", 0, 0, 9999),
+            "shop_hp_bonus": number("shop_hp_bonus", 0, 0, 99999),
+            "shop_purchased": sorted(
+                {
+                    item_id
+                    for item_id in purchased
+                    if isinstance(item_id, str) and item_id in valid_shop_items
+                }
+            ),
+        }
+
+    @staticmethod
     def _normalise_profile(data: dict) -> dict:
         """补全缺失字段，保证旧档案也能直接读。"""
         profile = dict(data)
@@ -820,8 +870,12 @@ class StartScreen:
             profile["lifetime_stats"] = {}
         if not isinstance(profile.get("scores"), list):
             profile["scores"] = []
+        profile["progress_floor"] = StartScreen._progress_floor_of(profile)
         profile["active_run"] = StartScreen._normalise_run_checkpoint(
             profile.get("active_run")
+        )
+        profile["retry_run"] = StartScreen._normalise_retry_run(
+            profile.get("retry_run")
         )
         return profile
 
@@ -849,6 +903,7 @@ class StartScreen:
         for key in (
             "best_score",
             "best_floor",
+            "progress_floor",
             "scores",
             "tutorial_completed",
             "echo_relics",
@@ -858,6 +913,9 @@ class StartScreen:
         ):
             if key in self.save_store:
                 profile[key] = self.save_store[key]
+        if "progress_floor" not in self.save_store:
+            # 旧格式没有远征起点：交给 _normalise_profile 用最高层兜底
+            profile.pop("progress_floor", None)
         return self._normalise_profile(profile)
 
     def _load_slots(self) -> list[dict | None]:
@@ -903,6 +961,61 @@ class StartScreen:
 
     def _active_run_checkpoint(self) -> dict | None:
         return self._normalise_run_checkpoint(self.profile.get("active_run"))
+
+    def _progress_floor(self) -> int:
+        """当前存档位的远征起点：下次从大厅出发时要打的层数。"""
+        return self._progress_floor_of(self.profile)
+
+    @staticmethod
+    def _live_checkpoint(profile: dict) -> dict | None:
+        """有效、且不低于远征起点的暂存进度；低于起点的旧记录视为过期。"""
+        checkpoint = StartScreen._normalise_run_checkpoint(profile.get("active_run"))
+        if checkpoint is None:
+            return None
+        if checkpoint["floor"] < StartScreen._progress_floor_of(profile):
+            return None
+        return checkpoint
+
+    def _pending_checkpoint(self) -> dict | None:
+        return self._live_checkpoint(self.profile)
+
+    def _retry_growth_matching(self, floor: int) -> dict | None:
+        """取出该层的失败续战记录；层数对不上就当过期丢掉。"""
+        growth = self._normalise_retry_run(self.profile.get("retry_run"))
+        if growth is None or growth["floor"] != floor:
+            return None
+        return growth
+
+    def _apply_retry_growth(self, growth: dict) -> None:
+        """把上一局失败时留下的等级与资源接回来，重打不用从头练。"""
+        self.player_level = growth["player_level"]
+        self.player_exp = min(growth["player_exp"], self.exp_to_next - 1)
+        self.run_currency = growth["run_currency"]
+        self.run_shop_attack_bonus = growth["shop_attack_bonus"]
+        self.run_shop_hp_bonus = growth["shop_hp_bonus"]
+        self.shop_purchased = set(growth["shop_purchased"])
+        gained_levels = max(0, self.player_level - 1)
+        self.player.max_hp += self.run_shop_hp_bonus + gained_levels * HP_PER_LEVEL
+        self.player.attack_bonus += (
+            self.run_shop_attack_bonus + gained_levels * ATTACK_PER_LEVEL
+        )
+        self.player.hp = self.player.max_hp
+
+    def _remember_retry_growth(self) -> None:
+        """失败时把本局成长写进续战记录，供下次重打同一层使用。"""
+        self.profile["retry_run"] = {
+            "floor": self.run_floor,
+            "player_level": self.player_level,
+            "player_exp": self.player_exp,
+            "run_currency": self.run_currency,
+            "shop_attack_bonus": self.run_shop_attack_bonus,
+            "shop_hp_bonus": self.run_shop_hp_bonus,
+            "shop_purchased": sorted(self.shop_purchased),
+        }
+
+    def _set_progress_floor(self, floor: int) -> None:
+        """记录远征起点；下发层只停留在第一阶段的末层，不会继续外推。"""
+        self.profile["progress_floor"] = max(1, min(BOSS_FLOOR, int(floor)))
 
     def _build_run_checkpoint(self) -> dict:
         return {
@@ -963,14 +1076,29 @@ class StartScreen:
         return True
 
     def _start_or_resume_expedition(self) -> None:
-        checkpoint = self._active_run_checkpoint()
+        checkpoint = self._pending_checkpoint()
         if checkpoint is not None and self._resume_run_checkpoint(checkpoint):
             self._notify(f"已读取暂存进度：从第 {self.run_floor} 层继续远征")
             return
+        stale = self._active_run_checkpoint() is not None
+        start_floor = self._progress_floor()
+        growth = self._retry_growth_matching(start_floor)
         self._clear_run_checkpoint()
-        self._start_run(1, tutorial=False)
+        self._start_run(start_floor, tutorial=False)
+        if growth is not None:
+            self._apply_retry_growth(growth)
         self._save_run_checkpoint()
-        self._notify("未发现暂存进度：从第一层第一关开始新远征")
+        if growth is not None:
+            self._notify(
+                f"继续挑战第 {start_floor} 层  ·  保留 Lv.{self.player_level} "
+                f"与战时铸币 {self.run_currency}"
+            )
+        elif stale:
+            self._notify(f"旧暂存低于远征起点，改从第 {start_floor} 层重新开始")
+        elif start_floor > 1:
+            self._notify(f"未发现暂存进度：从第 {start_floor} 层重新挑战")
+        else:
+            self._notify("未发现暂存进度：从第一层第一关开始新远征")
 
     @staticmethod
     def _default_keybinds() -> dict[str, int]:
@@ -1003,6 +1131,7 @@ class StartScreen:
             "version": 2,
             "best_score": int(self.profile.get("best_score", 0) or 0),
             "best_floor": int(self.profile.get("best_floor", 0) or 0),
+            "progress_floor": self._progress_floor(),
             "scores": self.profile.get("scores", []),
             "tutorial_completed": bool(
                 self.profile.get("tutorial_completed", False)
@@ -1013,6 +1142,7 @@ class StartScreen:
             "active_run": self._normalise_run_checkpoint(
                 self.profile.get("active_run")
             ),
+            "retry_run": self._normalise_retry_run(self.profile.get("retry_run")),
         }
 
     def _write_store(self) -> None:
@@ -1435,12 +1565,16 @@ class StartScreen:
             self._open_overlay("settings")
 
     def _lobby_actions(self) -> list[tuple[str, str, pygame.Rect]]:
-        checkpoint = self._active_run_checkpoint()
-        gate_label = (
-            f"继续远征 · 第 {checkpoint['floor']} 层"
-            if checkpoint is not None
-            else "开启新远征"
-        )
+        checkpoint = self._pending_checkpoint()
+        if checkpoint is not None:
+            gate_label = f"继续远征 · 第 {checkpoint['floor']} 层"
+        else:
+            start_floor = self._progress_floor()
+            gate_label = (
+                f"开启新远征 · 第 {start_floor} 层"
+                if start_floor > 1
+                else "开启新远征"
+            )
         return [
             ("gate", gate_label, pygame.Rect(490, 414, 300, 72)),
             ("nexus", "进入回响中枢", pygame.Rect(485, 196, 310, 100)),
@@ -1482,11 +1616,11 @@ class StartScreen:
             else 0
         )
         tutorial = "已完成教学" if profile.get("tutorial_completed") else "未完成教学"
-        checkpoint = StartScreen._normalise_run_checkpoint(profile.get("active_run"))
+        checkpoint = StartScreen._live_checkpoint(profile)
         run_state = (
             f"暂存第 {checkpoint['floor']} 层"
             if checkpoint is not None
-            else "无暂存远征"
+            else f"远征起点 第 {StartScreen._progress_floor_of(profile)} 层"
         )
         return (
             f"最高层 {int(profile.get('best_floor', 0) or 0)}   "
@@ -1921,9 +2055,11 @@ class StartScreen:
             self._dash_was_active = False
 
     def _spawn_pending_enemies(self) -> None:
-        """立刻让待登场的敌人出现。"""
+        """立刻让待登场的敌人出现，并留出一小段不出手的反应时间。"""
         if not self.pending_spawn:
             return
+        for enemy in self.pending_spawn:
+            enemy.begin_spawn_grace(ENEMY_SPAWN_ATTACK_GRACE)
         self.room_enemies.extend(self.pending_spawn)
         self.pending_spawn.clear()
         self.enemy_spawn_timer = 0.0
@@ -2727,21 +2863,22 @@ class StartScreen:
             COLORS["muted"],
         )
         self.canvas.blit(stats, (930, 78))
-        checkpoint = self._active_run_checkpoint()
+        checkpoint = self._pending_checkpoint()
         if checkpoint is not None:
-            suspended = self.small_font.render(
-                f"暂存远征  第 {checkpoint['floor']} 层  ·  Lv.{checkpoint['player_level']}",
-                True,
-                COLORS["cyan"],
+            run_state = (
+                f"暂存远征  第 {checkpoint['floor']} 层  ·  Lv.{checkpoint['player_level']}"
             )
-            self.canvas.blit(suspended, (930, 104))
+        else:
+            run_state = f"远征起点  第 {self._progress_floor()} 层"
+        suspended = self.small_font.render(run_state, True, COLORS["cyan"])
+        self.canvas.blit(suspended, (930, 104))
         if self.result_relics:
             settlement = self.small_font.render(
                 f"本次远征凝结 +{self.result_relics} 遗晶",
                 True,
                 COLORS["gold"],
             )
-            self.canvas.blit(settlement, (930, 128 if checkpoint is not None else 104))
+            self.canvas.blit(settlement, (930, 128))
 
         # Central gate: the primary interaction in the room.
         pygame.draw.rect(self.canvas, (7, 17, 28), (480, 286, 320, 254))
@@ -3857,6 +3994,10 @@ class StartScreen:
             int(self.profile.get("best_floor", 0) or 0),
             self.run_floor,
         )
+        if not self.is_tutorial_run:
+            # 这一层已经打通：远征起点顺延到下一层，末层则留在原地
+            self._set_progress_floor(self.run_floor + 1)
+        self.profile["retry_run"] = None
         scores = self.profile.get("scores", [])
         if not isinstance(scores, list):
             scores = []
@@ -3932,6 +4073,10 @@ class StartScreen:
             int(self.profile.get("best_floor", 0) or 0),
             self.run_floor,
         )
+        if not self.is_tutorial_run:
+            # 这一层没打过：起点停在这一层，并留住本局成长，下次接着打
+            self._set_progress_floor(max(self._progress_floor(), self.run_floor))
+            self._remember_retry_growth()
         self.result_relic_breakdown, self.result_relics = (
             self._calculate_failure_relics()
         )

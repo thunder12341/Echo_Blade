@@ -853,9 +853,10 @@ def test_tutorial_completion_enters_lobby_and_lobby_starts_new_run(monkeypatch, 
     pygame.quit()
 
 
-def test_lobby_without_checkpoint_starts_at_floor_one_not_historical_best(
+def test_lobby_without_checkpoint_ignores_historical_best_floor(
     monkeypatch, tmp_path
 ):
+    """历史最高层只是纪录，不能把远征起点顶上去；起点由 progress_floor 决定。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     app.profile = app._new_profile()
     app.profile["tutorial_completed"] = True
@@ -868,6 +869,200 @@ def test_lobby_without_checkpoint_starts_at_floor_one_not_historical_best(
     assert app.run_floor == 1
     assert app._active_run_checkpoint()["floor"] == 1
     assert "第一层第一关" in app.notification
+    pygame.quit()
+
+
+def test_lobby_without_checkpoint_starts_at_the_recorded_progress_floor(
+    monkeypatch, tmp_path
+):
+    """没打过的那一层就是远征起点：下次进城直接从那里再来一次。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app.profile["best_floor"] = 5
+    app.profile["progress_floor"] = 3
+    app._enter_lobby()
+
+    assert app._lobby_actions()[0][1] == "开启新远征 · 第 3 层"
+    app._activate_lobby_action(0)
+
+    assert app.page == "game"
+    assert app.run_floor == 3
+    assert app._active_run_checkpoint()["floor"] == 3
+    assert "第 3 层" in app.notification
+    pygame.quit()
+
+
+def test_stale_checkpoint_below_the_progress_floor_is_ignored(monkeypatch, tmp_path):
+    """旧存档里低于远征起点的暂存属于过期记录，不该把玩家拽回低层。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    app.profile["progress_floor"] = 5
+    app.profile["active_run"] = {
+        "status": "active",
+        "floor": 1,
+        "player_level": 1,
+        "player_hp": 1,
+    }
+    app._enter_lobby()
+
+    assert app._lobby_actions()[0][1] == "开启新远征 · 第 5 层"
+    app._activate_lobby_action(0)
+
+    assert app.page == "game"
+    assert app.run_floor == 5
+    assert app._active_run_checkpoint()["floor"] == 5
+    assert "第 5 层" in app.notification
+    pygame.quit()
+
+
+def test_clearing_a_floor_moves_the_recorded_start_point_forward(
+    monkeypatch, tmp_path
+):
+    """打通一层之后，远征起点就顺延到还没打过的下一层。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    _enter_level(app, floor=1)
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    app.wave_plan = []
+    app.wave_index = 0
+
+    app._open_portal_choice()
+    app._activate_portal_choice(1)
+
+    assert app.run_floor == 2
+    assert app.profile["progress_floor"] == 2
+    assert app._active_run_checkpoint()["floor"] == 2
+    assert app.profile["retry_run"] is None
+    pygame.quit()
+
+
+def test_failure_keeps_run_growth_for_the_retry(monkeypatch, tmp_path):
+    """失败重打同一层时保留等级、经验、战时铸币与商店强化，不用从头练。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    _enter_level(app, floor=3)
+    app.player_level = 4
+    app.player_exp = 30
+    app.run_currency = 96
+    app.run_shop_attack_bonus = 4
+    app.run_shop_hp_bonus = 45
+    app.shop_purchased = {"edge_plating"}
+    app.player.hp = 0
+
+    app._fail_run()
+
+    assert app.page == "failure"
+    assert app.profile["progress_floor"] == 3
+    assert app.profile["retry_run"]["floor"] == 3
+    assert app._active_run_checkpoint() is None
+
+    app._enter_lobby()
+    app._activate_lobby_action(0)
+
+    assert app.page == "game"
+    assert app.run_floor == 3
+    assert app.player_level == 4
+    assert app.player_exp == 30
+    assert app.run_currency == 96
+    assert app.run_shop_attack_bonus == 4
+    assert app.run_shop_hp_bonus == 45
+    assert app.shop_purchased == {"edge_plating"}
+    # 重打是满血开局，分数、连击与能量重新开始
+    assert app.player.max_hp == 320 + 45 + 3 * main.HP_PER_LEVEL
+    assert app.player.attack_damage == 18 + 4 + 3 * main.ATTACK_PER_LEVEL
+    assert app.player.hp == app.player.max_hp
+    assert app.run_score == 0
+    assert app.run_combo == 0
+    assert app.echo_energy == 0
+    # 续战记录同时写进暂存，重启游戏也能接上
+    assert app._active_run_checkpoint()["floor"] == 3
+    assert "第 3 层" in app.notification
+    pygame.quit()
+
+
+def test_retry_growth_survives_a_restart(monkeypatch, tmp_path):
+    """续战记录要落盘：关掉游戏再进来，仍然带着等级与铸币重打。"""
+    save_file = tmp_path / "save.json"
+    monkeypatch.setattr(main, "SAVE_FILE", save_file)
+    pygame.init()
+    screen = pygame.display.set_mode((1280, 720))
+    app = StartScreen(screen)
+    app._bind_slot(0, fresh=True)
+    app.profile["tutorial_completed"] = True
+    _enter_level(app, floor=2)
+    app.player_level = 3
+    app.run_currency = 64
+    app.player.hp = 0
+    app._fail_run()
+
+    again = StartScreen(screen)
+    again._load_slot(0)
+    again._activate_lobby_action(0)
+
+    assert again.run_floor == 2
+    assert again.player_level == 3
+    assert again.run_currency == 64
+    assert again.player.hp == again.player.max_hp
+    pygame.quit()
+
+
+def test_failure_keeps_the_expedition_start_on_the_uncleared_floor(
+    monkeypatch, tmp_path
+):
+    """哪一层没打过，远征起点就停在那一层，死亡结算后还能直接重来。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile = app._new_profile()
+    app.profile["tutorial_completed"] = True
+    _enter_level(app, floor=3)
+    app.player.hp = 0
+    app._fail_run()
+
+    assert app.page == "failure"
+    assert app.profile["progress_floor"] == 3
+    assert app._active_run_checkpoint() is None
+
+    app._enter_lobby()
+    assert app._lobby_actions()[0][1] == "开启新远征 · 第 3 层"
+    app._activate_lobby_action(0)
+
+    assert app.page == "game"
+    assert app.run_floor == 3
+    assert app._active_run_checkpoint()["floor"] == 3
+    pygame.quit()
+
+
+def test_clearing_the_final_floor_keeps_the_start_point_at_floor_five(
+    monkeypatch, tmp_path
+):
+    """第五层打过后不要把存档退回第一层：起点先原地保留在第五层。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app.profile["tutorial_completed"] = True
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.hp = 0
+    app._award_enemy_defeat(boss)
+    app.room_enemies.clear()
+    app.pending_spawn.clear()
+    app.wave_plan = []
+    app.wave_index = 0
+
+    app._open_portal_choice()
+    app._activate_portal_choice(1)
+
+    assert app.page == "lobby"
+    assert app.profile["progress_floor"] == main.BOSS_FLOOR == 5
+    assert app._active_run_checkpoint() is None
+    assert app._lobby_actions()[0][1] == "开启新远征 · 第 5 层"
+
+    app._activate_lobby_action(0)
+
+    assert app.run_floor == 5
+    assert app._active_run_checkpoint()["floor"] == 5
     pygame.quit()
 
 
@@ -1642,6 +1837,35 @@ def test_level_spawns_enemies_after_delay(monkeypatch, tmp_path):
     pygame.quit()
 
 
+def test_newly_spawned_enemies_hold_fire_for_a_moment(monkeypatch, tmp_path):
+    """敌人刷出来不会立刻动手：先留一段反应时间，之后才挥出第一刀。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    app._dismiss_floor_intro()
+    _advance(app, main.ENEMY_SPAWN_DELAY + 0.1)
+
+    assert app.room_enemies
+    assert all(enemy.attack_ready is False for enemy in app.room_enemies)
+
+    # 就算贴到脸上，缓冲期里也不会出手
+    chaser = next(enemy for enemy in app.room_enemies if enemy.kind == "chaser")
+    chaser.x = app.player.x + 40
+    _advance(app, main.ENEMY_SPAWN_ATTACK_GRACE - 0.3)
+    assert app.pending_enemy_attacks == []
+
+    # 缓冲期结束后恢复进攻
+    chaser.x = app.player.x + 40
+    attacked = False
+    for _ in range(60):
+        app._update(1.0 / 60.0)
+        if app.pending_enemy_attacks:
+            attacked = True
+            break
+
+    assert attacked is True
+    pygame.quit()
+
+
 def test_spawn_countdown_display_actually_ticks(monkeypatch, tmp_path):
     """回归：倒计时面板必须随时间变化，且提示文案里不能写死秒数。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
@@ -2203,6 +2427,50 @@ def test_launched_enemy_falls_back_to_the_ground(monkeypatch, tmp_path):
     pygame.quit()
 
 
+def test_broken_posture_is_a_temporary_window_not_a_permanent_stun():
+    """韧性归零只该是一段破绽：窗口结束后韧性回满，敌人重新起身。"""
+    boss = RustCrownKnight(900, 522)
+    boss.take_damage(1, posture_damage=boss.max_posture)
+
+    assert boss.posture == 0
+    assert boss.vulnerable is True
+    assert boss.BREAK_WINDOW >= 1.0
+
+    # 破绽期间继续挨打：不会把僵直一次次续上
+    for _ in range(20):
+        boss.take_posture_damage(30)
+        boss.update(1.0 / 60.0, (200, 522))
+    assert boss.vulnerable is True
+
+    for _ in range(90):
+        boss.update(1.0 / 60.0, (200, 522))
+
+    assert boss.posture == boss.max_posture
+    assert boss.vulnerable is False
+    assert boss.update(1.0 / 60.0, (200, 522)).action == "royal_advance"
+
+
+def test_boss_keeps_attacking_after_its_posture_breaks(monkeypatch, tmp_path):
+    """回归：首领被打空韧性后必须起身继续出手，不能站在原地震刀。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.take_damage(1, posture_damage=boss.max_posture)
+    boss.x = app.player.x + 60
+    assert boss.vulnerable is True
+
+    attacked = False
+    for _ in range(180):
+        app._update(1.0 / 60.0)
+        if app.pending_enemy_attacks:
+            attacked = True
+            break
+
+    assert attacked is True
+    assert boss.posture == boss.max_posture
+    pygame.quit()
+
+
 # -- 剑气横穿全屏、存档槽位 -------------------------------------------------
 
 
@@ -2445,6 +2713,8 @@ def test_legacy_single_profile_save_migrates_into_the_first_slot(monkeypatch, tm
     assert app.save_slots[0] is not None
     assert app.save_slots[0]["echo_relics"] == 150
     assert app.save_slots[0]["best_floor"] == 2
+    # 旧存档没有远征起点字段：用最高层兜底，别把进度打回第一层
+    assert app.save_slots[0]["progress_floor"] == 2
     assert app.save_slots[0]["tutorial_completed"] is True
     assert all(slot is None for slot in app.save_slots[1:])
     assert app.settings["volume"] == 60

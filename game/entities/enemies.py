@@ -57,6 +57,8 @@ class Enemy(ABC):
     # 被回响剑气击飞时的重力与水平摩擦
     KNOCKBACK_GRAVITY: ClassVar[float] = 1750.0
     KNOCKBACK_FRICTION: ClassVar[float] = 900.0
+    # 韧性归零后的破绽窗口：窗口结束韧性回满，敌人重新投入战斗
+    BREAK_WINDOW: ClassVar[float] = 0.8
 
     def __init__(
         self,
@@ -94,6 +96,7 @@ class Enemy(ABC):
         )
         self._attack_cooldown = 0.0
         self._vulnerable_timer = 0.0
+        self._posture_broken = False
 
     @property
     def position(self) -> Position:
@@ -102,6 +105,10 @@ class Enemy(ABC):
     @property
     def attack_ready(self) -> bool:
         return self._attack_cooldown <= 0.0
+
+    def begin_spawn_grace(self, seconds: float) -> None:
+        """刚踏入战场：先把首次出手推迟一段时间，留给玩家反应余地。"""
+        self._attack_cooldown = max(self._attack_cooldown, max(0.0, float(seconds)))
 
     @property
     def vulnerable(self) -> bool:
@@ -127,6 +134,10 @@ class Enemy(ABC):
         elapsed = max(0.0, dt)
         self._attack_cooldown = max(0.0, self._attack_cooldown - elapsed)
         self._vulnerable_timer = max(0.0, self._vulnerable_timer - elapsed)
+        # 破绽结束：韧性回满，否则一次破韧后敌人会永远站不起来
+        if self._posture_broken and self._vulnerable_timer <= 0.0:
+            self._posture_broken = False
+            self.posture = self.max_posture
 
         if self.defeated:
             return EnemyIntent("defeated", note="已被击败")
@@ -185,6 +196,11 @@ class Enemy(ABC):
     def enter_vulnerable(self, seconds: float = 0.8) -> None:
         self._vulnerable_timer = max(self._vulnerable_timer, seconds)
 
+    def break_posture(self) -> None:
+        """韧性归零：进入破绽窗口，窗口结束后韧性回满。"""
+        self._posture_broken = True
+        self.enter_vulnerable(self.BREAK_WINDOW)
+
     def apply_knockback(self, direction: int, speed: float, lift: float) -> None:
         """被回响剑气击飞：横向推开并腾空，之后自然落下。"""
         self.velocity_x = (1.0 if direction >= 0 else -1.0) * abs(float(speed))
@@ -221,9 +237,12 @@ class Enemy(ABC):
     def take_posture_damage(self, amount: int) -> None:
         if self.max_posture <= 0 or amount <= 0:
             return
+        if self._posture_broken:
+            # 破绽窗口内不再累计：否则连续命中会把破绽无限延长成永久僵直
+            return
         self.posture = max(0, self.posture - amount)
         if self.posture == 0:
-            self.enter_vulnerable()
+            self.break_posture()
 
 
 class Chaser(Enemy):
@@ -448,6 +467,8 @@ class RustCrownKnight(Enemy):
     SPECIAL_INTERVAL = 7.0
     SPECIAL_FIRST_DELAY = 3.2
     DEFENSE_BREAK_DURATION = 3.0
+    # 首领韧性归零只中断当前行动，暴露 1.2 秒核心后重新起身
+    BREAK_WINDOW = 1.2
     NORMAL_DAMAGE_TAKEN = 0.78
     BROKEN_DAMAGE_TAKEN = 1.35
 
