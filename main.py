@@ -14,6 +14,7 @@ from game.entities import (
     BOSS_CLASSES,
     ENEMY_CLASSES,
     AttackProfile,
+    BrokenBridgeBellKeeper,
     Chaser,
     Enemy,
     Hitbox,
@@ -79,6 +80,8 @@ ENERGY_GAIN_HEAVY_ATTACK = 7
 ENERGY_GAIN_DEFEAT = 20
 ENERGY_GAIN_PARRY = 20
 ENERGY_GAIN_REFLECT = 6
+# 回响剑气还在场上时不再积攒能量：避免一发剑气滚出下一发
+SKILL_WAVE_ENERGY_LOCK = True
 
 # -- 回响剑气 ---------------------------------------------------------------
 # 伤害为普通攻击的若干倍，命中后把敌人击飞一段距离。
@@ -103,6 +106,11 @@ DEATH_FADE_TIME = 1.1
 # 每往下一层，敌人的生命与伤害同步提高
 FLOOR_THREAT_BASE = 0.12
 FLOOR_THREAT_STEP = 0.18
+
+# -- 小怪成长 ---------------------------------------------------------------
+# 小怪的层内成长沿用上面的威胁曲线；跨章节再乘一个明显的台阶，
+# 于是第一章内部每层小幅提升，进入第二章后小怪会明显更硬、更疼。
+NORMAL_ENEMY_STAGE_STEP = 0.6
 # 击败敌人获得的经验（按敌人种类），并随层数放大
 ENEMY_EXP = {
     "chaser": 24,
@@ -111,6 +119,7 @@ ENEMY_EXP = {
     "rift_worm": 36,
     "resonance_mage": 40,
     "rust_crown_knight": 320,
+    "broken_bridge_bell_keeper": 340,
 }
 FLOOR_EXP_STEP = 0.35
 
@@ -129,6 +138,15 @@ SECOND_STAGE_ROOM_COUNT = 7
 SECOND_STAGE_SHOP_ROOM = 6
 SECOND_STAGE_BOSS_ROOM = 7
 BOSS_MEMORY_SEVER_DAMAGE_RATIO = 0.8
+
+# -- 战时铸币 ---------------------------------------------------------------
+# 局内铸币收益整体缩放：战斗、弹刀、事件与清房奖励统一打折结算
+RUN_CURRENCY_RATE = 0.65
+# 战前整备的回复货品：可以重复购买，价格固定
+SHOP_HEAL_ITEM_ID = "coagulant_draught"
+SHOP_HEAL_AMOUNT = 60
+# 随机事件关的恢复选项：按最大生命比例结算，适配不同成长阶段
+EVENT_HEAL_RATIO = 0.4
 
 ROOM_COMBAT = "combat"
 ROOM_ELITE = "elite"
@@ -180,6 +198,19 @@ class AttackImpact:
     parryable: bool
     dodged: bool = False
     remaining: float = 0.24
+
+
+@dataclass
+class ParryShockwave:
+    """弹反冲击波：从角色身上扩散，表现弹刀把首领压回去的那一下。"""
+
+    x: float
+    y: float
+    remaining: float
+    total: float
+    radius: float = 150.0
+    color: tuple[int, int, int] = (120, 240, 255)
+    label: str = ""
 
 
 @dataclass
@@ -272,6 +303,8 @@ class ShopItem:
     title: str
     cost: int
     description: str
+    # 可重复购买（例如战前回复）：不写入“本局已购入”名单
+    repeatable: bool = False
 
 
 @dataclass(frozen=True)
@@ -593,7 +626,7 @@ SECOND_STAGE_WAVE_PLANS: dict[int, tuple[tuple[str, ...], ...]] = {
         ("rift_worm", "rift_worm", "shield_guard", "chaser", "resonance_mage"),
         ("shield_guard", "rift_worm", "resonance_mage", "chaser", "spear_thrower"),
     ),
-    7: (("rust_crown_knight",),),
+    7: (("broken_bridge_bell_keeper",),),
 }
 
 SHOP_ITEMS = (
@@ -601,6 +634,13 @@ SHOP_ITEMS = (
     ShopItem("edge_plating", "锋刃镀层", 28, "本次远征攻击力永久提高 4 点。"),
     ShopItem("vital_expansion", "晶格扩容", 34, "本次远征最大生命提高 45，不恢复生命。"),
     ShopItem("resonance_cell", "谐振电池", 20, "立即补充 45 点回响能量。"),
+    ShopItem(
+        SHOP_HEAL_ITEM_ID,
+        "凝血汤剂",
+        18,
+        "立即恢复 60 点生命，可重复购买。",
+        repeatable=True,
+    ),
 )
 
 # 每层的关卡简报：介绍本层首次登场的敌人及其攻击特点
@@ -660,8 +700,8 @@ FLOOR_BRIEFINGS: dict[int, FloorBriefing] = {
         (
             (
                 "灰烬行商",
-                "可购买恢复、锋刃强化、生命扩容与能量补给。每件商品每次远征限购一次，"
-                "可以不消费直接离开。",
+                "可购买锋刃强化、生命扩容、能量补给与凝血汤剂。强化类货品每次远征限购一次，"
+                "凝血汤剂可以重复购买，也可以不消费直接离开。",
             ),
             (
                 "战前整备",
@@ -671,17 +711,22 @@ FLOOR_BRIEFINGS: dict[int, FloorBriefing] = {
     ),
     5: FloorBriefing(
         "锈冠王庭",
-        "第一阶段终点：锈冠骑士会在生命降至 55% 后改写攻击节奏。",
+        "第一阶段终点：锈冠骑士全阶段减免 80% 伤害，破防窗口才是真正的输出期。",
         (
             (
                 "第一阶段 · 王庭残仪",
-                "骑士以王庭横斩和锈链突刺压迫站位。其冠甲会削减常规伤害，"
-                "完美弹刀可制造短暂输出窗口。",
+                "骑士连续挥出三段冠冕三裁：每段弹刀窗口 0.4 秒，落点间隔 0.3 / 0.4 秒。"
+                "三段全部弹开才会被击退破防，漏掉的每一段会造成 120 点伤害。",
+            ),
+            (
+                "破防 · 核心暴露",
+                "破防瞬间骑士承受最大生命 10% 的伤害，并在 5 秒内失去全部减伤；"
+                "这段时间结束后抗性回归，骑士会立刻重新起手。",
             ),
             (
                 "第二阶段 · 熔锈誓约",
-                "骑士约每 7 秒瞬移至远端并发动断忆敕令。金红色敕令覆盖全场且不能靠冲刺规避；"
-                "未完美弹刀会失去 80% 最大生命，成功则令其眩晕并防御崩解 3 秒。",
+                "生命低于 50% 后骑士约每 7 秒瞬移至远端发动断忆敕令：弹刀窗口更短，"
+                "未完美弹刀会失去 80% 当前生命；成功则以弹反冲击波令其瘫痪 5 秒并失去减伤。",
             ),
         ),
     ),
@@ -693,14 +738,17 @@ ROOM_TYPE_BRIEFINGS: dict[str, FloorBriefing] = {
         "高威胁敌群获得额外生命与攻击修正，击破后可取得更多战时铸币。",
         (
             ("精英契印", "敌群威胁额外提高 20%，编成会混合前后排与不可弹反攻击。"),
-            ("讨伐酬赏", "清空全部波次后额外获得 24 枚战时铸币。"),
+            ("讨伐酬赏", "清空全部波次后额外获得一批战时铸币。"),
         ),
     ),
     ROOM_EVENT: FloorBriefing(
         "失真记忆事件",
-        "本关没有强制战斗；读取残留记忆，并在三项不可撤销的结果中选择其一。",
+        "本关没有强制战斗；读取残留记忆，并在四项不可撤销的结果中选择其一。",
         (
-            ("记忆抉择", "选择铸币、回响能量或以生命换取本局攻击强化。"),
+            (
+                "记忆抉择",
+                "选择铸币、回响能量、恢复生命，或以生命换取本局攻击强化。",
+            ),
             ("一次勘定", "结果确认后立即写入暂存，重新进入关卡不能重复领取。"),
         ),
     ),
@@ -725,23 +773,32 @@ ROOM_TYPE_BRIEFINGS: dict[str, FloorBriefing] = {
         "裂隙会随机拼接高压敌群，威胁更高，但清理后获得额外铸币。",
         (
             ("未知编成", "敌群从第二阶段战斗池中重组，威胁额外提高 30%。"),
-            ("裂隙溢价", "清空房间后额外获得 32 枚战时铸币。"),
+            ("裂隙溢价", "清空房间后额外获得一批战时铸币。"),
         ),
     ),
     ROOM_SHOP: FloorBriefing(
         "余烬行商驿站",
         "第二阶段第六关固定为整备商店，可为最终首领战补充资源。",
         (
-            ("区域行商", "生命上限、攻击与能量货品每件限购一次，商店不提供治疗。"),
+            (
+                "区域行商",
+                "生命上限、攻击与能量货品每件限购一次；凝血汤剂可重复购买，用于战前回复。",
+            ),
             ("最终整备", "不消费也可离开；离店后直接开启第七关入口。"),
         ),
     ),
     ROOM_BOSS: FloorBriefing(
-        "深层锈冠王庭",
-        "第二阶段第七关：强化后的锈冠骑士仍具有两个阶段与断忆敕令。",
+        "断桥钟楼",
+        "第二阶段第七关：断桥司钟以时钉散射压制，核心未暴露时不受任何伤害。",
         (
-            ("深层冠甲", "更高威胁强化生命与伤害，第一阶段维持可学习的近战组合。"),
-            ("断忆敕令", "骑士先瞬移到远离玩家的一侧；必须以完美弹刀破解，否则会损失绝大部分生命。"),
+            (
+                "时钉散射",
+                "钟体一次连续射出三枚时钉，可逐发弹刀反弹；玩家贴身时改用刻度横扫。",
+            ),
+            (
+                "核心暴露",
+                "只有削空韧性才能打伤钟体：核心暴露 4 秒且钟体停火，窗口结束后韧性回满。",
+            ),
         ),
     ),
 }
@@ -902,6 +959,8 @@ class StartScreen:
         self.run_parries = 0
         self.run_kills = 0
         self.run_currency = 0
+        # 铸币缩放产生的零头：攒够 1 枚再结算，避免每次收益都被向下取整吃掉
+        self._currency_pool = 0.0
         self.run_shop_attack_bonus = 0
         self.run_shop_hp_bonus = 0
         self.shop_selected = 0
@@ -916,6 +975,7 @@ class StartScreen:
         self.room_enemies: list[Enemy] = []
         self.pending_enemy_attacks: list[PendingEnemyAttack] = []
         self.attack_impacts: list[AttackImpact] = []
+        self.shockwaves: list[ParryShockwave] = []
         self.dash_trails: list[DashTrail] = []
         self._dash_trail_timer = 0.0
         self._dash_was_active = False
@@ -1317,6 +1377,7 @@ class StartScreen:
         self.run_parries = saved["run_parries"]
         self.run_kills = saved["run_kills"]
         self.run_currency = saved["run_currency"]
+        self._currency_pool = 0.0
         self.player_level = saved["player_level"]
         self.player_exp = min(saved["player_exp"], self.exp_to_next - 1)
         self.run_shop_attack_bonus = saved["shop_attack_bonus"]
@@ -2193,25 +2254,50 @@ class StartScreen:
             return (
                 ("静滞扩容", "最大生命 +25，不恢复当前生命"),
                 ("谐振整备", "回响能量补满"),
-                ("拆解装置", "获得 18 枚战时铸币"),
+                (
+                    "拆解装置",
+                    f"获得 {self._currency_reward(18)} 枚战时铸币",
+                ),
             )
         return (
-            ("回收记忆", "获得 24 枚战时铸币"),
+            ("回收记忆", f"获得 {self._currency_reward(24)} 枚战时铸币"),
             ("汲取谐振", "回响能量 +40"),
+            (
+                "回溯愈合",
+                f"恢复 {self.event_heal_amount} 点生命"
+                f"（最大生命的 {round(EVENT_HEAL_RATIO * 100)}%）",
+            ),
             ("承受烙印", "失去 15% 当前生命，攻击力 +4"),
         )
 
+    @property
+    def event_heal_amount(self) -> int:
+        """事件关的回血量：按最大生命比例，随本局成长自动放大。"""
+        return max(1, round(self.player.max_hp * EVENT_HEAL_RATIO))
+
     def _room_event_rects(self) -> list[pygame.Rect]:
         rect = self._overlay_rect()
+        choices = self._room_event_choices()
+        height = 82
+        spacing = 108
+        bottom_margin = 28
+        # 选项超过三行时压缩行距，保证仍然落在面板内
+        needed = rect.y + 112 + spacing * (len(choices) - 1) + height + bottom_margin
+        if needed > rect.bottom:
+            spacing = max(
+                height + 8,
+                (rect.height - 112 - height - bottom_margin) // max(1, len(choices) - 1),
+            )
         return [
-            pygame.Rect(rect.x + 42, rect.y + 112 + index * 108, rect.width - 84, 82)
-            for index in range(len(self._room_event_choices()))
+            pygame.Rect(rect.x + 42, rect.y + 112 + index * spacing, rect.width - 84, height)
+            for index in range(len(choices))
         ]
 
     def _resolve_room_event(self, index: int) -> bool:
         if self.room_resolved or index < 0 or index >= len(self._room_event_choices()):
             return False
         title = self._room_event_choices()[index][0]
+        message = f"{title} 已完成，回响之门正在开启"
         if self.room_type == ROOM_REWARD:
             if index == 0:
                 self.run_shop_attack_bonus += 3
@@ -2228,12 +2314,18 @@ class StartScreen:
             elif index == 1:
                 self.echo_energy = ECHO_ENERGY_MAX
             else:
-                self.run_currency += 18
+                self._grant_fixed_currency(18)
         else:
             if index == 0:
-                self.run_currency += 24
+                self._grant_fixed_currency(24)
             elif index == 1:
                 self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + 40)
+            elif index == 2:
+                if self.player.hp >= self.player.max_hp:
+                    self._notify("生命值已满，不需要回溯愈合")
+                    return False
+                healed = self.player.heal(self.event_heal_amount)
+                message = f"{title}  生命 +{healed}，回响之门正在开启"
             else:
                 self.player.hp = max(1, self.player.hp - max(1, round(self.player.hp * 0.15)))
                 self.run_shop_attack_bonus += 4
@@ -2243,7 +2335,7 @@ class StartScreen:
         self.page = "game"
         self._save_run_checkpoint()
         self.audio.play("hit", 0.45)
-        self._notify(f"{title} 已完成，回响之门正在开启")
+        self._notify(message)
         return True
 
     def _leave_shop(self) -> None:
@@ -2258,7 +2350,7 @@ class StartScreen:
     def _shop_item_rects(self) -> list[pygame.Rect]:
         rect = self._overlay_rect()
         rows = [
-            pygame.Rect(rect.x + 42, rect.y + 108 + index * 78, rect.width - 84, 64)
+            pygame.Rect(rect.x + 42, rect.y + 104 + index * 72, rect.width - 84, 60)
             for index in range(len(SHOP_ITEMS))
         ]
         rows.append(pygame.Rect(rect.centerx - 150, rect.bottom - 104, 300, 44))
@@ -2268,13 +2360,17 @@ class StartScreen:
         if index < 0 or index >= len(SHOP_ITEMS):
             return False
         item = SHOP_ITEMS[index]
-        if item.item_id in self.shop_purchased:
+        if item.item_id in self.shop_purchased and not item.repeatable:
             self._notify("该货品本次远征已经购入")
             return False
         if self.run_currency < item.cost:
             self._notify(f"战时铸币不足，还需 {item.cost - self.run_currency}")
             return False
+        if item.item_id == SHOP_HEAL_ITEM_ID and self.player.hp >= self.player.max_hp:
+            self._notify("生命值已满，不需要回复")
+            return False
         self.run_currency -= item.cost
+        message = f"购入 {item.title}  铸币 -{item.cost}"
         if item.item_id == "repair_infusion":
             self.run_shop_hp_bonus += 25
             self.player.max_hp += 25
@@ -2286,7 +2382,13 @@ class StartScreen:
             self.player.max_hp += 45
         elif item.item_id == "resonance_cell":
             self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + 45)
-        self.shop_purchased.add(item.item_id)
+        elif item.item_id == SHOP_HEAL_ITEM_ID:
+            healed = self.player.heal(SHOP_HEAL_AMOUNT)
+            message = (
+                f"购入 {item.title}  铸币 -{item.cost}  生命 +{healed}"
+            )
+        if not item.repeatable:
+            self.shop_purchased.add(item.item_id)
         lifetime_stats = self.profile.get("lifetime_stats", {})
         if not isinstance(lifetime_stats, dict):
             lifetime_stats = {}
@@ -2294,7 +2396,7 @@ class StartScreen:
         lifetime_stats["shop_purchases"] = self._stat("shop_purchases") + 1
         self.profile["lifetime_stats"] = lifetime_stats
         self.audio.play("hit", 0.5)
-        self._notify(f"购入 {item.title}  铸币 -{item.cost}")
+        self._notify(message)
         self._save_run_checkpoint()
         return True
 
@@ -2752,8 +2854,9 @@ class StartScreen:
         if not self.portal_open:
             if self._room_cleared():
                 if self.room_type in {ROOM_ELITE, ROOM_RIFT} and not self.room_resolved:
-                    bonus = 24 if self.room_type == ROOM_ELITE else 32
-                    self.run_currency += bonus
+                    bonus = self._grant_fixed_currency(
+                        24 if self.room_type == ROOM_ELITE else 32
+                    )
                     self.room_resolved = True
                     self._save_run_checkpoint()
                     self._notify(f"额外勘定完成  战时铸币 +{bonus}")
@@ -2901,7 +3004,7 @@ class StartScreen:
         self.run_score += 120
         self.run_combo += 1
         self.run_max_combo = max(self.run_max_combo, self.run_combo)
-        self.run_currency += 2
+        self._grant_currency(2)
         self._gain_energy(ENERGY_GAIN_REFLECT)
         if enemy.defeated:
             self._award_enemy_defeat(enemy)
@@ -2960,7 +3063,8 @@ class StartScreen:
         reflect: bool = False,
     ) -> None:
         enemy = pending.enemy
-        reflected_damage = enemy.on_attack_parried(pending.profile, perfect=True)
+        profile = pending.profile
+        reflected_damage = enemy.on_attack_parried(profile, perfect=True)
         if reflect:
             # 远程弹刀：子弹原样打回去，命中敌人才造成伤害
             self.reflected_projectiles.append(
@@ -2973,32 +3077,71 @@ class StartScreen:
             )
         else:
             enemy.take_damage(reflected_damage, source_x=self.player.x)
-            # 近战弹刀把敌人向后震开一段，形成"弹开"的手感
-            enemy.apply_knockback(
-                self.player.facing,
-                enemy.PARRY_KNOCKBACK_SPEED,
-                enemy.PARRY_KNOCKBACK_LIFT,
-            )
+            # 近战弹刀把敌人向后震开一段，形成"弹开"的手感；
+            # 首领连段的前两段不产生击退，只有三段全弹开才会被震开
+            if enemy.allows_parry_knockback(profile):
+                enemy.apply_knockback(
+                    self.player.facing,
+                    enemy.PARRY_KNOCKBACK_SPEED,
+                    enemy.PARRY_KNOCKBACK_LIFT,
+                )
         self.audio.play("parry")
         self.audio.duck(0.5, 0.45)
         self.run_score += 260
         self.run_combo += 2
         self.run_max_combo = max(self.run_max_combo, self.run_combo)
         self.run_parries += 1
-        self.run_currency += 5
+        self._grant_currency(5)
         self._gain_energy(ENERGY_GAIN_PARRY)
         self.attack_impacts.append(
             AttackImpact(self.player.x, self.player.y - 58, True, True)
         )
-        if pending.profile.tag == "boss_memory_sever":
-            self._notify("敕令逆断  锈冠骑士眩晕且防御崩解 3 秒")
+        if profile.tag == "boss_memory_sever":
+            self._spawn_parry_shockwave(
+                radius=190.0,
+                color=(190, 240, 255),
+                label="弹反冲击波",
+            )
+            self._notify(
+                f"敕令逆断  弹反冲击波令 {enemy.display_name} 瘫痪 5 秒且减伤失效"
+            )
+        elif profile.tag.startswith("boss_combo_") and enemy.allows_parry_knockback(
+            profile
+        ):
+            self._spawn_parry_shockwave(
+                radius=130.0,
+                color=COLORS["gold"],
+                label="破防",
+            )
+            self._notify(f"冠冕三裁 三段全弹开  {enemy.display_name} 被击退破防")
         elif reflect:
             self._notify(f"PERFECT  弹开子弹  反弹 {reflected_damage}")
         else:
             self._notify(f"PERFECT  弹刀成功  反震 {reflected_damage}")
         self._complete_tutorial_action("parry")
+        enemy.on_attack_resolved(profile, parried=True)
         if enemy.defeated:
             self._award_enemy_defeat(enemy)
+
+    def _spawn_parry_shockwave(
+        self,
+        *,
+        radius: float,
+        color: tuple[int, int, int],
+        label: str = "",
+    ) -> None:
+        """弹刀成功的冲击波：从角色身上向外扩散。"""
+        self.shockwaves.append(
+            ParryShockwave(
+                x=self.player.x,
+                y=self.player.y - 54,
+                remaining=0.5,
+                total=0.5,
+                radius=radius,
+                color=color,
+                label=label,
+            )
+        )
 
     def _is_key_down(self, key: int) -> bool:
         if key in self.pressed_keys:
@@ -3068,7 +3211,7 @@ class StartScreen:
             self.run_score += 120
             self.run_combo += 1
             self.run_max_combo = max(self.run_max_combo, self.run_combo)
-            self.run_currency += 2
+            self._grant_currency(2)
             self._gain_energy(
                 ENERGY_GAIN_HEAVY_ATTACK
                 if self.player.attack_direction in ("up", "down")
@@ -3130,6 +3273,22 @@ class StartScreen:
         self.attack_impacts = [
             impact for impact in self.attack_impacts if impact.remaining > 0.0
         ]
+        for wave in self.shockwaves:
+            wave.remaining -= dt
+        self.shockwaves = [wave for wave in self.shockwaves if wave.remaining > 0.0]
+
+    def _parry_window_open(self, profile: AttackProfile) -> bool:
+        """当前是否处在这次攻击的弹刀窗口内。
+
+        多数招式沿用全局弹刀缓冲；首领连段与断忆敕令通过
+        `AttackProfile.parry_window` 指定更短、更严格的窗口。
+        """
+        if not self.player.parry_buffered:
+            return False
+        window = profile.parry_window
+        if window is None:
+            return True
+        return self.player.parry_buffer_age <= window
 
     def _resolve_enemy_attack(self, pending: PendingEnemyAttack) -> None:
         enemy = pending.enemy
@@ -3139,14 +3298,15 @@ class StartScreen:
         # 近战：金色闪光亮起后的窗口内按下弹刀即为完美弹刀。
         # 远程弹刀在按下瞬间按“贴身范围”判定（见 _try_projectile_parry），
         # 因此这里不再用时间缓冲补判，避免离得很远也能弹。
-        if profile.parryable and not is_projectile and self.player.parry_buffered:
+        if profile.parryable and not is_projectile and self._parry_window_open(profile):
             self._perfect_parry(pending)
             return
 
-        # 断忆敕令是首领二阶段的强制弹刀检定：冲刺与剑气无敌不能替代弹刀。
+        # 断忆敕令是首领二阶段的强制弹刀检定：冲刺与剑气无敌不能替代弹刀，
+        # 失误按“当前生命”结算，未受伤时不会直接被满血秒杀。
         if profile.tag == "boss_memory_sever":
             damage = self.player.take_damage(
-                max(1, round(self.player.max_hp * BOSS_MEMORY_SEVER_DAMAGE_RATIO)),
+                max(1, round(self.player.hp * BOSS_MEMORY_SEVER_DAMAGE_RATIO)),
                 ignore_invulnerability=True,
             )
             self.audio.play("hurt")
@@ -3161,6 +3321,7 @@ class StartScreen:
                 )
             )
             self._notify(f"断忆敕令贯穿防护  失去 {damage} 点生命")
+            enemy.on_attack_resolved(profile, parried=False)
             return
 
         # 闪避期间无敌：不受伤害，也不中断连击
@@ -3177,6 +3338,7 @@ class StartScreen:
                 )
             )
             self._notify(f"闪避成功  躲开 {enemy.display_name}")
+            enemy.on_attack_resolved(profile, parried=False)
             return
 
         damage = self.player.take_damage(profile.damage)
@@ -3191,6 +3353,7 @@ class StartScreen:
                 profile.parryable,
             )
         )
+        enemy.on_attack_resolved(profile, parried=False)
         if profile.parryable and self.player.parry_active:
             self._notify(f"弹刀过早  受到 {damage} 伤害")
         elif not profile.parryable and self.player.parry_active:
@@ -3208,14 +3371,18 @@ class StartScreen:
         salvage_rate = self._track_value("salvage_protocol")
         if salvage_rate > 0:
             currency_gain = math.ceil(currency_gain * (1.0 + salvage_rate / 100.0))
-        self.run_currency += currency_gain
+        currency_gain = self._grant_currency(currency_gain)
         self.run_kills += 1
         self.audio.play("defeat")
-        message = f"击败 {enemy.display_name}  铸币 +{currency_gain}"
+        message = (
+            f"击败 {enemy.display_name}  铸币 +{currency_gain}"
+            if currency_gain > 0
+            else f"击败 {enemy.display_name}"
+        )
         self._notify(message)
         self._gain_energy(ENERGY_GAIN_DEFEAT)
         self._gain_exp(self._enemy_exp(enemy))
-        if enemy.kind == "rust_crown_knight":
+        if enemy.kind in BOSS_CLASSES:
             lifetime_stats = self.profile.get("lifetime_stats", {})
             if not isinstance(lifetime_stats, dict):
                 lifetime_stats = {}
@@ -3283,13 +3450,42 @@ class StartScreen:
 
     # -- 回响能量与回响剑气 -----------------------------------------------
 
+    def _currency_reward(self, base: int) -> int:
+        """固定铸币奖励的折算值：UI 文案与实际发放共用同一个数字。"""
+        return max(1, round(base * RUN_CURRENCY_RATE))
+
+    def _grant_currency(self, amount: int) -> int:
+        """战斗收益入账：整体按 RUN_CURRENCY_RATE 缩放，零头攒到下一次。"""
+        if amount <= 0:
+            return 0
+        self._currency_pool += amount * RUN_CURRENCY_RATE
+        whole = int(self._currency_pool)
+        if whole <= 0:
+            return 0
+        self._currency_pool -= whole
+        self.run_currency += whole
+        return whole
+
+    def _grant_fixed_currency(self, base: int) -> int:
+        """固定奖励（事件、清房）：按折算值一次性发放，避免与提示文案不符。"""
+        reward = self._currency_reward(base)
+        self.run_currency += reward
+        return reward
+
     @property
     def energy_ready(self) -> bool:
         return self.echo_energy >= ECHO_ENERGY_MAX
 
+    @property
+    def skill_energy_locked(self) -> bool:
+        """回响剑气还在出手或仍在场上时，战斗收益不再积攒能量。"""
+        if not SKILL_WAVE_ENERGY_LOCK:
+            return False
+        return bool(self.skill_waves) or self.player.skill_active
+
     def _gain_energy(self, amount: int) -> None:
         """普通攻击 / 上劈下劈 / 击败敌人 / 完美弹刀都会积攒回响能量。"""
-        if amount <= 0 or self.energy_ready:
+        if amount <= 0 or self.energy_ready or self.skill_energy_locked:
             return
         self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + amount)
         if self.energy_ready:
@@ -3389,7 +3585,7 @@ class StartScreen:
             self.run_score += 200
             self.run_combo += 1
             self.run_max_combo = max(self.run_max_combo, self.run_combo)
-            self.run_currency += 3
+            self._grant_currency(3)
             if enemy.defeated:
                 self._award_enemy_defeat(enemy)
             else:
@@ -4082,7 +4278,7 @@ class StartScreen:
 
     def _draw_shop(self, rect: pygame.Rect) -> None:
         intro = self.small_font.render(
-            f"持有战时铸币 {self.run_currency}    每件货品限购一次",
+            f"持有战时铸币 {self.run_currency}    强化限购一次 · 凝血汤剂可重复购买",
             True,
             COLORS["gold"],
         )
@@ -4091,7 +4287,7 @@ class StartScreen:
         for index, item in enumerate(SHOP_ITEMS):
             row = rows[index]
             selected = index == self.shop_selected
-            purchased = item.item_id in self.shop_purchased
+            purchased = item.item_id in self.shop_purchased and not item.repeatable
             affordable = self.run_currency >= item.cost and not purchased
             pygame.draw.rect(
                 self.canvas,
@@ -4105,9 +4301,9 @@ class StartScreen:
                 2 if selected else 1,
             )
             title = self.overlay_body_font.render(item.title, True, COLORS["ice"])
-            self.canvas.blit(title, (row.x + 22, row.y + 8))
+            self.canvas.blit(title, (row.x + 22, row.y + 5))
             detail = self.small_font.render(item.description, True, COLORS["muted"])
-            self.canvas.blit(detail, (row.x + 22, row.y + 37))
+            self.canvas.blit(detail, (row.x + 22, row.y + 33))
             if purchased:
                 state, color = "已购入", COLORS["cyan"]
             elif affordable:
@@ -4750,8 +4946,22 @@ class StartScreen:
         for kind, x in zip(kinds, self._wave_positions(len(kinds))):
             enemy_class = ENEMY_CLASSES.get(kind) or BOSS_CLASSES[kind]
             spawn_x = 980.0 if kind in BOSS_CLASSES else x
-            enemies.append(enemy_class(spawn_x, WAVE_GROUND_Y, threat=threat))
+            # 章节成长只作用于小怪：首领会按自己的阶段强化
+            scale = self._normal_enemy_scale() if kind in ENEMY_CLASSES else 1.0
+            enemies.append(
+                enemy_class(
+                    spawn_x,
+                    WAVE_GROUND_Y,
+                    threat=threat,
+                    scale=scale,
+                )
+            )
         return enemies
+
+    def _normal_enemy_scale(self) -> float:
+        """小怪的跨章节成长倍率：第一章为 1.0，第二章整体上一个台阶。"""
+        stage_steps = max(0, self.run_stage - 1)
+        return 1.0 + NORMAL_ENEMY_STAGE_STEP * stage_steps
 
     def _start_run(
         self,
@@ -4809,6 +5019,7 @@ class StartScreen:
         self.run_currency = (
             carried_currency if carried_currency is not None else carry_currency
         )
+        self._currency_pool = 0.0
         self.result_relic_breakdown = []
         self.player = Player(230, 566)
         nexus_hp = int(self._track_value("vital_lattice"))
@@ -4876,6 +5087,7 @@ class StartScreen:
             self._queue_next_wave()
         self.pending_enemy_attacks.clear()
         self.attack_impacts.clear()
+        self.shockwaves.clear()
         self.reflected_projectiles.clear()
         self.dash_trails.clear()
         self._dash_trail_timer = 0.0
@@ -5121,6 +5333,7 @@ class StartScreen:
         self.pressed_keys.clear()
         self.pending_enemy_attacks.clear()
         self.attack_impacts.clear()
+        self.shockwaves.clear()
         self._notify("记忆载体崩解，远征已终止")
 
     def _draw_game(self) -> None:
@@ -5202,7 +5415,7 @@ class StartScreen:
             )
         elif self._is_boss_room():
             boss = next(
-                (enemy for enemy in self.room_enemies if enemy.kind == "rust_crown_knight"),
+                (enemy for enemy in self.room_enemies if enemy.kind in BOSS_CLASSES),
                 None,
             )
             phase = getattr(boss, "phase", 1)
@@ -5393,13 +5606,12 @@ class StartScreen:
 
     def _draw_boss_hud(self) -> None:
         boss = next(
-            (enemy for enemy in self.room_enemies if enemy.kind == "rust_crown_knight"),
+            (enemy for enemy in self.room_enemies if enemy.kind in BOSS_CLASSES),
             None,
         )
         if boss is None or boss.defeated:
             return
         phase = int(getattr(boss, "phase", 1))
-        defense_broken = bool(getattr(boss, "defense_broken", False))
         bar = pygame.Rect(330, 184, 620, 18)
         pygame.draw.rect(self.canvas, (30, 13, 18), bar)
         pygame.draw.rect(
@@ -5407,15 +5619,34 @@ class StartScreen:
             COLORS["red"],
             (bar.x, bar.y, round(bar.width * boss.hp / max(1, boss.max_hp)), bar.height),
         )
+        if hasattr(boss, "phase"):
+            title_text = f"区域执政者 · {boss.display_name}    阶段 {phase}/2"
+        else:
+            title_text = f"区域执政者 · {boss.display_name}"
         title = self.small_font.render(
-            f"区域执政者 · {boss.display_name}    阶段 {phase}/2",
+            title_text,
             True,
             COLORS["gold"] if phase == 2 else COLORS["ice"],
         )
         self.canvas.blit(title, title.get_rect(center=(bar.centerx, bar.y - 14)))
-        if defense_broken:
-            state = self.small_font.render("眩晕 · 防御崩解", True, COLORS["cyan"])
+        state_text, state_color = self._boss_state_text(boss)
+        if state_text:
+            state = self.small_font.render(state_text, True, state_color)
             self.canvas.blit(state, state.get_rect(center=(bar.centerx, bar.bottom + 14)))
+
+    @staticmethod
+    def _boss_state_text(boss: Enemy) -> tuple[str, tuple[int, int, int]]:
+        """首领血条下方的状态说明：破防 / 核心暴露等关键输出窗口。"""
+        if getattr(boss, "core_exposed", False):
+            remaining = float(getattr(boss, "core_exposure_remaining", 0.0))
+            return f"核心暴露 · 可以造成伤害 {remaining:.1f} 秒", COLORS["cyan"]
+        if getattr(boss, "defense_broken", False):
+            return "破防 · 减伤失效", COLORS["cyan"]
+        if boss.kind == "rust_crown_knight":
+            return "全阶段减伤 80% · 三连弹刀破防", COLORS["muted"]
+        if boss.kind == "broken_bridge_bell_keeper":
+            return "核心未暴露 · 攻击只削韧", COLORS["muted"]
+        return "", COLORS["muted"]
 
     def _draw_tutorial_panel(self) -> None:
         step = self._current_tutorial_step
@@ -5761,6 +5992,7 @@ class StartScreen:
             "rift_worm": (166, 99, 244),
             "resonance_mage": COLORS["cyan"],
             "rust_crown_knight": COLORS["gold"],
+            "broken_bridge_bell_keeper": (122, 214, 226),
         }
         for enemy in self.room_enemies:
             if enemy.defeated:
@@ -5807,7 +6039,8 @@ class StartScreen:
                 else colors.get(enemy.kind, COLORS["muted"])
             )
             pygame.draw.rect(self.canvas, (9, 25, 35), body)
-            pygame.draw.rect(self.canvas, color, body, 3 if enemy.kind == "rust_crown_knight" else 2)
+            is_boss = enemy.kind in BOSS_CLASSES
+            pygame.draw.rect(self.canvas, color, body, 3 if is_boss else 2)
             if enemy.kind == "rust_crown_knight":
                 crown_y = body.y - 18
                 pygame.draw.polygon(
@@ -5832,11 +6065,24 @@ class StartScreen:
                 )
                 if getattr(enemy, "defense_broken", False):
                     pygame.draw.circle(self.canvas, COLORS["cyan"], body.center, 68, 3)
+            elif enemy.kind == "broken_bridge_bell_keeper":
+                # 钟体：外圈刻度环 + 中央钟摆，核心暴露时额外套一层青色光环
+                pygame.draw.circle(self.canvas, color, body.center, 30, 3)
+                pygame.draw.circle(self.canvas, COLORS["gold"], body.center, 6)
+                pygame.draw.line(
+                    self.canvas,
+                    COLORS["gold"],
+                    (body.centerx, body.y + 14),
+                    (body.centerx + enemy.facing * 26, body.centery + 20),
+                    5,
+                )
+                if getattr(enemy, "core_exposed", False):
+                    pygame.draw.circle(self.canvas, COLORS["cyan"], body.center, 46, 3)
             else:
                 eye_x = x + (7 if enemy.facing > 0 else -12)
                 pygame.draw.rect(self.canvas, color, (eye_x, y - 32, 8, 5))
 
-            if enemy.kind == "rust_crown_knight":
+            if is_boss:
                 continue
             hp_ratio = enemy.hp / enemy.max_hp if enemy.max_hp else 0
             hp_back = pygame.Rect(x - 26, y - 56, 52, 5)
@@ -5867,7 +6113,12 @@ class StartScreen:
             elif pending.profile.projectile_speed is not None:
                 self._draw_projectile_telegraph(effect, pending)
             elif pending.profile.parryable:
-                self._draw_melee_parry_flash(effect, enemy_center, pending.remaining)
+                self._draw_melee_parry_flash(
+                    effect,
+                    enemy_center,
+                    pending.remaining,
+                    pending.profile.parry_window,
+                )
             else:
                 self._draw_unparryable_telegraph(effect, pending, enemy_center)
 
@@ -5904,6 +6155,49 @@ class StartScreen:
                 label.set_alpha(alpha)
                 effect.blit(label, label.get_rect(center=(center[0], center[1] - 30)))
 
+        for wave in self.shockwaves:
+            progress = 1.0 - max(
+                0.0,
+                min(1.0, wave.remaining / max(0.001, wave.total)),
+            )
+            radius = round(wave.radius * (0.35 + 0.65 * progress))
+            alpha = round(230 * (1.0 - progress) ** 1.2)
+            center = (round(wave.x), round(wave.y))
+            pygame.draw.circle(
+                effect,
+                (*wave.color, alpha),
+                center,
+                radius,
+                max(2, round(8 * (1.0 - progress) + 2)),
+            )
+            pygame.draw.circle(
+                effect,
+                (*COLORS["white"], max(0, alpha - 60)),
+                center,
+                max(6, round(radius * 0.45)),
+                3,
+            )
+            for angle in range(0, 360, 30):
+                radians = math.radians(angle)
+                inner = radius * 0.55
+                outer = radius * 0.92
+                start = (
+                    round(center[0] + math.cos(radians) * inner),
+                    round(center[1] + math.sin(radians) * inner),
+                )
+                end = (
+                    round(center[0] + math.cos(radians) * outer),
+                    round(center[1] + math.sin(radians) * outer),
+                )
+                pygame.draw.line(effect, (*wave.color, alpha), start, end, 3)
+            if wave.label:
+                label = self.small_font.render(wave.label, True, COLORS["ice"])
+                label.set_alpha(alpha)
+                effect.blit(
+                    label,
+                    label.get_rect(center=(center[0], center[1] - radius - 12)),
+                )
+
         self.canvas.blit(effect, (0, 0))
 
     def _draw_boss_decree_telegraph(
@@ -5920,7 +6214,9 @@ class StartScreen:
         pygame.draw.rect(effect, (190, 42, 48, alpha), (0, 0, *LOGICAL_SIZE), 12)
         center = (round(self.player.x), round(self.player.y - 54))
         radius = round(170 - 125 * progress)
-        window_open = pending.remaining <= MELEE_FLASH_LEAD
+        # 敕令的弹刀窗口比普通近战更短：提示光也要跟着收紧
+        window = pending.profile.parry_window or MELEE_FLASH_LEAD
+        window_open = pending.remaining <= window
         signal_color = COLORS["gold"] if window_open else COLORS["red"]
         pygame.draw.circle(effect, (*signal_color, 190), center, max(28, radius), 6)
         pygame.draw.line(
@@ -5967,17 +6263,20 @@ class StartScreen:
         effect: pygame.Surface,
         center: tuple[int, int],
         remaining: float,
+        window: float | None = None,
     ) -> None:
         """近战提示：闪光亮起后的这段时间内按弹刀即可完美弹反。"""
         gold = COLORS["gold"]
-        flash_age = MELEE_FLASH_LEAD - remaining
+        # 首领连段之类可以指定更短的弹刀窗口，提示闪光必须与之一致
+        lead = MELEE_FLASH_LEAD if window is None else window
+        flash_age = lead - remaining
         if flash_age < 0.0:
             # 闪光尚未亮起：只留一个暗金色信号，避免和弹刀窗口混淆
             pygame.draw.circle(effect, (*gold, 55), center, 11, 2)
             pygame.draw.circle(effect, (*gold, 80), center, 3)
             return
 
-        progress = max(0.0, min(1.0, flash_age / MELEE_FLASH_LEAD))
+        progress = max(0.0, min(1.0, flash_age / max(0.001, lead)))
         burst = max(0.0, 1.0 - flash_age / 0.09)
         # 由外向内叠三层光晕，形成“亮起”的闪光
         for radius, alpha in (

@@ -9,6 +9,7 @@ import pygame
 import main
 from game.entities import (
     ENEMY_CLASSES,
+    BrokenBridgeBellKeeper,
     Chaser,
     Enemy,
     Player,
@@ -497,7 +498,8 @@ def test_game_attack_damages_enemy(monkeypatch, tmp_path):
 
     assert enemy.hp < starting_hp
     assert app.run_score > 0
-    assert app.run_currency >= 2
+    # 局内铸币收益按 RUN_CURRENCY_RATE 折算，单次命中至少仍有 1 枚
+    assert app.run_currency >= 1
     pygame.quit()
 
 
@@ -1235,9 +1237,9 @@ def test_new_nexus_tracks_apply_attributes_and_mechanics(monkeypatch, tmp_path):
     assert app.auto_heal_per_second == 6
     assert app.auto_energy_per_second == 1
 
-    # 战利议价 +5%：追击者基础 6 铸币 → 7
+    # 战利议价 +5% 后追击者基础 7 铸币，再按 RUN_CURRENCY_RATE 折算为 4
     app._award_enemy_defeat(Chaser(300, 522))
-    assert app.run_currency == 17
+    assert app.run_currency == 14
     assert app.run_kills == 1
 
     # 生命每 10 秒结算一次；回响能量仍按秒积累。
@@ -1766,6 +1768,7 @@ def test_projectile_parry_requires_close_range(monkeypatch, tmp_path):
 
     # 子弹飞到角色身边：按下弹刀立即弹开并反震
     app.player.update(app.player.PARRY_DURATION, 0)
+    app.player.update(app.player.PARRY_COOLDOWN, 0)
     near = PendingEnemyAttack(
         thrower,
         profile,
@@ -2140,12 +2143,13 @@ def test_second_stage_event_choice_is_applied_once_and_opens_exit(
 
     assert app.overlay == "room_event"
     before = app.run_currency
+    expected_reward = round(24 * main.RUN_CURRENCY_RATE)
     assert app._resolve_room_event(0) is True
-    assert app.run_currency == before + 24
+    assert app.run_currency == before + expected_reward
     assert app.room_resolved is True
     assert app._room_cleared() is True
     assert app._resolve_room_event(0) is False
-    assert app.run_currency == before + 24
+    assert app.run_currency == before + expected_reward
     assert app._active_run_checkpoint()["room_resolved"] is True
     pygame.quit()
 
@@ -2207,8 +2211,91 @@ def test_second_stage_sixth_room_is_shop_and_seventh_room_is_boss(
     app._start_run(7, tutorial=False, stage=2, keep_progress=True, route_seed=11)
     assert app.room_type == main.ROOM_BOSS
     assert [[enemy.kind for enemy in wave] for wave in app.wave_plan] == [
-        ["rust_crown_knight"]
+        ["broken_bridge_bell_keeper"]
     ]
+    pygame.quit()
+
+
+def _open_event_room(app, *, floor: int = 5, stage: int = 2):
+    app._start_run(
+        floor,
+        tutorial=False,
+        stage=stage,
+        room_type=main.ROOM_EVENT,
+        route_seed=7,
+    )
+    app._dismiss_floor_intro()
+    assert app.overlay == "room_event"
+    return app
+
+
+def test_second_stage_event_room_offers_heal(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _open_event_room(app)
+    choices = app._room_event_choices()
+    heal_index = next(
+        index for index, (title, _) in enumerate(choices) if title == "回溯愈合"
+    )
+    app.player.hp = 80
+
+    assert app._resolve_room_event(heal_index) is True
+
+    assert app.player.hp == 80 + app.event_heal_amount
+    assert app.event_heal_amount == round(app.player.max_hp * main.EVENT_HEAL_RATIO)
+    assert app.room_resolved is True
+    assert app._active_run_checkpoint()["room_resolved"] is True
+    pygame.quit()
+
+
+def test_event_heal_is_refused_when_hp_is_full(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _open_event_room(app)
+    heal_index = next(
+        index
+        for index, (title, _) in enumerate(app._room_event_choices())
+        if title == "回溯愈合"
+    )
+    app.player.hp = app.player.max_hp
+
+    assert app._resolve_room_event(heal_index) is False
+
+    assert app.room_resolved is False
+    assert app.overlay == "room_event"
+    pygame.quit()
+
+
+def test_event_heal_is_a_one_time_choice(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _open_event_room(app)
+    heal_index = next(
+        index
+        for index, (title, _) in enumerate(app._room_event_choices())
+        if title == "回溯愈合"
+    )
+    app.player.hp = 60
+    first_heal = app.event_heal_amount
+
+    assert app._resolve_room_event(heal_index) is True
+    app.player.hp = 60
+    assert app._resolve_room_event(heal_index) is False
+
+    assert app.player.hp == 60
+    assert app.player.max_hp >= first_heal
+    pygame.quit()
+
+
+def test_four_option_event_room_rows_fit_inside_panel(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _open_event_room(app)
+    rows = app._room_event_rects()
+    panel = app._overlay_rect()
+
+    assert len(rows) == len(app._room_event_choices()) == 4
+    assert rows[-1].bottom <= panel.bottom
+    assert all(
+        earlier.bottom < later.top for earlier, later in zip(rows, rows[1:])
+    )
+    app._draw_room_event(panel)
     pygame.quit()
 
 
@@ -2253,7 +2340,7 @@ def test_unparried_memory_sever_ignores_dash_and_removes_most_health(
     pygame.quit()
 
 
-def test_parrying_memory_sever_stuns_boss_and_breaks_defense_for_three_seconds(
+def test_parrying_memory_sever_stuns_boss_and_breaks_defense_for_five_seconds(
     monkeypatch, tmp_path
 ):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
@@ -2272,6 +2359,8 @@ def test_parrying_memory_sever_stuns_boss_and_breaks_defense_for_three_seconds(
     broken_damage = boss.take_damage(100, source_x=app.player.x)
     boss.update(0.5, app.player.position)  # 先让弹刀击退的滑行走完
     assert boss.update(2.4, app.player.position).action == "vulnerable"
+    assert boss.defense_broken is True
+    assert boss.update(2.0, app.player.position).action == "vulnerable"
     assert boss.defense_broken is True
     boss.update(0.2, app.player.position)
     assert boss.vulnerable is False
@@ -2919,4 +3008,578 @@ def test_legacy_single_profile_save_migrates_into_the_first_slot(monkeypatch, tm
     assert app.settings["volume"] == 60
     assert app.keybinds["attack"] == 106
     assert app.has_save is True
+    pygame.quit()
+
+
+# -- 战时铸币缩放 -----------------------------------------------------------
+
+
+def test_combat_currency_gain_is_scaled_by_rate(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    starting = app.run_currency
+
+    granted = app._grant_currency(20)
+
+    assert granted == round(20 * main.RUN_CURRENCY_RATE)
+    assert app.run_currency == starting + granted
+    pygame.quit()
+
+
+def test_fixed_currency_reward_matches_scaled_preview(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    before = app.run_currency
+
+    reward = app._grant_fixed_currency(24)
+
+    assert reward == app._currency_reward(24)
+    assert app.run_currency == before + reward
+    pygame.quit()
+
+
+# -- 战前整备：可重复购买的回复货品 -----------------------------------------
+
+
+def test_shop_heal_item_can_be_bought_repeatedly(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(main.SHOP_FLOOR, tutorial=False)
+    app._dismiss_floor_intro()
+    app.run_currency = 200
+    app.player.hp = 10
+    heal_index = next(
+        index
+        for index, item in enumerate(main.SHOP_ITEMS)
+        if item.item_id == main.SHOP_HEAL_ITEM_ID
+    )
+    cost = main.SHOP_ITEMS[heal_index].cost
+
+    assert app._purchase_shop_item(heal_index) is True
+    assert app.player.hp == 10 + main.SHOP_HEAL_AMOUNT
+    assert app._purchase_shop_item(heal_index) is True
+    assert app.player.hp == 10 + main.SHOP_HEAL_AMOUNT * 2
+    assert app.run_currency == 200 - cost * 2
+    pygame.quit()
+
+
+def test_shop_heal_item_is_refused_when_hp_is_full(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(main.SHOP_FLOOR, tutorial=False)
+    app.run_currency = 200
+    heal_index = next(
+        index
+        for index, item in enumerate(main.SHOP_ITEMS)
+        if item.item_id == main.SHOP_HEAL_ITEM_ID
+    )
+
+    assert app._purchase_shop_item(heal_index) is False
+    assert app.run_currency == 200
+    pygame.quit()
+
+
+# -- 回响剑气期间的能量锁 ---------------------------------------------------
+
+
+def test_skill_wave_locks_energy_gain(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    app.echo_energy = 0
+
+    app._spawn_skill_wave()
+    assert app.skill_waves
+    assert app.skill_energy_locked is True
+    app._gain_energy(50)
+    assert app.echo_energy == 0
+
+    app.skill_waves.clear()
+    assert app.skill_energy_locked is False
+    app._gain_energy(50)
+    assert app.echo_energy == 50
+    pygame.quit()
+
+
+# -- 弹刀内置冷却 -----------------------------------------------------------
+
+
+def test_parry_has_internal_cooldown_after_the_stance():
+    player = Player(300, 566)
+
+    assert player.start_parry() is True
+    player.update(Player.PARRY_DURATION, 0)
+
+    assert player.parry_active is False
+    assert player.start_parry() is False
+    player.update(Player.PARRY_COOLDOWN, 0)
+    assert player.start_parry() is True
+
+
+# -- 锈冠骑士：全阶段抗性与三连弹刀 -----------------------------------------
+
+
+def _start_crown_combo_hit(boss: RustCrownKnight) -> None:
+    """按真实流程让首领选出下一段冠冕三裁，激活连段状态。"""
+    if boss._combo_delay > 0.0:
+        # 连段落点间隔由首领自己的计时器控制，这里把它走完
+        boss.update(boss._combo_delay, (boss.x - 60.0, boss.y))
+    intent = boss.choose_intent((boss.x - 60.0, boss.y))
+    assert intent.attack is not None
+
+
+def test_rust_crown_knight_resists_eighty_percent_of_damage():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+
+    assert boss.take_damage(100) == 20
+
+
+def test_rust_crown_knight_breaks_only_after_three_parries():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+
+    for index, profile in enumerate(boss.combo_profiles):
+        _start_crown_combo_hit(boss)
+        boss.on_attack_parried(profile, perfect=True)
+        # 前两段不产生击退，只有第三段全弹开才会被震开
+        assert boss.allows_parry_knockback(profile) is (index == 2)
+        boss.on_attack_resolved(profile, parried=True)
+
+    assert boss.defense_broken is True
+    expected_break_damage = round(boss.max_hp * RustCrownKnight.BREAK_DAMAGE_RATIO)
+    assert boss.hp == boss.max_hp - expected_break_damage
+
+
+def test_rust_crown_knight_break_window_ignores_damage_reduction():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+    for profile in boss.combo_profiles:
+        _start_crown_combo_hit(boss)
+        boss.on_attack_parried(profile, perfect=True)
+        boss.on_attack_resolved(profile, parried=True)
+
+    broken_damage = boss.take_damage(100)
+    boss.update(RustCrownKnight.DEFENSE_BREAK_DURATION, (1200.0, 522.0))
+    normal_damage = boss.take_damage(100)
+
+    assert broken_damage == 100
+    assert normal_damage == 20
+    assert boss.defense_broken is False
+
+
+def test_rust_crown_knight_combo_needs_every_parry():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+    profiles = boss.combo_profiles
+
+    _start_crown_combo_hit(boss)
+    boss.on_attack_parried(profiles[0], perfect=True)
+    boss.on_attack_resolved(profiles[0], parried=True)
+    _start_crown_combo_hit(boss)
+    boss.on_attack_resolved(profiles[1], parried=False)  # 漏掉第二段
+    _start_crown_combo_hit(boss)
+    boss.on_attack_parried(profiles[2], perfect=True)
+    boss.on_attack_resolved(profiles[2], parried=True)
+
+    assert boss.defense_broken is False
+    assert boss.hp == boss.max_hp
+
+
+def test_rust_crown_knight_phase_two_ends_the_break_early():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+    for profile in boss.combo_profiles:
+        _start_crown_combo_hit(boss)
+        boss.on_attack_parried(profile, perfect=True)
+        boss.on_attack_resolved(profile, parried=True)
+    assert boss.defense_broken is True
+
+    boss.hp = round(boss.max_hp * 0.52)
+    boss.take_damage(200)
+
+    assert boss.phase == 2
+    assert boss.defense_broken is False
+    assert boss._special_cooldown == 0.0  # 一进二阶段就能立刻放敕令
+
+
+def test_entering_phase_two_casts_the_decree_immediately():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+    boss.hp = round(boss.max_hp * 0.51)
+
+    boss.take_damage(100)  # 打进二阶段
+
+    assert boss.phase == 2
+    intent = boss.choose_intent((boss.x + 300.0, boss.y))
+    assert intent.attack is not None
+    assert intent.attack.tag == "boss_memory_sever"
+
+
+def test_decree_break_recovers_into_the_combo():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+    boss.hp = round(boss.max_hp * 0.51)
+    boss.take_damage(100)  # 走真实路径进二阶段：入场敕令立刻可用
+    assert boss.phase == 2
+    player = (840.0, 522.0)
+    opening = boss.choose_intent((boss.x + 300.0, boss.y))
+    assert opening.attack is not None
+    assert opening.attack.tag == "boss_memory_sever"
+
+    boss.on_attack_parried(opening.attack, perfect=True)
+    boss.on_attack_resolved(opening.attack, parried=True)
+    assert boss.defense_broken is True
+
+    for _ in range(int(RustCrownKnight.DEFENSE_BREAK_DURATION * 60) + 2):
+        boss.update(1.0 / 60.0, player)
+
+    assert boss.defense_broken is False
+    assert boss._special_cooldown > 0.0  # 处决技还在转，先打连段
+    boss.x = player[0] + 60.0
+    next_intent = boss.choose_intent(player)
+    assert next_intent.attack is not None
+    assert next_intent.attack.tag == "boss_combo_1"
+
+
+def test_phase_two_alternates_combo_and_decree(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.x = app.player.x + 80.0
+    boss._attack_cooldown = 0.0
+    app.player.max_hp = 100000
+    app.player.hp = 100000
+    sequence: list[str] = []
+    original_resolve = app._resolve_enemy_attack
+
+    def record(pending):
+        if pending.enemy is boss and pending.profile.tag:
+            sequence.append(pending.profile.tag)
+        original_resolve(pending)
+
+    app._resolve_enemy_attack = record
+    boss.hp = round(boss.max_hp * 0.49)
+    boss.take_damage(1)  # 进二阶段
+    assert boss.phase == 2
+
+    for _ in range(60 * 22):
+        app._update(1.0 / 60.0)
+
+    assert sequence[0] == "boss_memory_sever"
+    assert "boss_combo_1" in sequence
+    # 敕令之后必须先走完连段，才会再插入下一次敕令
+    later = sequence[1:]
+    assert later.index("boss_combo_1") < later.index("boss_memory_sever")
+    pygame.quit()
+
+
+def test_rust_crown_knight_combo_uses_four_tenths_parry_window():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+
+    for profile in boss.combo_profiles:
+        assert profile.parry_window == RustCrownKnight.COMBO_PARRY_WINDOW
+        assert profile.damage == RustCrownKnight.COMBO_DAMAGE
+
+
+def test_rust_crown_knight_keeps_the_combo_after_break(monkeypatch, tmp_path):
+    """破防恢复后必须继续用三段连击起手，不能退回单发横斩。"""
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.x = app.player.x + 80.0
+    boss._attack_cooldown = 0.0
+
+    for index in range(RustCrownKnight.COMBO_SIZE):
+        if index:
+            app.player.update(Player.PARRY_DURATION, 0)
+            app.player.update(Player.PARRY_COOLDOWN, 0)
+            for _ in range(12):
+                boss.update(1.0 / 60.0, app.player.position)
+        intent = boss.choose_intent(app.player.position)
+        assert app.player.start_parry() is True
+        app._resolve_enemy_attack(PendingEnemyAttack(boss, intent.attack, 0.0))
+    assert boss.defense_broken is True
+
+    # 小步走完破防时间：顺便让弹刀击退的滑行结算掉
+    for _ in range(int(RustCrownKnight.DEFENSE_BREAK_DURATION * 60) + 2):
+        boss.update(1.0 / 60.0, app.player.position)
+    assert boss.defense_broken is False
+
+    boss.x = app.player.x + 80.0
+    intent = boss.choose_intent(app.player.position)
+    assert intent.attack is not None
+    assert intent.attack.tag == "boss_combo_1"
+    pygame.quit()
+
+
+def test_rust_crown_knight_phase_two_keeps_the_combo():
+    boss = RustCrownKnight(900, 522, threat=0.0)
+    boss.phase = 2
+    boss._special_cooldown = 99.0  # 处决技未就绪时，常规攻击仍然走连段
+
+    intent = boss.choose_intent((boss.x - 60.0, boss.y))
+
+    assert intent.attack is not None
+    assert intent.attack.tag == "boss_combo_1"
+
+
+def test_rust_crown_knight_never_falls_back_to_single_slash():
+    """两个阶段的出招表里都不该再出现单发横斩或突刺。"""
+    for phase in (1, 2):
+        boss = RustCrownKnight(900, 522, threat=1.0)
+        boss.phase = phase
+        for _ in range(60 * 30):
+            intent = boss.update(1.0 / 60.0, (960.0, 522.0))
+            assert intent.action not in {"royal_slash", "rust_lunge"}
+            if intent.attack is not None:
+                assert intent.attack.tag in {
+                    "boss_combo_1",
+                    "boss_combo_2",
+                    "boss_combo_3",
+                    "boss_memory_sever",
+                }
+
+
+def test_memory_sever_damage_scales_with_current_hp(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.phase = 2
+    profile = boss.scaled_attack(boss.execution_profile)
+    app.player.hp = 200
+
+    app._resolve_enemy_attack(PendingEnemyAttack(boss, profile, 0.0))
+
+    assert profile.parry_window == RustCrownKnight.DECREE_PARRY_WINDOW
+    assert app.player.hp == 200 - round(200 * main.BOSS_MEMORY_SEVER_DAMAGE_RATIO)
+    pygame.quit()
+
+
+def test_boss_attacks_can_use_a_stricter_parry_window(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    combo_profile = RustCrownKnight.combo_profiles[0]
+    normal_profile = RustCrownKnight.attack_profile
+
+    app.player.start_parry()
+    app.player.update(RustCrownKnight.COMBO_PARRY_WINDOW + 0.05, 0)
+
+    assert app._parry_window_open(combo_profile) is False
+    # 普通招式仍沿用全局弹刀缓冲
+    assert app._parry_window_open(normal_profile) is True
+    pygame.quit()
+
+
+def test_parrying_memory_sever_spawns_shockwave(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.phase = 2
+    profile = boss.scaled_attack(boss.execution_profile)
+
+    assert app.player.start_parry() is True
+    app._resolve_enemy_attack(PendingEnemyAttack(boss, profile, 0.0))
+
+    assert app.shockwaves
+    assert app.shockwaves[0].label == "弹反冲击波"
+    assert boss.defense_broken is True
+    pygame.quit()
+
+
+def test_crown_combo_through_game_logic_breaks_the_boss(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.x = app.player.x + 80.0
+    boss._attack_cooldown = 0.0  # 跳过登场缓冲，直接进入连段
+    starting_hp = boss.hp
+
+    for index in range(RustCrownKnight.COMBO_SIZE):
+        if index:
+            app.player.update(Player.PARRY_DURATION, 0)
+            app.player.update(Player.PARRY_COOLDOWN, 0)
+            for _ in range(12):  # 让首领的连段间隔走完
+                boss.update(1.0 / 60.0, app.player.position)
+        intent = boss.choose_intent(app.player.position)
+        assert intent.attack is not None
+        assert app.player.start_parry() is True
+        app._resolve_enemy_attack(PendingEnemyAttack(boss, intent.attack, 0.0))
+
+    assert boss.defense_broken is True
+    expected_break_damage = round(boss.max_hp * RustCrownKnight.BREAK_DAMAGE_RATIO)
+    assert boss.hp == starting_hp - expected_break_damage
+    assert app.shockwaves
+    pygame.quit()
+
+
+def test_crown_combo_impact_spacing_follows_design(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app, floor=5)
+    boss = app.room_enemies[0]
+    boss.x = app.player.x + 80.0
+    boss._attack_cooldown = 0.0  # 跳过登场缓冲，直接进入连段
+    app.player.max_hp = 9999
+    app.player.hp = 9999
+    impacts: list[float] = []
+    elapsed = {"time": 0.0}
+    original_resolve = app._resolve_enemy_attack
+
+    def record(pending):
+        if pending.enemy is boss and pending.profile.tag.startswith("boss_combo_"):
+            impacts.append(elapsed["time"])
+        original_resolve(pending)
+
+    app._resolve_enemy_attack = record
+    step = 1.0 / 120.0
+    for _ in range(240):
+        elapsed["time"] += step
+        app._update(step)
+        if len(impacts) >= RustCrownKnight.COMBO_SIZE:
+            break
+
+    assert len(impacts) >= RustCrownKnight.COMBO_SIZE
+    assert abs((impacts[1] - impacts[0]) - 0.3) <= 0.03
+    assert abs((impacts[2] - impacts[1]) - 0.4) <= 0.03
+    pygame.quit()
+
+
+# -- 断桥司钟：核心暴露与连发时钉 -------------------------------------------
+
+
+def test_bell_keeper_only_takes_damage_while_core_is_exposed():
+    keeper = BrokenBridgeBellKeeper(900, 522, threat=0.0)
+
+    assert keeper.take_damage(120, posture_damage=20) == 0
+    assert keeper.hp == keeper.max_hp
+    assert keeper.posture == keeper.max_posture - 20
+
+    keeper.break_posture()
+    assert keeper.core_exposed is True
+    assert keeper.take_damage(120) == 120
+    assert keeper.hp == keeper.max_hp - 120
+
+
+def test_bell_keeper_core_exposure_ends_and_refills_posture():
+    keeper = BrokenBridgeBellKeeper(900, 522, threat=0.0)
+    keeper.break_posture()
+
+    keeper.update(BrokenBridgeBellKeeper.CORE_EXPOSURE_TIME - 0.1, (1200.0, 522.0))
+    assert keeper.core_exposed is True
+
+    keeper.update(0.2, (1200.0, 522.0))
+    assert keeper.core_exposed is False
+    assert keeper.posture == keeper.max_posture
+
+
+def test_bell_keeper_fires_bursts_of_projectiles():
+    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
+    player = (900.0, 522.0)
+    tags: list[str] = []
+
+    for _ in range(240):
+        intent = keeper.update(1.0 / 60.0, player)
+        if intent.attack is not None:
+            tags.append(intent.attack.tag)
+
+    assert tags.count("bell_bullet") >= BrokenBridgeBellKeeper.BURST_SIZE
+
+
+def test_bell_keeper_cannot_be_knocked_back():
+    keeper = BrokenBridgeBellKeeper(900, 522, threat=0.0)
+
+    keeper.apply_knockback(1, 400.0, 400.0)
+
+    assert keeper.velocity_x == 0.0
+    assert keeper.velocity_y == 0.0
+    assert keeper.vulnerable is False
+
+
+def test_bell_keeper_room_draws_and_fires_in_game_loop(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(7, tutorial=False, stage=2, route_seed=11)
+    app._dismiss_floor_intro()
+    app._spawn_pending_enemies()
+    keeper = app.room_enemies[0]
+    assert keeper.kind == "broken_bridge_bell_keeper"
+
+    fired = False
+    for _ in range(180):
+        app._update(1.0 / 60.0)
+        if any(
+            pending.enemy is keeper and pending.profile.tag == "bell_bullet"
+            for pending in app.pending_enemy_attacks
+        ):
+            fired = True
+
+    assert fired is True
+    app._draw_boss_hud()
+    app._draw_enemies()
+    pygame.quit()
+
+
+def test_shop_overlay_draws_with_heal_item(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(main.SHOP_FLOOR, tutorial=False)
+    app._dismiss_floor_intro()
+
+    assert app.overlay == "shop"
+    app._draw_shop(app._overlay_rect())
+    pygame.quit()
+
+
+# -- 小怪基础数值与成长曲线 -------------------------------------------------
+
+
+def test_normal_enemy_base_stats_are_buffed():
+    """第一章的小怪不再是一两刀就碎的纸片人。"""
+    expected = {
+        "chaser": (88, 16),
+        "spear_thrower": (68, 20),
+        "shield_guard": (135, 21),
+        "rift_worm": (56, 25),
+        "resonance_mage": (78, 19),
+    }
+
+    for kind, (base_hp, base_damage) in expected.items():
+        enemy_class = ENEMY_CLASSES[kind]
+        assert enemy_class.base_hp == base_hp
+        assert enemy_class.attack_profile.damage == base_damage
+
+
+def test_enemy_scale_multiplies_hp_and_damage():
+    plain = Chaser(100, 522, threat=0.0)
+    scaled = Chaser(100, 522, threat=0.0, scale=1.6)
+
+    assert scaled.max_hp == round(plain.max_hp * 1.6)
+    assert scaled.damage == round(plain.attack_profile.damage * 1.6)
+
+
+def test_normal_enemy_stats_grow_with_floor(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False)
+    early = app._build_wave(("chaser",), app.run_threat)[0]
+    app._start_run(4, tutorial=False)
+    late = app._build_wave(("chaser",), app.run_threat)[0]
+
+    assert late.max_hp > early.max_hp
+    assert late.damage > early.damage
+    # 层内成长保持克制：一层之差不应该接近翻倍
+    assert late.max_hp < early.max_hp * 2
+    pygame.quit()
+
+
+def test_second_stage_mobs_step_up_further_than_one_floor(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(5, tutorial=False)
+    last_of_stage_one = app._build_wave(("chaser",), app.run_threat)[0]
+    app._start_run(1, tutorial=False, stage=2)
+    first_of_stage_two = app._build_wave(("chaser",), app.run_threat)[0]
+
+    assert first_of_stage_two.max_hp > last_of_stage_one.max_hp
+    assert first_of_stage_two.damage > last_of_stage_one.damage
+    # 跨章节是一次明显的台阶，而不是普通的一层
+    assert first_of_stage_two.max_hp >= round(last_of_stage_one.max_hp * 1.25)
+    pygame.quit()
+
+
+def test_bosses_ignore_the_normal_enemy_growth(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(1, tutorial=False, stage=2)
+
+    boss = app._build_wave(("broken_bridge_bell_keeper",), app.run_threat)[0]
+    mob = app._build_wave(("chaser",), app.run_threat)[0]
+
+    assert boss.scale == 1.0
+    assert mob.scale == 1.0 + main.NORMAL_ENEMY_STAGE_STEP
     pygame.quit()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -49,6 +50,8 @@ class Player:
     # 弹刀输入缓冲：按下后这么久内命中判定都算完美弹刀，
     # 与提示闪光提前量（main.MELEE_FLASH_LEAD）保持一致。
     PARRY_INPUT_BUFFER = 0.65
+    # 弹刀内置冷却：架势结束后还要等这么久才能再次弹刀
+    PARRY_COOLDOWN = 0.2
 
     # 回响剑气：起手到剑气出手的时间，以及整段无敌时间
     SKILL_CAST_TIME = 0.18
@@ -105,6 +108,7 @@ class Player:
         self._dash_cooldown = 0.0
         self._dash_elapsed = -1.0
         self._parry_buffer = 0.0
+        self._parry_cooldown = 0.0
         self._parry_elapsed = -1.0
         self._skill_elapsed = -1.0
         self._attack_elapsed = -1.0
@@ -138,6 +142,13 @@ class Player:
     def parry_buffered(self) -> bool:
         """是否处于弹刀输入缓冲内（用于近战完美弹刀判定）。"""
         return self._parry_buffer > 0.0
+
+    @property
+    def parry_buffer_age(self) -> float:
+        """距离上一次弹刀输入过去了多久；不在缓冲内时返回无穷大。"""
+        if self._parry_buffer <= 0.0:
+            return math.inf
+        return self.PARRY_INPUT_BUFFER - self._parry_buffer
 
     @property
     def dash_active(self) -> bool:
@@ -326,7 +337,7 @@ class Player:
         return True
 
     def start_parry(self) -> bool:
-        if self.parry_active or self.skill_active:
+        if self.parry_active or self.skill_active or self._parry_cooldown > 0.0:
             return False
         self._attack_elapsed = -1.0
         self._parry_buffer = self.PARRY_INPUT_BUFFER
@@ -374,6 +385,7 @@ class Player:
         self._dash_cooldown = max(0.0, self._dash_cooldown - dt)
         self.hurt_flash = max(0.0, self.hurt_flash - dt)
         self._parry_buffer = max(0.0, self._parry_buffer - dt)
+        self._parry_cooldown = max(0.0, self._parry_cooldown - dt)
         if self._dash_elapsed >= 0.0:
             self._dash_elapsed += dt
             if self._dash_elapsed >= self.DASH_DURATION:
@@ -383,6 +395,8 @@ class Player:
             self._parry_elapsed += dt
             if self._parry_elapsed >= self.PARRY_DURATION:
                 self._parry_elapsed = -1.0
+                # 架势收招后才进入内置冷却，避免"按得快就能一直弹"
+                self._parry_cooldown = max(self._parry_cooldown, self.PARRY_COOLDOWN)
         if self._skill_elapsed >= 0.0:
             self._skill_elapsed += dt
             if self._skill_elapsed >= self.SKILL_DURATION:
