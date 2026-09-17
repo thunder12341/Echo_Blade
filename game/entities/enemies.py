@@ -817,42 +817,110 @@ class RustCrownKnight(Enemy):
             self._vulnerable_timer = 0.0
 
 
+class BellTowerClock(Enemy):
+    """断桥司钟召唤的地面钟表：承接反弹的时钉，被击破后钟体落地瘫痪。"""
+
+    kind = "bell_tower_clock"
+    display_name = "断桥钟表"
+    # 威胁折算后约 320：一次完整的三连反弹就能击破
+    base_hp = 120
+    base_posture = 0
+    speed = 0.0
+    bounty_score = 300
+    parry_tutorial = ""
+    body_width = 76.0
+    body_height = 96.0
+    attack_profile = AttackProfile(
+        name="静止钟摆",
+        damage=1,
+        reach=10,
+        telegraph_time=1.0,
+        cooldown=9.0,
+        parryable=False,
+        tag="clock_idle",
+    )
+
+    def choose_intent(self, player_position: Position) -> EnemyIntent:
+        return EnemyIntent("idle", note="静止的钟表")
+
+
 class BrokenBridgeBellKeeper(Enemy):
-    """断桥司钟：第二阶段首领。远程散射压制，只有核心暴露时才会受伤。"""
+    """断桥司钟：远程三连发时钉压制，近身只打一次就瞬移拉开距离。
+
+    一阶段在地面循环「三连发时钉 → 被近身时一次近战 + 瞬移」；二阶段升到场地
+    正中央的空中，只发射时钉并召唤地面钟表，反弹的时钉会被引到钟表上，钟表被
+    击破后钟体瘫痪落地 5 秒，随后重新升空并召唤新的钟表。
+    """
 
     kind = "broken_bridge_bell_keeper"
     display_name = "断桥司钟"
     base_hp = 520
-    base_posture = 140
-    speed = 58.0
+    base_posture = 0
+    speed = 0.0
     bounty_score = 2200
-    parry_tutorial = "弹反时钉削减韧性；只有核心暴露时才能造成伤害"
+    parry_tutorial = "弹反时钉：反弹的时钉直接打回钟体，二阶段则打在钟表上"
     body_width = 92.0
     body_height = 132.0
-    safe_distance = 240.0
-    wall_margin = 90.0
-    # 核心暴露窗口：韧性归零后才能被打伤，窗口结束韧性回满
-    CORE_EXPOSURE_TIME = 4.0
-    BURST_SIZE = 3
-    # 时钉落点之间的间隔；弹道飞行时间与它相同，因此连发节奏稳定
-    BURST_INTERVAL = 0.55
-    VOLLEY_COOLDOWN = 1.6
-    BREAK_WINDOW = CORE_EXPOSURE_TIME
+
+    PHASE_TWO_THRESHOLD = 0.5
+    # 时钉：每发 120 伤害，弹反回去也按 120 结算给钟体或钟表
+    BULLET_DAMAGE = 120
+    # 时钉的飞行时间：三发会同时挂在空中，需要连续弹反
+    BULLET_TELEGRAPH = 0.6
+    VOLLEY_SIZE = 3
+    # 发射间隔：第一发→第二发 0.4 秒，第二发→第三发 0.3 秒
+    VOLLEY_GAPS = (0.4, 0.3)
+    VOLLEY_RECOVERY = 1.5
+    # 被近身后只打一次近战，然后瞬移到离玩家更远的一侧
+    MELEE_RANGE = 150.0
+    MELEE_TIMEOUT = 2.5
+    TELEPORT_TIME = 0.6
+    # 二阶段：升到场地中央的空中
+    AIR_HEIGHT = 260.0
+    PARALYSIS_TIME = 5.0
     # 重装钟体不会被击飞，也不会被剑气推着走
     PARRY_KNOCKBACK_SPEED = 0.0
     PARRY_KNOCKBACK_LIFT = 0.0
-    attack_profile = AttackProfile(
-        name="时钉散射",
-        damage=16,
-        reach=1000,
-        telegraph_time=BURST_INTERVAL,
-        cooldown=0.0,
-        parryable=True,
-        projectile_speed=780.0,
-        posture_damage=18,
-        warning_color="ice",
-        tag="bell_bullet",
+
+    bullet_profiles = (
+        AttackProfile(
+            name="时钉 · 一",
+            damage=BULLET_DAMAGE,
+            reach=1200,
+            telegraph_time=BULLET_TELEGRAPH,
+            cooldown=0.0,
+            parryable=True,
+            projectile_speed=760.0,
+            posture_damage=0,
+            warning_color="ice",
+            tag="bell_bullet_1",
+        ),
+        AttackProfile(
+            name="时钉 · 二",
+            damage=BULLET_DAMAGE,
+            reach=1200,
+            telegraph_time=BULLET_TELEGRAPH,
+            cooldown=0.0,
+            parryable=True,
+            projectile_speed=760.0,
+            posture_damage=0,
+            warning_color="ice",
+            tag="bell_bullet_2",
+        ),
+        AttackProfile(
+            name="时钉 · 三",
+            damage=BULLET_DAMAGE,
+            reach=1200,
+            telegraph_time=BULLET_TELEGRAPH,
+            cooldown=0.0,
+            parryable=True,
+            projectile_speed=760.0,
+            posture_damage=0,
+            warning_color="ice",
+            tag="bell_bullet_3",
+        ),
     )
+    attack_profile = bullet_profiles[0]
     sweep_profile = AttackProfile(
         name="刻度横扫",
         damage=24,
@@ -867,42 +935,88 @@ class BrokenBridgeBellKeeper(Enemy):
 
     def __init__(self, x: float, y: float, **kwargs) -> None:
         super().__init__(x, y, **kwargs)
-        self._burst_left = 0
-        self._burst_delay = 0.0
-        # 时钉还在飞的时候不再出手，同时兼作“弹道被剑气斩灭”时的保险丝
-        self._bullet_in_flight = 0.0
-        self._volley_cooldown = 1.2
-        self._core_timer = 0.0
+        self.phase = 1
+        self._volley_left = 0
+        self._volley_timer = 1.0
+        self._melee_waiting = False
+        self._melee_timeout = 0.0
+        self._vanished_timer = 0.0
+        self._teleport_target: tuple[float, float] | None = None
+        self._teleport_action = ""
+        self._paralysis_timer = 0.0
+        self._clock: Enemy | None = None
+        self._player_x = float(x)
+
+    # -- 状态 ---------------------------------------------------------
+
+    @property
+    def vanished(self) -> bool:
+        """瞬移过程中：不绘制本体、也不会被击中。"""
+        return self._vanished_timer > 0.0
+
+    @property
+    def teleport_progress(self) -> float | None:
+        """瞬移动画进度 0～1；不在瞬移时返回 None。"""
+        if self._vanished_timer <= 0.0:
+            return None
+        return 1.0 - self._vanished_timer / self.TELEPORT_TIME
+
+    @property
+    def paralyzed(self) -> bool:
+        return self._paralysis_timer > 0.0
 
     @property
     def core_exposed(self) -> bool:
-        return self._core_timer > 0.0
+        """瘫痪落地期间是唯一稳定输出窗口，沿用 HUD 的“可造成伤害”提示。"""
+        return self.paralyzed
 
     @property
     def core_exposure_remaining(self) -> float:
-        return self._core_timer
+        return self._paralysis_timer
 
-    def update(self, dt: float, player_position: Position) -> EnemyIntent:
-        elapsed = max(0.0, dt)
-        self._core_timer = max(0.0, self._core_timer - elapsed)
-        self._volley_cooldown = max(0.0, self._volley_cooldown - elapsed)
-        self._burst_delay = max(0.0, self._burst_delay - elapsed)
-        self._bullet_in_flight = max(0.0, self._bullet_in_flight - elapsed)
-        if self.core_exposed:
-            # 核心暴露期间停火：把输出窗口完整交给玩家
-            self._burst_left = 0
-            self._volley_cooldown = self.VOLLEY_COOLDOWN
-        return super().update(dt, player_position)
+    @property
+    def needs_clock(self) -> bool:
+        """二阶段停在空中且没有可用钟表时，需要主循环补一座地面钟表。"""
+        return (
+            self.phase == 2
+            and not self.vanished
+            and not self.paralyzed
+            and (self._clock is None or self._clock.defeated)
+        )
 
-    def break_posture(self) -> None:
-        """韧性归零：核心暴露，只有这段时间里钟体才会受伤。"""
-        self._posture_broken = True
-        self.posture = 0
-        self._core_timer = self.CORE_EXPOSURE_TIME
-        self.enter_vulnerable(self.CORE_EXPOSURE_TIME)
+    @property
+    def clock_target(self) -> Enemy | None:
+        """反弹的时钉应该打向哪里：有钟表就打钟表。"""
+        if self._clock is not None and not self._clock.defeated:
+            return self._clock
+        return None
+
+    @property
+    def state_label(self) -> str:
+        if self.paralyzed:
+            return f"瘫痪 · 落地可输出 {self._paralysis_timer:.1f} 秒"
+        if self.vanished:
+            return "瞬移中"
+        if self.phase == 2:
+            return "空中压制 · 反弹时钉打向钟表"
+        return f"三连发时钉 {self.BULLET_DAMAGE} 伤害 · 近身会瞬移拉开"
+
+    def bind_clock(self, clock: Enemy) -> None:
+        self._clock = clock
+
+    # -- 行为 ---------------------------------------------------------
 
     def apply_knockback(self, direction: int, speed: float, lift: float) -> None:
         """重装钟体：不吃击退与击飞。"""
+        return None
+
+    @property
+    def being_knocked_back(self) -> bool:
+        """钟体既不会被击飞，也不会因为悬停在空中而被重力拽回地面。"""
+        return False
+
+    def _keep_distance_from(self, player_position: Position) -> None:
+        """远程首领不需要保持贴身间距，避免悬停位置被玩家挤偏。"""
         return None
 
     def take_damage(
@@ -912,52 +1026,152 @@ class BrokenBridgeBellKeeper(Enemy):
         source_x: float | None = None,
         posture_damage: int = 0,
     ) -> int:
-        if not self.core_exposed:
-            # 核心未暴露：攻击只削韧，不掉血
-            self.take_posture_damage(posture_damage)
-            return 0
-        return super().take_damage(
+        if self.vanished:
+            return 0  # 瞬移过程中打不到
+        dealt = super().take_damage(
             amount,
             source_x=source_x,
             posture_damage=posture_damage,
         )
+        self._check_phase_two()
+        return dealt
+
+    def update(self, dt: float, player_position: Position) -> EnemyIntent:
+        elapsed = max(0.0, dt)
+        self._tick_timers(elapsed)
+        return super().update(elapsed, player_position)
+
+    def _tick_timers(self, elapsed: float) -> None:
+        self._volley_timer = max(0.0, self._volley_timer - elapsed)
+        if self._melee_waiting:
+            self._melee_timeout = max(0.0, self._melee_timeout - elapsed)
+            if self._melee_timeout <= 0.0:
+                # 保险丝：近战意图被特殊结算吞掉时也要按计划瞬移
+                self._melee_waiting = False
+                self._start_teleport(self._far_side_position(self._player_x))
+
+        if self._vanished_timer > 0.0:
+            before = self._vanished_timer
+            self._vanished_timer = max(0.0, self._vanished_timer - elapsed)
+            if (
+                self._teleport_target is not None
+                and before > self.TELEPORT_TIME / 2
+                and self._vanished_timer <= self.TELEPORT_TIME / 2
+            ):
+                self.x, self.y = self._teleport_target
+                self.velocity_x = 0.0
+                self.velocity_y = 0.0
+                self._teleport_target = None
+            if self._vanished_timer <= 0.0:
+                self._on_reappear()
+            return
+
+        if self._paralysis_timer > 0.0:
+            self._paralysis_timer = max(0.0, self._paralysis_timer - elapsed)
+            if self._paralysis_timer <= 0.0:
+                # 瘫痪结束：重新升空，随后主循环会补上新的钟表
+                self._start_teleport(self._air_position(), action="rise")
+            return
+
+        if self._clock_broken():
+            return
+
+    def _clock_broken(self) -> bool:
+        if self.phase != 2 or self._clock is None or not self._clock.defeated:
+            return False
+        self._clock = None
+        self._volley_left = 0
+        self._start_teleport(self._ground_position(), action="paralysis")
+        return True
+
+    def _on_reappear(self) -> None:
+        self._melee_waiting = False
+        self._volley_left = 0
+        self._volley_timer = 0.35
+        if self._teleport_action == "paralysis":
+            self._paralysis_timer = self.PARALYSIS_TIME
+        self._teleport_action = ""
+
+    def _start_teleport(
+        self,
+        target: tuple[float, float],
+        *,
+        action: str = "",
+    ) -> None:
+        self._teleport_target = target
+        self._teleport_action = action
+        self._vanished_timer = self.TELEPORT_TIME
+        self._volley_left = 0
+
+    def _air_position(self) -> tuple[float, float]:
+        center_x = (self.bounds_left + self.bounds_right) / 2
+        return (center_x, self.ground_y - self.AIR_HEIGHT)
+
+    def _ground_position(self) -> tuple[float, float]:
+        center_x = (self.bounds_left + self.bounds_right) / 2
+        return (center_x, self.ground_y)
+
+    def _far_side_position(self, player_x: float) -> tuple[float, float]:
+        left = self.bounds_left + self.body_width / 2
+        right = self.bounds_right - self.body_width / 2
+        if abs(left - player_x) >= abs(right - player_x):
+            return (left, self.ground_y)
+        return (right, self.ground_y)
+
+    def _check_phase_two(self) -> None:
+        if self.phase != 1 or self.hp > self.max_hp * self.PHASE_TWO_THRESHOLD:
+            return
+        self.phase = 2
+        self._melee_waiting = False
+        self._volley_left = 0
+        # 二阶段：瞬移到场地正中央的空中，只放远程攻击
+        self._start_teleport(self._air_position())
 
     def choose_intent(self, player_position: Position) -> EnemyIntent:
         self.facing = self.direction_to(player_position)
-        distance = self.distance_to(player_position)
-        if self.core_exposed:
-            return EnemyIntent("core_exposed", note="核心暴露")
-        if distance < self.safe_distance and self.can_step(-self.facing, self.wall_margin):
-            return EnemyIntent(
-                "blink_back",
-                move_x=-self.facing * self.speed,
-                note="维持钟摆节拍距离",
-            )
-        if self._bullet_in_flight > 0.0:
-            return EnemyIntent("channel", note="时钉在飞")
-        if distance <= self.sweep_profile.reach and self.attack_ready:
+        self._player_x = float(player_position[0])
+        if self.vanished:
+            return EnemyIntent("teleporting", note="瞬移中")
+        if self.paralyzed:
+            return EnemyIntent("paralyzed", note="瘫痪落地")
+        if self._melee_waiting:
+            return EnemyIntent("bell_sweep_wait", note="近战收招")
+        if self.phase == 1 and self.distance_to(player_position) <= self.MELEE_RANGE:
+            # 被近身：只打一次近战，无论是否被弹开都会瞬移拉开距离
+            self._volley_left = 0
+            self._melee_waiting = True
+            self._melee_timeout = self.MELEE_TIMEOUT
             return EnemyIntent(
                 "bell_sweep",
                 attack=self.scaled_attack(self.sweep_profile),
-                note="刻度横扫",
+                note="刻度横扫 · 打完就瞬移",
             )
-        if self.attack_ready and distance <= self.attack_profile.reach:
-            if self._burst_left <= 0 and self._volley_cooldown <= 0.0:
-                self._burst_left = self.BURST_SIZE
-            if self._burst_left > 0 and self._burst_delay <= 0.0:
-                self._burst_left -= 1
-                self._bullet_in_flight = self.attack_profile.telegraph_time + 0.25
-                return EnemyIntent(
-                    "bell_volley",
-                    attack=self.scaled_attack(self.attack_profile),
-                    note=(
-                        f"时钉散射 "
-                        f"{self.BURST_SIZE - self._burst_left}/{self.BURST_SIZE}"
-                    ),
-                )
-        if distance > self.attack_profile.reach:
-            return EnemyIntent("advance", move_x=self.facing * self.speed, note="进入射程")
-        return EnemyIntent("channel", note="校准钟摆")
+        if self._volley_left <= 0 and self._volley_timer <= 0.0:
+            self._volley_left = self.VOLLEY_SIZE
+        if self._volley_left > 0 and self._volley_timer <= 0.0:
+            index = self.VOLLEY_SIZE - self._volley_left
+            self._volley_left -= 1
+            if self._volley_left > 0:
+                gap = self.VOLLEY_GAPS[min(index, len(self.VOLLEY_GAPS) - 1)]
+                self._volley_timer = gap
+            else:
+                self._volley_timer = self.VOLLEY_RECOVERY
+            return EnemyIntent(
+                "bell_volley",
+                attack=self.bullet_profiles[index],
+                note=f"时钉 {index + 1}/{self.VOLLEY_SIZE} · 弹反可打回去",
+            )
+        return EnemyIntent("hover", note="校准钟摆")
+
+    def on_attack_parried(self, profile: AttackProfile, *, perfect: bool) -> int:
+        if profile.tag.startswith("bell_bullet"):
+            # 反弹的时钉按子弹本身的伤害结算，也不会打断连发
+            self.hurt_flash = max(self.hurt_flash, self.HURT_FLASH_TIME * 1.8)
+            return profile.damage if perfect else 0
+        if profile.tag == "bell_sweep" and perfect:
+            self.hurt_flash = max(self.hurt_flash, self.HURT_FLASH_TIME * 1.8)
+            return profile.damage
+        return super().on_attack_parried(profile, perfect=perfect)
 
     def on_attack_resolved(
         self,
@@ -965,14 +1179,11 @@ class BrokenBridgeBellKeeper(Enemy):
         *,
         parried: bool,
     ) -> None:
-        if profile.tag != "bell_bullet":
+        if profile.tag != "bell_sweep" or not self._melee_waiting:
             return
-        self._bullet_in_flight = 0.0
-        if self._burst_left > 0:
-            # 连发间隔从落点开始算，避免主循环丢帧吃掉一颗时钉
-            self._burst_delay = max(0.0, self.BURST_INTERVAL - profile.telegraph_time)
-            return
-        self._volley_cooldown = self.VOLLEY_COOLDOWN
+        # 无论近战是否被弹开，收招后都会瞬移到离玩家更远的一侧
+        self._melee_waiting = False
+        self._start_teleport(self._far_side_position(self._player_x))
 
 
 ENEMY_CLASSES: dict[str, type[Enemy]] = {

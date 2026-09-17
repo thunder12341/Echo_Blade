@@ -358,11 +358,20 @@ class Player:
         return True
 
     def gain_level(self, hp_gain: int, attack_gain: int) -> int:
-        """升级只提高生命上限与攻击力，不立即恢复当前生命。"""
+        """升级把新增的生命上限同时补进当前生命：既不倒扣血，也不会回满。
+
+        失去的生命不会因为升级而变少，但新增的上限会立刻可用；返回实际补进
+        当前生命的点数，供 UI 提示使用。
+        """
         hp_gain = max(0, int(hp_gain))
         self.max_hp += hp_gain
+        gained_hp = 0
+        if self.hp > 0:
+            before = self.hp
+            self.hp = min(self.max_hp, self.hp + hp_gain)
+            gained_hp = self.hp - before
         self.attack_bonus += max(0, int(attack_gain))
-        return 0
+        return gained_hp
 
     def take_damage(self, amount: int, *, ignore_invulnerability: bool = False) -> int:
         if self.invulnerable and not ignore_invulnerability:

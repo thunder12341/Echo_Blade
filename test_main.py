@@ -9,6 +9,7 @@ import pygame
 import main
 from game.entities import (
     ENEMY_CLASSES,
+    BellTowerClock,
     BrokenBridgeBellKeeper,
     Chaser,
     Enemy,
@@ -998,6 +999,7 @@ def test_settings_can_suspend_an_expedition_to_lobby(monkeypatch, tmp_path):
         room_type=main.ROOM_COMBAT,
     )
     app._dismiss_floor_intro()
+    app._leave_shop()  # 第三关开局会先弹战前补给，这里直接跳过
     app.run_score = 4321
     app.run_kills = 19
     app.run_currency = 88
@@ -1242,16 +1244,16 @@ def test_new_nexus_tracks_apply_attributes_and_mechanics(monkeypatch, tmp_path):
     assert app.run_currency == 14
     assert app.run_kills == 1
 
-    # 生命每 10 秒结算一次；回响能量仍按秒积累。
+    # 生命每 5 秒结算一次；回响能量仍按秒积累。
     app._dismiss_floor_intro()
     _clear_room(app)
     app.player.hp = 100
     app.echo_energy = 0
-    _advance(app, 9.9)
+    _advance(app, 4.9)
     assert app.player.hp == 100
     _advance(app, 0.2)
     assert app.player.hp == 106
-    assert app.echo_energy >= 10
+    assert app.echo_energy >= 5
     pygame.quit()
 
 
@@ -2128,6 +2130,121 @@ def test_second_stage_combat_rooms_spawn_larger_enemy_groups(monkeypatch, tmp_pa
     pygame.quit()
 
 
+# -- 第二阶段第三关：开局战前补给 -------------------------------------------
+
+
+def test_second_stage_third_room_opens_supply_before_the_fight(
+    monkeypatch, tmp_path
+):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(3, tutorial=False, stage=2, route_seed=3)
+
+    assert app.room_type == main.ROOM_COMBAT
+    assert app._is_supply_room() is True
+    assert app.shop_closed is False
+
+    app._dismiss_floor_intro()
+
+    assert app.overlay == "shop"
+    assert app.shop_supply is True
+    assert app.shop_stock == main.SUPPLY_ITEMS
+    assert all(
+        item.item_id == main.SUPPLY_MEND_ITEM_ID for item in app.shop_stock
+    )
+    assert app.shop_stock[0].cost == 0  # 战前补给是免费选项
+    app._draw()
+    pygame.quit()
+
+
+def test_supply_mend_is_free_and_single_use(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(3, tutorial=False, stage=2, route_seed=3)
+    app._dismiss_floor_intro()
+    app.run_currency = 100
+    app.player.hp = 60
+
+    assert app._purchase_shop_item(0) is True
+
+    assert app.player.hp == 60 + app.supply_heal_amount
+    assert app.supply_heal_amount == round(app.player.max_hp * main.SUPPLY_HEAL_RATIO)
+    assert app.run_currency == 100  # 免费，不消耗战时铸币
+
+    app.player.hp = 60
+    assert app._purchase_shop_item(0) is False  # 本关只能用一次
+    assert app.player.hp == 60
+    pygame.quit()
+
+
+def test_supply_mend_is_refused_when_hp_is_full(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(3, tutorial=False, stage=2, route_seed=3)
+    app._dismiss_floor_intro()
+    app.player.hp = app.player.max_hp
+
+    assert app._purchase_shop_item(0) is False
+
+    assert app.shop_purchased == set()
+    pygame.quit()
+
+
+def test_leaving_supply_starts_the_fight(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(3, tutorial=False, stage=2, route_seed=3)
+    app._dismiss_floor_intro()
+
+    app._leave_shop()
+
+    assert app.overlay is None
+    assert app.page == "game"
+    assert app.shop_closed is True
+    assert app.shop_supply is False
+    assert app.wave_plan  # 补给结束后战斗照常进行
+    assert app._active_run_checkpoint()["shop_closed"] is True
+    pygame.quit()
+
+
+def test_supply_only_opens_on_second_stage_third_room(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+
+    app._start_run(1, tutorial=False, stage=2, route_seed=3)
+    assert app._is_supply_room() is False
+    app._dismiss_floor_intro()
+    assert app.overlay is None
+
+    app._start_run(3, tutorial=False, route_seed=3)
+    assert app._is_supply_room() is False
+    assert app.shop_closed is True
+    pygame.quit()
+
+
+def test_supply_room_uses_its_own_briefing(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+
+    app._start_run(3, tutorial=False, stage=2, route_seed=3)
+    assert app._floor_briefing(3) is main.SUPPLY_BRIEFING
+    app._draw()
+
+    app._start_run(1, tutorial=False, stage=2, route_seed=3)
+    assert app._floor_briefing(1) is not main.SUPPLY_BRIEFING
+    pygame.quit()
+
+
+def test_resumed_run_does_not_reopen_the_supply(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(3, tutorial=False, stage=2, route_seed=3)
+    app._dismiss_floor_intro()
+    app._leave_shop()
+    checkpoint = app._active_run_checkpoint()
+
+    assert app._resume_run_checkpoint(checkpoint) is True
+
+    assert app._is_supply_room() is True
+    assert app.shop_closed is True
+    app._dismiss_floor_intro()
+    assert app.overlay is None
+    pygame.quit()
+
+
 def test_second_stage_event_choice_is_applied_once_and_opens_exit(
     monkeypatch, tmp_path
 ):
@@ -2229,68 +2346,25 @@ def _open_event_room(app, *, floor: int = 5, stage: int = 2):
     return app
 
 
-def test_second_stage_event_room_offers_heal(monkeypatch, tmp_path):
+def test_event_room_has_no_heal_option_anymore(monkeypatch, tmp_path):
+    """第二章第五层的回血选项已经挪到第三关的战前补给。"""
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     _open_event_room(app)
     choices = app._room_event_choices()
-    heal_index = next(
-        index for index, (title, _) in enumerate(choices) if title == "回溯愈合"
-    )
-    app.player.hp = 80
 
-    assert app._resolve_room_event(heal_index) is True
-
-    assert app.player.hp == 80 + app.event_heal_amount
-    assert app.event_heal_amount == round(app.player.max_hp * main.EVENT_HEAL_RATIO)
-    assert app.room_resolved is True
-    assert app._active_run_checkpoint()["room_resolved"] is True
+    assert len(choices) == 3
+    assert all("回溯愈合" not in title for title, _ in choices)
+    assert "回溯愈合" not in app._floor_briefing(5).summary
     pygame.quit()
 
 
-def test_event_heal_is_refused_when_hp_is_full(monkeypatch, tmp_path):
-    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
-    _open_event_room(app)
-    heal_index = next(
-        index
-        for index, (title, _) in enumerate(app._room_event_choices())
-        if title == "回溯愈合"
-    )
-    app.player.hp = app.player.max_hp
-
-    assert app._resolve_room_event(heal_index) is False
-
-    assert app.room_resolved is False
-    assert app.overlay == "room_event"
-    pygame.quit()
-
-
-def test_event_heal_is_a_one_time_choice(monkeypatch, tmp_path):
-    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
-    _open_event_room(app)
-    heal_index = next(
-        index
-        for index, (title, _) in enumerate(app._room_event_choices())
-        if title == "回溯愈合"
-    )
-    app.player.hp = 60
-    first_heal = app.event_heal_amount
-
-    assert app._resolve_room_event(heal_index) is True
-    app.player.hp = 60
-    assert app._resolve_room_event(heal_index) is False
-
-    assert app.player.hp == 60
-    assert app.player.max_hp >= first_heal
-    pygame.quit()
-
-
-def test_four_option_event_room_rows_fit_inside_panel(monkeypatch, tmp_path):
+def test_event_room_rows_fit_inside_panel(monkeypatch, tmp_path):
     app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
     _open_event_room(app)
     rows = app._room_event_rects()
     panel = app._overlay_rect()
 
-    assert len(rows) == len(app._room_event_choices()) == 4
+    assert len(rows) == len(app._room_event_choices()) == 3
     assert rows[-1].bottom <= panel.bottom
     assert all(
         earlier.bottom < later.top for earlier, later in zip(rows, rows[1:])
@@ -2551,7 +2625,30 @@ def test_defeating_enemies_grants_exp_and_level_ups_raise_stats(monkeypatch, tmp
     assert app.player_exp == 0
     assert app.player.max_hp == base_max_hp + main.HP_PER_LEVEL
     assert app.player.attack_damage == base_damage + main.ATTACK_PER_LEVEL
-    assert app.player.hp == 90
+    # 升级把新增的上限同时补进当前生命：缺的 230 点不会变，也不会回满
+    assert app.player.hp == 90 + main.HP_PER_LEVEL
+    assert app.player.max_hp - app.player.hp == base_max_hp - 90
+    pygame.quit()
+
+
+def test_level_up_never_heals_to_full_nor_lowers_hp(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    _enter_level(app)
+    player = app.player
+
+    # 满血升级：仍然是满血，不会溢出
+    player.hp = player.max_hp
+    gained = player.gain_level(main.HP_PER_LEVEL, main.ATTACK_PER_LEVEL)
+    assert gained == main.HP_PER_LEVEL
+    assert player.hp == player.max_hp
+
+    # 残血升级：当前生命同步增加同样点数，缺失的生命值保持不变
+    player.hp = 100
+    missing_before = player.max_hp - player.hp
+    gained = player.gain_level(main.HP_PER_LEVEL, main.ATTACK_PER_LEVEL)
+    assert gained == main.HP_PER_LEVEL
+    assert player.hp == 100 + main.HP_PER_LEVEL
+    assert player.max_hp - player.hp == missing_before
     pygame.quit()
 
 
@@ -3434,45 +3531,126 @@ def test_crown_combo_impact_spacing_follows_design(monkeypatch, tmp_path):
     pygame.quit()
 
 
-# -- 断桥司钟：核心暴露与连发时钉 -------------------------------------------
+# -- 断桥司钟：三连时钉、近身瞬移与空中钟表 ---------------------------------
 
 
-def test_bell_keeper_only_takes_damage_while_core_is_exposed():
-    keeper = BrokenBridgeBellKeeper(900, 522, threat=0.0)
-
-    assert keeper.take_damage(120, posture_damage=20) == 0
-    assert keeper.hp == keeper.max_hp
-    assert keeper.posture == keeper.max_posture - 20
-
-    keeper.break_posture()
-    assert keeper.core_exposed is True
-    assert keeper.take_damage(120) == 120
-    assert keeper.hp == keeper.max_hp - 120
-
-
-def test_bell_keeper_core_exposure_ends_and_refills_posture():
-    keeper = BrokenBridgeBellKeeper(900, 522, threat=0.0)
-    keeper.break_posture()
-
-    keeper.update(BrokenBridgeBellKeeper.CORE_EXPOSURE_TIME - 0.1, (1200.0, 522.0))
-    assert keeper.core_exposed is True
-
-    keeper.update(0.2, (1200.0, 522.0))
-    assert keeper.core_exposed is False
-    assert keeper.posture == keeper.max_posture
-
-
-def test_bell_keeper_fires_bursts_of_projectiles():
-    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
-    player = (900.0, 522.0)
-    tags: list[str] = []
-
-    for _ in range(240):
+def _collect_keeper_intents(keeper, player, frames):
+    """推进首领并收集 (时间, 招式 tag) 序列。"""
+    fired: list[tuple[float, str]] = []
+    elapsed = 0.0
+    for frame in range(frames):
+        elapsed += 1.0 / 60.0
         intent = keeper.update(1.0 / 60.0, player)
         if intent.attack is not None:
-            tags.append(intent.attack.tag)
+            fired.append((elapsed, intent.attack.tag))
+    return fired
 
-    assert tags.count("bell_bullet") >= BrokenBridgeBellKeeper.BURST_SIZE
+
+def test_bell_keeper_volley_fires_three_bullets_at_design_gaps():
+    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
+    player = (1100.0, 522.0)
+
+    fired = _collect_keeper_intents(keeper, player, 60 * 4)
+    bullets = [stamp for stamp, tag in fired if tag.startswith("bell_bullet")]
+
+    assert len(bullets) >= BrokenBridgeBellKeeper.VOLLEY_SIZE
+    assert abs((bullets[1] - bullets[0]) - 0.4) <= 0.03
+    assert abs((bullets[2] - bullets[1]) - 0.3) <= 0.03
+
+
+def test_bell_keeper_bullet_parry_reflects_full_bullet_damage():
+    keeper = BrokenBridgeBellKeeper(900, 522, threat=1.5)
+    profile = keeper.bullet_profiles[0]
+
+    reflected = keeper.on_attack_parried(profile, perfect=True)
+
+    # 反弹伤害等于子弹伤害本身，不受威胁加成放大
+    assert reflected == BrokenBridgeBellKeeper.BULLET_DAMAGE
+    assert profile.damage == BrokenBridgeBellKeeper.BULLET_DAMAGE
+    assert keeper.vulnerable is False  # 弹反时钉不会打断连发
+
+
+def test_bell_keeper_melee_then_teleports_to_far_side():
+    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
+    near_player = (260.0, 522.0)
+
+    intent = keeper.update(1.0 / 60.0, near_player)
+    assert intent.attack is not None
+    assert intent.attack.tag == "bell_sweep"
+
+    keeper.on_attack_resolved(intent.attack, parried=False)
+    assert keeper.vanished is True
+
+    # 瞬移过程不超过 0.6 秒，落点必须在离玩家更远的一侧
+    keeper.update(keeper.TELEPORT_TIME / 2 + 0.01, near_player)
+    keeper.update(keeper.TELEPORT_TIME, near_player)
+
+    assert keeper.vanished is False
+    assert abs(keeper.x - near_player[0]) > 400.0
+
+
+def test_bell_keeper_melee_parried_still_teleports():
+    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
+
+    intent = keeper.update(1.0 / 60.0, (260.0, 522.0))
+    keeper.on_attack_parried(intent.attack, perfect=True)
+    keeper.on_attack_resolved(intent.attack, parried=True)
+
+    assert keeper.vanished is True
+
+
+def test_bell_keeper_phase_two_rises_to_air_center():
+    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
+    keeper.hp = round(keeper.max_hp * 0.51)
+
+    keeper.take_damage(200)
+    assert keeper.phase == 2
+    assert keeper.vanished is True
+
+    keeper.update(keeper.TELEPORT_TIME / 2 + 0.01, (1100.0, 522.0))
+    keeper.update(keeper.TELEPORT_TIME, (1100.0, 522.0))
+
+    assert keeper.vanished is False
+    assert abs(keeper.x - (keeper.bounds_left + keeper.bounds_right) / 2) <= 1.0
+    assert keeper.y < keeper.ground_y - 200.0
+    assert keeper.needs_clock is True
+
+
+def test_bell_keeper_clock_break_paralyzes_for_five_seconds():
+    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
+    clock = BellTowerClock(640, 522, threat=0.0)
+    keeper.bind_clock(clock)
+    keeper.phase = 2
+    clock.hp = 0
+
+    keeper.update(1.0 / 60.0, (1100.0, 522.0))
+
+    # 先做落地瞬移，落地后才开始 5 秒瘫痪
+    assert keeper.vanished is True
+    keeper.update(keeper.TELEPORT_TIME / 2 + 0.01, (1100.0, 522.0))
+    keeper.update(keeper.TELEPORT_TIME, (1100.0, 522.0))
+
+    assert keeper.paralyzed is True
+    assert keeper.core_exposed is True
+    assert keeper.y == keeper.ground_y
+
+    keeper.update(keeper.PARALYSIS_TIME - 0.1, (1100.0, 522.0))
+    assert keeper.paralyzed is True
+    keeper.update(0.2, (1100.0, 522.0))
+    assert keeper.paralyzed is False
+    assert keeper.vanished is True  # 瘫痪结束后重新升空
+
+
+def test_bell_keeper_reflected_bullets_hit_the_clock():
+    keeper = BrokenBridgeBellKeeper(200, 522, threat=0.0)
+    clock = BellTowerClock(640, 522, threat=0.0)
+    keeper.bind_clock(clock)
+    keeper.phase = 2
+
+    assert keeper.clock_target is clock
+
+    clock.hp = 0
+    assert keeper.clock_target is None
 
 
 def test_bell_keeper_cannot_be_knocked_back():
@@ -3490,21 +3668,65 @@ def test_bell_keeper_room_draws_and_fires_in_game_loop(monkeypatch, tmp_path):
     app._start_run(7, tutorial=False, stage=2, route_seed=11)
     app._dismiss_floor_intro()
     app._spawn_pending_enemies()
+    app.player.max_hp = 9999
+    app.player.hp = 9999
     keeper = app.room_enemies[0]
     assert keeper.kind == "broken_bridge_bell_keeper"
 
     fired = False
-    for _ in range(180):
+    volley_size = 0
+    for _ in range(240):
         app._update(1.0 / 60.0)
+        volley_size = max(
+            volley_size,
+            sum(
+                1
+                for pending in app.pending_enemy_attacks
+                if pending.enemy is keeper
+                and pending.profile.tag.startswith("bell_bullet")
+            ),
+        )
         if any(
-            pending.enemy is keeper and pending.profile.tag == "bell_bullet"
+            pending.enemy is keeper
+            and pending.profile.tag.startswith("bell_bullet")
             for pending in app.pending_enemy_attacks
         ):
             fired = True
 
     assert fired is True
+    assert volley_size >= 2  # 连发的时钉会同时挂在空中
     app._draw_boss_hud()
     app._draw_enemies()
+    pygame.quit()
+
+
+def test_bell_keeper_phase_two_summons_a_ground_clock(monkeypatch, tmp_path):
+    app, _recorder = _app_with_recording_audio(monkeypatch, tmp_path)
+    app._start_run(7, tutorial=False, stage=2, route_seed=11)
+    app._dismiss_floor_intro()
+    app._spawn_pending_enemies()
+    app.player.max_hp = 9999
+    app.player.hp = 9999
+    keeper = app.room_enemies[0]
+    keeper.hp = round(keeper.max_hp * 0.51)
+    keeper.take_damage(200)  # 打进二阶段
+
+    for _ in range(60 * 3):
+        app._update(1.0 / 60.0)
+
+    clocks = [enemy for enemy in app.room_enemies if enemy.kind == "bell_tower_clock"]
+    assert len(clocks) == 1
+    assert keeper.phase == 2
+    assert keeper.clock_target is clocks[0]
+    assert clocks[0].y == main.WAVE_GROUND_Y
+
+    # 钟表被击破后首领落地瘫痪，随后重新升空并补一座新钟表
+    clocks[0].hp = 0
+    for _ in range(60 * 8):
+        app._update(1.0 / 60.0)
+
+    assert any(enemy.kind == "bell_tower_clock" for enemy in app.room_enemies)
+    assert not keeper.paralyzed
     pygame.quit()
 
 

@@ -14,6 +14,7 @@ from game.entities import (
     BOSS_CLASSES,
     ENEMY_CLASSES,
     AttackProfile,
+    BellTowerClock,
     BrokenBridgeBellKeeper,
     Chaser,
     Enemy,
@@ -65,7 +66,8 @@ PORTAL_RETRIGGER_LOCK = 0.6
 # 每升一级提升的生命上限与攻击力
 HP_PER_LEVEL = 26
 ATTACK_PER_LEVEL = 3
-HEAL_TICK_INTERVAL = 10.0
+# 生命自愈的结算间隔：战斗房内每 5 秒回一次
+HEAL_TICK_INTERVAL = 5.0
 
 # -- 回响中枢 ---------------------------------------------------------------
 # 每个存档的成长拓扑不会因为战斗失败而重置，只有新建/覆盖存档才会清空
@@ -137,6 +139,8 @@ BOSS_FLOOR = 5
 SECOND_STAGE_ROOM_COUNT = 7
 SECOND_STAGE_SHOP_ROOM = 6
 SECOND_STAGE_BOSS_ROOM = 7
+# 第二阶段第三关：开局先给一次免费的战前补给（回溯愈合）
+SECOND_STAGE_SUPPLY_ROOM = 3
 BOSS_MEMORY_SEVER_DAMAGE_RATIO = 0.8
 
 # -- 战时铸币 ---------------------------------------------------------------
@@ -145,8 +149,9 @@ RUN_CURRENCY_RATE = 0.65
 # 战前整备的回复货品：可以重复购买，价格固定
 SHOP_HEAL_ITEM_ID = "coagulant_draught"
 SHOP_HEAL_AMOUNT = 60
-# 随机事件关的恢复选项：按最大生命比例结算，适配不同成长阶段
-EVENT_HEAL_RATIO = 0.4
+# 战前补给的回溯愈合：免费、本关一次，按最大生命比例结算
+SUPPLY_MEND_ITEM_ID = "temporal_mend"
+SUPPLY_HEAL_RATIO = 0.4
 
 ROOM_COMBAT = "combat"
 ROOM_ELITE = "elite"
@@ -357,7 +362,7 @@ LEGACY_PROGRESSION_NODES = (
         "refracted_afterglow",
         "任意一局最高连击达到 12",
         100,
-        "战斗房内每 10 秒恢复 8% 最大生命。",
+        "战斗房内每 5 秒恢复 8% 最大生命。",
     ),
     ProgressionNode(
         "twin_blade_license",
@@ -529,10 +534,10 @@ PROGRESSION_TRACKS = (
         "vital_regeneration",
         "机制谱系",
         "生命自愈",
-        "战斗房内每 10 秒恢复 {value} 点生命。",
+        "战斗房内每 5 秒恢复 {value} 点生命。",
         (3, 6, 9, 12, 15),
         (50, 90, 150, 230, 340),
-        "点/10秒",
+        "点/5秒",
     ),
     ProgressionTrack(
         "resonance_reflux",
@@ -643,6 +648,33 @@ SHOP_ITEMS = (
     ),
 )
 
+# 战前补给点：免费、本关一次的回溯愈合
+SUPPLY_ITEMS = (
+    ShopItem(
+        SUPPLY_MEND_ITEM_ID,
+        "回溯愈合",
+        0,
+        f"恢复 {round(SUPPLY_HEAL_RATIO * 100)}% 最大生命，"
+        "本关只能使用一次；生命已满时无法选择。",
+    ),
+)
+
+SUPPLY_BRIEFING = FloorBriefing(
+    "断电街区 · 战前补给",
+    "本关开局可以先使用一次回溯愈合，离开补给界面后立刻进入战斗。",
+    (
+        (
+            "战前补给",
+            f"回溯愈合免费恢复最大生命的 {round(SUPPLY_HEAL_RATIO * 100)}%，"
+            "本关只能使用一次；不使用也可以直接开战。",
+        ),
+        (
+            "本关编成",
+            "三波混合敌群，是第二阶段里最后一处能在开战前回复生命的战斗关。",
+        ),
+    ),
+)
+
 # 每层的关卡简报：介绍本层首次登场的敌人及其攻击特点
 FLOOR_BRIEFINGS: dict[int, FloorBriefing] = {
     1: FloorBriefing(
@@ -743,12 +775,9 @@ ROOM_TYPE_BRIEFINGS: dict[str, FloorBriefing] = {
     ),
     ROOM_EVENT: FloorBriefing(
         "失真记忆事件",
-        "本关没有强制战斗；读取残留记忆，并在四项不可撤销的结果中选择其一。",
+        "本关没有强制战斗；读取残留记忆，并在三项不可撤销的结果中选择其一。",
         (
-            (
-                "记忆抉择",
-                "选择铸币、回响能量、恢复生命，或以生命换取本局攻击强化。",
-            ),
+            ("记忆抉择", "选择铸币、回响能量或以生命换取本局攻击强化。"),
             ("一次勘定", "结果确认后立即写入暂存，重新进入关卡不能重复领取。"),
         ),
     ),
@@ -789,15 +818,22 @@ ROOM_TYPE_BRIEFINGS: dict[str, FloorBriefing] = {
     ),
     ROOM_BOSS: FloorBriefing(
         "断桥钟楼",
-        "第二阶段第七关：断桥司钟以时钉散射压制，核心未暴露时不受任何伤害。",
+        "第二阶段第七关：断桥司钟用三连发时钉压制，近身只打一次就瞬移拉开。",
         (
             (
-                "时钉散射",
-                "钟体一次连续射出三枚时钉，可逐发弹刀反弹；玩家贴身时改用刻度横扫。",
+                "三连时钉",
+                "每发时钉造成 120 点伤害，弹反回去同样打掉钟体 120 点；"
+                "发射间隔 0.4 / 0.3 秒，三发会同时挂在空中。",
             ),
             (
-                "核心暴露",
-                "只有削空韧性才能打伤钟体：核心暴露 4 秒且钟体停火，窗口结束后韧性回满。",
+                "近身应对",
+                "被近身时钟体只挥出一次刻度横扫，无论是否被弹开都会瞬移到场地另一侧，"
+                "消失与重现合计不超过 0.6 秒。",
+            ),
+            (
+                "二阶段 · 空中钟表",
+                "生命低于 50% 后升到场地中央的空中，只放远程攻击并召唤地面钟表；"
+                "反弹的时钉打向钟表，钟表被击破后钟体瘫痪落地 5 秒，随后重新升起。",
             ),
         ),
     ),
@@ -966,6 +1002,9 @@ class StartScreen:
         self.shop_selected = 0
         self.shop_purchased: set[str] = set()
         self.shop_closed = True
+        # 当前柜台货架：行商驿站用全部货品，战前补给只有回溯愈合
+        self.shop_stock: tuple[ShopItem, ...] = SHOP_ITEMS
+        self.shop_supply = False
         self.player = Player(230, 566)
         self._attack_hits: set[tuple[int, int]] = set()
         self._defeated_enemies: set[int] = set()
@@ -1383,7 +1422,13 @@ class StartScreen:
         self.run_shop_attack_bonus = saved["shop_attack_bonus"]
         self.run_shop_hp_bonus = saved["shop_hp_bonus"]
         self.shop_purchased = set(saved["shop_purchased"])
-        self.shop_closed = saved["shop_closed"] if self._is_shop_room() else True
+        self.shop_closed = (
+            saved["shop_closed"]
+            if (self._is_shop_room() or self._is_supply_room())
+            else True
+        )
+        self.shop_stock = SHOP_ITEMS
+        self.shop_supply = False
         self.room_resolved = saved["room_resolved"]
         self.run_difficulty_hard = saved["hard_mode"]
         self.run_threat = self._floor_threat(self.run_floor, self.run_stage) + (
@@ -1723,11 +1768,15 @@ class StartScreen:
 
         if self.overlay == "shop":
             if key in (pygame.K_UP, pygame.K_w):
-                self.shop_selected = (self.shop_selected - 1) % (len(SHOP_ITEMS) + 1)
+                self.shop_selected = (self.shop_selected - 1) % (
+                    len(self.shop_stock) + 1
+                )
             elif key in (pygame.K_DOWN, pygame.K_s):
-                self.shop_selected = (self.shop_selected + 1) % (len(SHOP_ITEMS) + 1)
+                self.shop_selected = (self.shop_selected + 1) % (
+                    len(self.shop_stock) + 1
+                )
             elif key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_j):
-                if self.shop_selected == len(SHOP_ITEMS):
+                if self.shop_selected == len(self.shop_stock):
                     self._leave_shop()
                 else:
                     self._purchase_shop_item(self.shop_selected)
@@ -2209,10 +2258,20 @@ class StartScreen:
     def _is_shop_room(self) -> bool:
         return self.room_type == ROOM_SHOP
 
+    def _is_supply_room(self) -> bool:
+        """第二阶段第三关：开局先弹一次免费的战前补给（回溯愈合）。"""
+        return (
+            self.run_stage >= 2
+            and self.run_floor == SECOND_STAGE_SUPPLY_ROOM
+            and not self.is_tutorial_run
+        )
+
     def _is_boss_room(self) -> bool:
         return self.room_type == ROOM_BOSS
 
     def _floor_briefing(self, floor: int) -> FloorBriefing:
+        if self._is_supply_room():
+            return SUPPLY_BRIEFING
         if self.run_stage >= 2:
             return ROOM_TYPE_BRIEFINGS.get(
                 self.room_type,
@@ -2227,16 +2286,18 @@ class StartScreen:
     def _dismiss_floor_intro(self) -> None:
         if self.overlay == "floor_intro":
             self._close_overlay()
-            if self._is_shop_room() and not self.shop_closed:
-                self._open_shop()
+            if (self._is_shop_room() or self._is_supply_room()) and not self.shop_closed:
+                self._open_shop(supply=self._is_supply_room())
             elif self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}:
                 if not self.room_resolved:
                     self._open_room_event()
 
-    def _open_shop(self) -> None:
+    def _open_shop(self, *, supply: bool = False) -> None:
+        self.shop_supply = supply
+        self.shop_stock = SUPPLY_ITEMS if supply else SHOP_ITEMS
         self.shop_selected = 0
         self._open_overlay("shop", return_page="game")
-        self._notify("灰烬行商已展开战前整备目录")
+        self._notify("战前补给已展开" if supply else "灰烬行商已展开战前整备目录")
 
     def _open_room_event(self) -> None:
         self.room_choice_selected = 0
@@ -2262,18 +2323,8 @@ class StartScreen:
         return (
             ("回收记忆", f"获得 {self._currency_reward(24)} 枚战时铸币"),
             ("汲取谐振", "回响能量 +40"),
-            (
-                "回溯愈合",
-                f"恢复 {self.event_heal_amount} 点生命"
-                f"（最大生命的 {round(EVENT_HEAL_RATIO * 100)}%）",
-            ),
             ("承受烙印", "失去 15% 当前生命，攻击力 +4"),
         )
-
-    @property
-    def event_heal_amount(self) -> int:
-        """事件关的回血量：按最大生命比例，随本局成长自动放大。"""
-        return max(1, round(self.player.max_hp * EVENT_HEAL_RATIO))
 
     def _room_event_rects(self) -> list[pygame.Rect]:
         rect = self._overlay_rect()
@@ -2320,12 +2371,6 @@ class StartScreen:
                 self._grant_fixed_currency(24)
             elif index == 1:
                 self.echo_energy = min(ECHO_ENERGY_MAX, self.echo_energy + 40)
-            elif index == 2:
-                if self.player.hp >= self.player.max_hp:
-                    self._notify("生命值已满，不需要回溯愈合")
-                    return False
-                healed = self.player.heal(self.event_heal_amount)
-                message = f"{title}  生命 +{healed}，回响之门正在开启"
             else:
                 self.player.hp = max(1, self.player.hp - max(1, round(self.player.hp * 0.15)))
                 self.run_shop_attack_bonus += 4
@@ -2341,34 +2386,52 @@ class StartScreen:
     def _leave_shop(self) -> None:
         if self.overlay != "shop":
             return
+        was_supply = self.shop_supply
         self.shop_closed = True
         self.overlay = None
         self.page = "game"
         self._save_run_checkpoint()
-        self._notify("整备结束，通往锈冠王庭的回响之门正在开启")
+        self._notify(
+            "补给结束，战斗即将开始"
+            if was_supply
+            else "整备结束，通往锈冠王庭的回响之门正在开启"
+        )
+        self.shop_supply = False
 
     def _shop_item_rects(self) -> list[pygame.Rect]:
         rect = self._overlay_rect()
         rows = [
             pygame.Rect(rect.x + 42, rect.y + 104 + index * 72, rect.width - 84, 60)
-            for index in range(len(SHOP_ITEMS))
+            for index in range(len(self.shop_stock))
         ]
-        rows.append(pygame.Rect(rect.centerx - 150, rect.bottom - 104, 300, 44))
+        if self.shop_supply:
+            # 补给货架只有一两件货，按钮跟在货架下面而不是钉在面板底部
+            rows.append(pygame.Rect(rect.centerx - 150, rows[-1].bottom + 40, 300, 44))
+        else:
+            rows.append(pygame.Rect(rect.centerx - 150, rect.bottom - 104, 300, 44))
         return rows
 
     def _purchase_shop_item(self, index: int) -> bool:
-        if index < 0 or index >= len(SHOP_ITEMS):
+        if index < 0 or index >= len(self.shop_stock):
             return False
-        item = SHOP_ITEMS[index]
+        item = self.shop_stock[index]
         if item.item_id in self.shop_purchased and not item.repeatable:
-            self._notify("该货品本次远征已经购入")
+            self._notify(
+                "本关的回溯愈合已经用过了"
+                if item.item_id == SUPPLY_MEND_ITEM_ID
+                else "该货品本次远征已经购入"
+            )
             return False
         if self.run_currency < item.cost:
             self._notify(f"战时铸币不足，还需 {item.cost - self.run_currency}")
             return False
-        if item.item_id == SHOP_HEAL_ITEM_ID and self.player.hp >= self.player.max_hp:
-            self._notify("生命值已满，不需要回复")
-            return False
+        if self.player.hp >= self.player.max_hp:
+            if item.item_id == SHOP_HEAL_ITEM_ID:
+                self._notify("生命值已满，不需要回复")
+                return False
+            if item.item_id == SUPPLY_MEND_ITEM_ID:
+                self._notify("生命值已满，不需要回溯愈合")
+                return False
         self.run_currency -= item.cost
         message = f"购入 {item.title}  铸币 -{item.cost}"
         if item.item_id == "repair_infusion":
@@ -2387,6 +2450,9 @@ class StartScreen:
             message = (
                 f"购入 {item.title}  铸币 -{item.cost}  生命 +{healed}"
             )
+        elif item.item_id == SUPPLY_MEND_ITEM_ID:
+            healed = self.player.heal(self.supply_heal_amount)
+            message = f"{item.title}  生命 +{healed}"
         if not item.repeatable:
             self.shop_purchased.add(item.item_id)
         lifetime_stats = self.profile.get("lifetime_stats", {})
@@ -2417,7 +2483,7 @@ class StartScreen:
             for index, row in enumerate(self._shop_item_rects()):
                 if row.collidepoint(logical):
                     self.shop_selected = index
-                    if index == len(SHOP_ITEMS):
+                    if index == len(self.shop_stock):
                         self._leave_shop()
                     else:
                         self._purchase_shop_item(index)
@@ -2541,6 +2607,7 @@ class StartScreen:
         self._resolve_player_attack()
         if not self.is_tutorial_run or self._current_tutorial_step.action == "parry":
             self._update_enemy_attacks(fixed_dt)
+            self._update_boss_summons()
 
     VORTEX_TIME = 0.65
     BLACK_TIME = 0.26
@@ -2686,7 +2753,7 @@ class StartScreen:
         self.canvas.blit(layer, (0, 0))
 
     def _update_passive_recovery(self, dt: float) -> None:
-        """生命恢复每十秒结算一次；商店和事件类房间禁用恢复。"""
+        """生命恢复每五秒结算一次；商店和事件类房间禁用恢复。"""
         healing_blocked = self.room_type in {
             ROOM_SHOP,
             ROOM_EVENT,
@@ -3056,6 +3123,14 @@ class StartScreen:
             return True
         return False
 
+    @staticmethod
+    def _reflection_target(enemy: Enemy) -> Enemy:
+        """二阶段的断桥司钟会把反弹的时钉引到地面钟表上。"""
+        clock = getattr(enemy, "clock_target", None)
+        if clock is not None and not clock.defeated:
+            return clock
+        return enemy
+
     def _perfect_parry(
         self,
         pending: PendingEnemyAttack,
@@ -3071,7 +3146,7 @@ class StartScreen:
                 ReflectedProjectile(
                     self.player.x,
                     self.player.y - 54,
-                    enemy,
+                    self._reflection_target(enemy),
                     reflected_damage,
                 )
             )
@@ -3225,14 +3300,20 @@ class StartScreen:
         self._remove_defeated_enemies()
 
     def _update_enemy_attacks(self, dt: float) -> None:
-        pending_enemy_ids = {
-            id(pending.enemy) for pending in self.pending_enemy_attacks
+        # 同一敌人的同名招式只保留一份待结算实例；像断桥司钟这样的连发首领
+        # 会给每发子弹不同的 tag，于是可以同时挂三枚时钉在空中
+        pending_keys = {
+            (id(pending.enemy), pending.profile.tag)
+            for pending in self.pending_enemy_attacks
         }
         for enemy in list(self.room_enemies):
             if enemy.defeated:
                 continue
             intent = enemy.update(dt, self.player.position)
-            if intent.attack is not None and id(enemy) not in pending_enemy_ids:
+            if intent.attack is not None:
+                key = (id(enemy), intent.attack.tag)
+                if key in pending_keys:
+                    continue
                 pending = PendingEnemyAttack(
                     enemy,
                     intent.attack,
@@ -3241,7 +3322,7 @@ class StartScreen:
                     target=(self.player.x, self.player.y - 54),
                 )
                 self.pending_enemy_attacks.append(pending)
-                pending_enemy_ids.add(id(enemy))
+                pending_keys.add(key)
                 # 敌人起手就给出提示音，命中与否由后续音效补充确认
                 self.audio.play("enemy_attack")
 
@@ -3260,6 +3341,32 @@ class StartScreen:
                 return
         self.pending_enemy_attacks = unresolved
         self._remove_defeated_enemies()
+
+    def _update_boss_summons(self) -> None:
+        """断桥司钟升空后需要一座地面钟表来承接反弹的时钉。"""
+        for enemy in list(self.room_enemies):
+            if not getattr(enemy, "needs_clock", False):
+                continue
+            clock = BellTowerClock(
+                (enemy.bounds_left + enemy.bounds_right) / 2,
+                WAVE_GROUND_Y,
+                threat=self.run_threat,
+            )
+            clock.summoned_by = enemy  # 首领被击破时要一起带走
+            self.room_enemies.append(clock)
+            enemy.bind_clock(clock)
+            self.audio.play("spawn", 0.6)
+            self._notify("断桥司钟召唤了钟表 · 反弹的时钉会打向它")
+
+    def _clear_boss_summons(self, boss: Enemy) -> None:
+        """首领被击破时带走它召唤的单位，否则房间永远无法结算。"""
+        removed = False
+        for summon in self.room_enemies:
+            if getattr(summon, "summoned_by", None) is boss and not summon.defeated:
+                summon.hp = 0
+                removed = True
+        if removed:
+            self._remove_defeated_enemies()
 
     def _update_death_fades(self, dt: float) -> None:
         """倒地动画推进：时间走完就把剪影移除。"""
@@ -3389,6 +3496,7 @@ class StartScreen:
             lifetime_stats = lifetime_stats.copy()
             lifetime_stats["boss_kills"] = self._stat("boss_kills") + 1
             self.profile["lifetime_stats"] = lifetime_stats
+            self._clear_boss_summons(enemy)
 
     def _remove_defeated_enemies(self) -> None:
         for enemy in self.room_enemies:
@@ -3441,11 +3549,12 @@ class StartScreen:
 
     def _level_up(self) -> None:
         self.player_level += 1
-        self.player.gain_level(HP_PER_LEVEL, ATTACK_PER_LEVEL)
+        gained_hp = self.player.gain_level(HP_PER_LEVEL, ATTACK_PER_LEVEL)
         self.audio.play("parry_ready")
         self._notify(
             f"等级提升 Lv.{self.player_level}  "
-            f"生命上限 +{HP_PER_LEVEL}  攻击 +{ATTACK_PER_LEVEL}"
+            f"生命上限 +{HP_PER_LEVEL} · 当前生命 +{gained_hp}  "
+            f"攻击 +{ATTACK_PER_LEVEL}"
         )
 
     # -- 回响能量与回响剑气 -----------------------------------------------
@@ -3471,6 +3580,11 @@ class StartScreen:
         reward = self._currency_reward(base)
         self.run_currency += reward
         return reward
+
+    @property
+    def supply_heal_amount(self) -> int:
+        """战前补给的回溯愈合量：按最大生命比例，随本局成长自动放大。"""
+        return max(1, round(self.player.max_hp * SUPPLY_HEAL_RATIO))
 
     @property
     def energy_ready(self) -> bool:
@@ -4045,7 +4159,11 @@ class StartScreen:
                 "progression": "回响中枢 · 成长拓扑",
                 "portal": "回响之门",
                 "expedition_choice": "远征城门 · 暂存进度",
-                "shop": "余烬行商 · 战前整备",
+                "shop": (
+                    "战前补给 · 回溯愈合"
+                    if self.shop_supply
+                    else "余烬行商 · 战前整备"
+                ),
                 "room_event": self._floor_briefing(self.run_floor).title,
             }.get(self.overlay, "设置")
         title = self.overlay_title_font.render(title_text, True, COLORS["ice"])
@@ -4196,6 +4314,8 @@ class StartScreen:
 
         if self._is_shop_room():
             room_status = "非战斗层    使用战时铸币整备    可不消费直接离开"
+        elif self._is_supply_room():
+            room_status = "战前补给    花铸币回复生命    离开后立刻开战"
         elif self._is_boss_room():
             room_status = (
                 f"区域执政者    两个阶段    威胁 {round(self.run_threat * 100)}%"
@@ -4231,13 +4351,14 @@ class StartScreen:
                 )
             y += 130
 
-        hint_text = (
-            "按 Enter / 空格 / 鼠标左键 进入交易"
-            if self._is_shop_room()
-            else "按 Enter / 空格 / 鼠标左键 查看选项"
-            if self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}
-            else "按 Enter / 空格 / 鼠标左键 开始战斗"
-        )
+        if self._is_shop_room():
+            hint_text = "按 Enter / 空格 / 鼠标左键 进入交易"
+        elif self._is_supply_room():
+            hint_text = "按 Enter / 空格 / 鼠标左键 进入战前补给"
+        elif self.room_type in {ROOM_EVENT, ROOM_REWARD, ROOM_SANCTUARY}:
+            hint_text = "按 Enter / 空格 / 鼠标左键 查看选项"
+        else:
+            hint_text = "按 Enter / 空格 / 鼠标左键 开始战斗"
         hint = self.small_font.render(
             hint_text,
             True,
@@ -4278,13 +4399,18 @@ class StartScreen:
 
     def _draw_shop(self, rect: pygame.Rect) -> None:
         intro = self.small_font.render(
-            f"持有战时铸币 {self.run_currency}    强化限购一次 · 凝血汤剂可重复购买",
+            (
+                f"本关开局提供一次免费回溯愈合    持有战时铸币 {self.run_currency}"
+                if self.shop_supply
+                else f"持有战时铸币 {self.run_currency}    "
+                "强化限购一次 · 凝血汤剂可重复购买"
+            ),
             True,
             COLORS["gold"],
         )
         self.canvas.blit(intro, (rect.x + 42, rect.y + 78))
         rows = self._shop_item_rects()
-        for index, item in enumerate(SHOP_ITEMS):
+        for index, item in enumerate(self.shop_stock):
             row = rows[index]
             selected = index == self.shop_selected
             purchased = item.item_id in self.shop_purchased and not item.repeatable
@@ -4305,7 +4431,10 @@ class StartScreen:
             detail = self.small_font.render(item.description, True, COLORS["muted"])
             self.canvas.blit(detail, (row.x + 22, row.y + 33))
             if purchased:
-                state, color = "已购入", COLORS["cyan"]
+                state = "已使用" if self.shop_supply else "已购入"
+                color = COLORS["cyan"]
+            elif item.cost <= 0:
+                state, color = "免费", COLORS["gold"]
             elif affordable:
                 state, color = f"{item.cost} 铸币", COLORS["gold"]
             else:
@@ -4315,8 +4444,8 @@ class StartScreen:
 
         self._draw_ui_button(
             rows[-1],
-            "结束整备并开启王庭入口",
-            selected=self.shop_selected == len(SHOP_ITEMS),
+            "进入战斗" if self.shop_supply else "结束整备并开启王庭入口",
+            selected=self.shop_selected == len(self.shop_stock),
         )
 
     def _draw_portal_choice(self, rect: pygame.Rect) -> None:
@@ -5071,7 +5200,9 @@ class StartScreen:
         self.spawn_countdown_total = ENEMY_SPAWN_DELAY
         self.spawn_countdown_label = "敌影接近"
         self.shop_selected = 0
-        self.shop_closed = not self._is_shop_room()
+        self.shop_stock = SHOP_ITEMS
+        self.shop_supply = False
+        self.shop_closed = not (self._is_shop_room() or self._is_supply_room())
         if tutorial:
             self.wave_plan = []
         else:
@@ -5103,6 +5234,8 @@ class StartScreen:
             self._notify("敌影正在接近…")
         elif self._is_shop_room():
             self._notify("余烬行商驿站已接入")
+        elif self._is_supply_room():
+            self._notify("战前补给点已接入")
         else:
             self._notify("试炼房间已开启")
         if not tutorial:
@@ -5637,6 +5770,10 @@ class StartScreen:
     @staticmethod
     def _boss_state_text(boss: Enemy) -> tuple[str, tuple[int, int, int]]:
         """首领血条下方的状态说明：破防 / 核心暴露等关键输出窗口。"""
+        label = getattr(boss, "state_label", "")
+        if label:
+            color = COLORS["cyan"] if getattr(boss, "core_exposed", False) else COLORS["muted"]
+            return label, color
         if getattr(boss, "core_exposed", False):
             remaining = float(getattr(boss, "core_exposure_remaining", 0.0))
             return f"核心暴露 · 可以造成伤害 {remaining:.1f} 秒", COLORS["cyan"]
@@ -5993,10 +6130,13 @@ class StartScreen:
             "resonance_mage": COLORS["cyan"],
             "rust_crown_knight": COLORS["gold"],
             "broken_bridge_bell_keeper": (122, 214, 226),
+            "bell_tower_clock": (188, 206, 120),
         }
         for enemy in self.room_enemies:
             if enemy.defeated:
                 continue
+            if getattr(enemy, "vanished", False):
+                continue  # 瞬移过程中不画本体，只留特效
             x, y = int(enemy.x), int(enemy.y)
             sprite = self.assets.enemy_sprites.get(enemy.kind)
             if sprite is not None:
@@ -6076,8 +6216,26 @@ class StartScreen:
                     (body.centerx + enemy.facing * 26, body.centery + 20),
                     5,
                 )
-                if getattr(enemy, "core_exposed", False):
+                if getattr(enemy, "paralyzed", False):
                     pygame.draw.circle(self.canvas, COLORS["cyan"], body.center, 46, 3)
+            elif enemy.kind == "bell_tower_clock":
+                # 地面钟表：表盘 + 两根指针
+                pygame.draw.circle(self.canvas, color, body.center, 34, 3)
+                pygame.draw.circle(self.canvas, COLORS["gold"], body.center, 5)
+                pygame.draw.line(
+                    self.canvas,
+                    COLORS["gold"],
+                    body.center,
+                    (body.centerx + 18, body.centery - 16),
+                    4,
+                )
+                pygame.draw.line(
+                    self.canvas,
+                    COLORS["gold"],
+                    body.center,
+                    (body.centerx - 12, body.centery - 20),
+                    3,
+                )
             else:
                 eye_x = x + (7 if enemy.facing > 0 else -12)
                 pygame.draw.rect(self.canvas, color, (eye_x, y - 32, 8, 5))
@@ -6196,6 +6354,38 @@ class StartScreen:
                 effect.blit(
                     label,
                     label.get_rect(center=(center[0], center[1] - radius - 12)),
+                )
+
+        for enemy in self.room_enemies:
+            progress = getattr(enemy, "teleport_progress", None)
+            if progress is None:
+                continue
+            # 前半个过程收缩消失，后半个过程重新展开
+            center = (round(enemy.x), round(enemy.y - enemy.body_height / 2))
+            if progress < 0.5:
+                phase = progress * 2.0
+                radius = round(86 - 62 * phase)
+                alpha = round(210 * (1.0 - phase))
+            else:
+                phase = (progress - 0.5) * 2.0
+                radius = round(24 + 62 * phase)
+                alpha = round(210 * phase)
+            color = COLORS["ice"]
+            pygame.draw.circle(effect, (*color, alpha), center, max(6, radius), 4)
+            pygame.draw.circle(
+                effect,
+                (*COLORS["white"], max(0, alpha - 40)),
+                center,
+                max(3, round(radius * 0.35)),
+                2,
+            )
+            for offset in (-26, 0, 26):
+                pygame.draw.line(
+                    effect,
+                    (*color, alpha),
+                    (center[0] + offset, center[1] - radius),
+                    (center[0] + offset, center[1] + radius),
+                    3,
                 )
 
         self.canvas.blit(effect, (0, 0))
